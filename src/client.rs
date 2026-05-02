@@ -28,7 +28,6 @@ impl AlternatorClient {
 
         let request_compression = extensions.request_compression.unwrap_or_default();
         let enforce_header_whitelist = extensions.enforce_header_whitelist.unwrap_or(true);
-
         let has_region = dynamodb_config.region().is_some();
 
         let mut dynamodb_config =
@@ -39,6 +38,12 @@ impl AlternatorClient {
                     enforce_header_whitelist,
                 ));
 
+        let live_nodes = LiveNodes::new(&config);
+        if let Some(nodes) = &live_nodes {
+            dynamodb_config =
+                dynamodb_config.interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()));
+        }
+
         if !has_region {
             dynamodb_config.set_region(Some(aws_sdk_dynamodb::config::Region::from_static(
                 "us-east-1",
@@ -47,6 +52,10 @@ impl AlternatorClient {
 
         let dynamodb_config = dynamodb_config.build();
         let dynamodb_client = aws_sdk_dynamodb::Client::from_conf(dynamodb_config);
+
+        if let Some(nodes) = live_nodes {
+            nodes.ensure_discovery_started();
+        }
 
         Self {
             dynamodb_client,

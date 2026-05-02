@@ -8,6 +8,7 @@ use aws_smithy_runtime_api::client::interceptors::context::{
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
+use std::sync::Arc;
 
 /// Driver's main interceptor
 ///
@@ -75,6 +76,34 @@ impl Intercept for AlternatorInterceptor {
 
         Ok(())
     }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        // Take the next node from the query plan and override the request URI.
+        if let Some(query_plan) = cfg.interceptor_state().load::<QueryPlan>()
+            && let Some(next_node) = query_plan.next_node()
+        {
+            let request = context.request_mut();
+            let mut current = url::Url::parse(request.uri())?;
+            current
+                .set_scheme(next_node.scheme())
+                .map_err(|_| "cannot set scheme")?;
+            current
+                .set_host(next_node.host_str())
+                .map_err(|_| "cannot set host")?;
+            current
+                .set_port(next_node.port())
+                .map_err(|_| "cannot set port")?;
+
+            request.set_uri(current.as_str())?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -135,5 +164,40 @@ impl AlternatorOverrideInterceptor<EnforceHeaderWhitelistStore> {
                 enforce_header_whitelist,
             },
         }
+    }
+}
+
+/// An interceptor that adds a round-robin [QueryPlan] to the config bag before request serialization,
+/// so that [AlternatorInterceptor] can later use it to determine which node to send the request to.
+#[derive(Debug)]
+pub(crate) struct RoundRobinQueryPlanInterceptor {
+    live_nodes: Arc<LiveNodes>,
+}
+
+impl RoundRobinQueryPlanInterceptor {
+    pub fn new(live_nodes: Arc<LiveNodes>) -> Self {
+        Self { live_nodes }
+    }
+}
+
+impl Intercept for RoundRobinQueryPlanInterceptor {
+    fn name(&self) -> &'static str {
+        "RoundRobinQueryPlanInterceptor"
+    }
+
+    /// This hook is triggered exactly once per request, before the first attempt is serialized.
+    /// Query plan, put here, is then used before every attempt by [`AlternatorInterceptor`] in `modify_before_signing`
+    /// hook to determine which node the request should be sent to.
+    /// This allows for tracking which nodes have already been tried in the current request and implementing a round-robin strategy.
+    fn modify_before_serialization(
+        &self,
+        _: &mut BeforeSerializationInterceptorContextMut,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let query_plan = QueryPlan::new(self.live_nodes.clone());
+        cfg.interceptor_state().store_put(query_plan);
+
+        Ok(())
     }
 }
