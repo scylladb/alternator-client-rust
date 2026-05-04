@@ -12,6 +12,7 @@ use crate::*;
 pub(crate) struct AlternatorExtensions {
     pub(crate) request_compression: Option<RequestCompression>,
     pub(crate) enforce_header_whitelist: Option<bool>,
+    pub(crate) routing_scope: Option<RoutingScope>,
 }
 
 /// [AlternatorClient]'s config
@@ -72,6 +73,26 @@ impl AlternatorConfig {
     /// By default, Gzip compression is used, with 1024 threshold and level 6 of compression.
     pub fn request_compression(&self) -> Option<RequestCompression> {
         self.alternator_ext.request_compression.clone()
+    }
+
+    /// Get the client's routing scope.
+    ///
+    /// This is used by the client to route requests to a chosen subset of nodes in the cluster,
+    /// based on the routing scope parameters set - datacenter and rack, see [RoutingScope].
+    ///
+    /// A routing scope can have a fallback scope set by [RoutingScope::with_fallback], which is used if no nodes are available in the preferred scope.
+    /// This function can be used multiple times to create a chain of fallback scopes.
+    /// Requests will always be routed to the most preferred scope in the chain with available nodes.
+    ///
+    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across nodes in the datacenter of the seed host.
+    /// If multiple seed hosts are provided, it will use the datacenter of one of the seed hosts, falling back to a different one if needed.
+    ///
+    /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
+    /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
+    /// Making a fallback narrower, e.g., (datacenter -> rack) or (cluster -> datacenter),
+    /// may be redundant if the set of nodes in the next scope is a subset of the previous one.
+    pub fn routing_scope(&self) -> Option<RoutingScope> {
+        self.alternator_ext.routing_scope.clone()
     }
 }
 
@@ -160,6 +181,48 @@ impl AlternatorBuilder {
         request_compression: RequestCompression,
     ) -> &mut Self {
         self.alternator_ext.request_compression = Some(request_compression);
+        self
+    }
+
+    /// Set the routing scope for the client.
+    ///
+    /// This is used by the client to route requests to a chosen subset of nodes in the cluster,
+    /// based on the routing scope parameters set - datacenter and rack, see [RoutingScope].
+    ///
+    /// A routing scope can have a fallback scope set by [RoutingScope::with_fallback], which is used if no nodes are available in the preferred scope.
+    /// This function can be used multiple times to create a chain of fallback scopes.
+    /// Requests will always be routed to the most preferred scope in the chain with available nodes.
+    ///
+    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across nodes in the datacenter of the seed host.
+    /// If multiple seed hosts are provided, it will use the datacenter of one of the seed hosts, falling back to a different one if needed.
+    ///
+    /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
+    /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
+    /// Making a fallback narrower, e.g., (datacenter -> rack) or (cluster -> datacenter),
+    /// may be redundant if the set of nodes in the next scope is a subset of the previous one.
+    pub fn routing_scope(mut self, routing_scope: RoutingScope) -> Self {
+        self.set_routing_scope(routing_scope);
+        self
+    }
+
+    /// Set the routing scope for the client.
+    ///
+    /// This is used by the client to route requests to a chosen subset of nodes in the cluster,
+    /// based on the routing scope parameters set - datacenter and rack, see [RoutingScope].
+    ///
+    /// A routing scope can have a fallback scope set by [RoutingScope::with_fallback], which is used if no nodes are available in the preferred scope.
+    /// This function can be used multiple times to create a chain of fallback scopes.
+    /// Requests will always be routed to the most preferred scope in the chain with available nodes.
+    ///
+    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across nodes in the datacenter of the seed host.
+    /// If multiple seed hosts are provided, it will use the datacenter of one of the seed hosts, falling back to a different one if needed.
+    ///
+    /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
+    /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
+    /// Making a fallback narrower, e.g., (datacenter -> rack) or (cluster -> datacenter),
+    /// may be redundant if the set of nodes in the next scope is a subset of the previous one.
+    pub fn set_routing_scope(&mut self, routing_scope: RoutingScope) -> &mut Self {
+        self.alternator_ext.routing_scope = Some(routing_scope);
         self
     }
 }
