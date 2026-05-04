@@ -16,6 +16,7 @@ http-body-util = "0.1"
 anyhow = "1.0.102"
 itertools = "0.14.0"
 reqwest = { version = "0.11", features = ["json"] }
+url = "2.5.8"
 
 [dev-dependencies]
 aws-sdk-dynamodb = { version = "1.103.0", features = ["test-util"] }
