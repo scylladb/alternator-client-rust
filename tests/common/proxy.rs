@@ -4,7 +4,7 @@
 //!
 //! The proxy is expected to live no longer than the server.
 //! When the server is closed, the future finishes.
-//! The proxy can accept many clients during its lifetime, but only one at a time.
+//! The proxy can accept many clients during its lifetime, up to 2 at a time.
 //!
 //! It comes with three hooks:
 //! - `on_request`
@@ -42,7 +42,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, watch};
 
 pub struct Proxy<'a> {
     task: Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
@@ -58,29 +58,83 @@ impl<'a> Proxy<'a> {
         on_client_disconnect: Option<Box<dyn Fn() + Send + Sync>>,
     ) -> Proxy<'a>
     where
-        F: Fn(Request<Incoming>, Arc<Mutex<SendRequest<Full<Bytes>>>>) -> Fut + Send + Sync + 'a,
-        Fut: Future<Output = Response<Full<Bytes>>> + Send,
+        F: Fn(Request<Incoming>, Arc<Mutex<SendRequest<Full<Bytes>>>>) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
     {
         let on_request = Arc::new(on_request);
+        let on_client_connect: Option<Arc<dyn Fn(SocketAddr) + Send + Sync>> =
+            on_client_connect.map(Arc::from);
+        let on_client_disconnect: Option<Arc<dyn Fn() + Send + Sync>> =
+            on_client_disconnect.map(Arc::from);
         let (listener, listen_address) = Proxy::bind_listener(listen_address.clone()).await;
-        let (sender, mut server_connection) = Proxy::connect_server(connect_address.clone()).await;
+        let (sender, server_connection) = Proxy::connect_server(connect_address.clone()).await;
 
         let task = async move {
-            let mut running = true;
-            while running {
-                let mut client_connection = Proxy::accept_client(
-                    &listener,
-                    sender.clone(),
-                    on_request.clone(),
-                    &on_client_connect,
-                )
-                .await;
-                running = Proxy::handle_connections(
-                    &mut client_connection,
-                    &mut server_connection,
-                    &on_client_disconnect,
-                )
-                .await;
+            let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+            tokio::spawn(async move {
+                let result = server_connection.await;
+                let _ = shutdown_tx.send(true);
+                result.expect("Server finished with an error");
+            });
+
+            let connection_limit = Arc::new(Semaphore::new(2));
+
+            loop {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_ok() && *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    permit = connection_limit.clone().acquire_owned() => {
+                        let permit = permit.unwrap();
+
+                        tokio::select! {
+                            changed = shutdown_rx.changed() => {
+                                if changed.is_ok() && *shutdown_rx.borrow() {
+                                    break;
+                                }
+                            }
+                            accepted = listener.accept() => {
+                                let (stream, client_address) = accepted.unwrap();
+                                let stream = TokioIo::new(stream);
+
+                                if let Some(on_client_connect) = &on_client_connect {
+                                    on_client_connect(client_address);
+                                }
+
+                                let server_sender = sender.clone();
+                                let on_request = on_request.clone();
+                                let on_client_disconnect = on_client_disconnect.clone();
+
+                                tokio::spawn(async move {
+                                    let service = service_fn(move |request| {
+                                        let server_sender = server_sender.clone();
+                                        let on_request = on_request.clone();
+                                        async move {
+                                            let response = on_request(request, server_sender).await;
+                                            Ok::<_, hyper::Error>(response)
+                                        }
+                                    });
+
+                                    let handler = hyper_server::Builder::new();
+                                    let connection = handler.serve_connection(stream, service);
+                                    let result = connection.await;
+                                    drop(permit);
+                                    result.expect("Client finished with an error");
+
+                                    if let Some(on_client_disconnect) = on_client_disconnect {
+                                        on_client_disconnect();
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
             }
         };
 
@@ -117,60 +171,6 @@ impl<'a> Proxy<'a> {
         let sender = Arc::new(Mutex::new(sender));
 
         (sender, Box::pin(connection.fuse()))
-    }
-
-    async fn accept_client<F, Fut>(
-        listener: &TcpListener,
-        server_sender: Arc<Mutex<SendRequest<Full<Bytes>>>>,
-        on_request: Arc<F>,
-        on_client_connect: &Option<Box<dyn Fn(SocketAddr) + Send + Sync>>,
-    ) -> Pin<Box<Fuse<impl Future<Output = Result<(), hyper::Error>>>>>
-    where
-        F: Fn(Request<Incoming>, Arc<Mutex<SendRequest<Full<Bytes>>>>) -> Fut,
-        Fut: Future<Output = Response<Full<Bytes>>>,
-    {
-        let (stream, client_address) = listener.accept().await.unwrap();
-        let stream = TokioIo::new(stream);
-
-        if let Some(on_client_connect) = on_client_connect {
-            on_client_connect(client_address);
-        }
-
-        let service = service_fn(move |request| {
-            let server_sender = server_sender.clone();
-            let on_request = on_request.clone();
-            async move {
-                let response = on_request(request, server_sender).await;
-                Ok::<_, hyper::Error>(response)
-            }
-        });
-
-        let handler = hyper_server::Builder::new();
-        let connection = handler.serve_connection(stream, service);
-        Box::pin(connection.fuse())
-    }
-
-    async fn handle_connections(
-        client_connection: &mut Pin<Box<Fuse<impl Future<Output = Result<(), hyper::Error>>>>>,
-        server_connection: &mut Pin<Box<Fuse<impl Future<Output = Result<(), hyper::Error>>>>>,
-        on_client_disconnect: &Option<Box<dyn Fn() + Send + Sync>>,
-    ) -> bool {
-        let (client_finished, result) = tokio::select! {
-            client_result = client_connection => (true, client_result),
-            server_result = server_connection => (false, server_result),
-        };
-
-        if client_finished {
-            result.expect("Client finished with an error");
-
-            if let Some(on_client_disconnect) = on_client_disconnect {
-                on_client_disconnect();
-            }
-        } else {
-            result.expect("Server finished with an error");
-        }
-
-        client_finished
     }
 }
 
