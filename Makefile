@@ -26,9 +26,14 @@ clippy:
 test: up
 	cargo test
 
-.PHONY: ccm-wrapper-tests
+.PHONY: ccm-wrapper-tests load-balancing-tests ccm-tests
 ccm-wrapper-tests:
 	RUSTFLAGS="--cfg ccm_tests" cargo test --test ccm_wrapper_tests -- --nocapture
+
+load-balancing-tests:
+	RUSTFLAGS="--cfg ccm_tests" cargo test --test load_balancing_tests -- --nocapture
+
+ccm-tests: ccm-wrapper-tests load-balancing-tests
 
 .PHONY: up
 up:

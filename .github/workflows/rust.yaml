@@ -25,7 +25,7 @@ jobs:
     - uses: actions/checkout@v5
     - name: Install scylla-ccm
       run: pip3 install https://github.com/scylladb/scylla-ccm/archive/master.zip
-    - name: CCM wrapper tests
-      run: make ccm-wrapper-tests
+    - name: CCM tests
+      run: make ccm-tests
     - name: Tests
       run: make test
