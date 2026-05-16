@@ -4,6 +4,7 @@ mod config;
 mod customize;
 mod header_whitelist;
 mod interceptors;
+pub mod keyrouting;
 mod live_nodes;
 mod query_plan;
 mod routing_scope;
