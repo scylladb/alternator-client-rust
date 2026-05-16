@@ -4,7 +4,7 @@
 //!
 //! The proxy is expected to live no longer than the server.
 //! When the server is closed, the future finishes.
-//! The proxy can accept many clients during its lifetime, up to 2 at a time.
+//! The proxy can accept many clients during its lifetime, up to 3 at a time.
 //!
 //! It comes with three hooks:
 //! - `on_request`
@@ -81,7 +81,7 @@ impl<'a> Proxy<'a> {
                 result.expect("Server finished with an error");
             });
 
-            let connection_limit = Arc::new(Semaphore::new(2));
+            let connection_limit = Arc::new(Semaphore::new(3));
 
             loop {
                 tokio::select! {

@@ -7,6 +7,11 @@ use crate::load_balancing::scope_utils;
 use alternator_driver::AlternatorClient;
 use alternator_driver::AlternatorConfig;
 use alternator_driver::RoutingScope;
+use alternator_driver::keyrouting::affinity_config::{
+    KeyRouteAffinityConfig, KeyRouteAffinityType,
+};
+use alternator_driver::keyrouting::{go_rand::GoRand, hasher};
+use aws_sdk_dynamodb::types::AttributeValue;
 use hyper::Method;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,12 +79,14 @@ fn redirect_target_node(cluster: &Cluster) -> Node {
     cluster.datacenters()[0].racks()[0].nodes()[0].clone()
 }
 
-// Struct for counting requests made to the proxy. GETs and POSTs are counted separately.
-// GETs are service discovery calls, and POSTs are the actual calls to DB.
+// Struct for counting requests made to the proxy. GETs, POSTs, and describe_tables are counted separately.
+// GETs are service discovery calls, POSTs are the actual calls to DB, and describe_table calls
+// are from PartitionKeyResolver.
 #[derive(Debug)]
 pub(crate) struct NodeCounter {
     posts: AtomicUsize,
     gets: AtomicUsize,
+    describe_tables: AtomicUsize,
 }
 
 impl NodeCounter {
@@ -87,6 +94,7 @@ impl NodeCounter {
         Self {
             posts: AtomicUsize::new(0),
             gets: AtomicUsize::new(0),
+            describe_tables: AtomicUsize::new(0),
         }
     }
 
@@ -97,6 +105,7 @@ impl NodeCounter {
     fn reset(&self) {
         self.posts.store(0, Ordering::Relaxed);
         self.gets.store(0, Ordering::Relaxed);
+        self.describe_tables.store(0, Ordering::Relaxed);
     }
 }
 
@@ -110,13 +119,25 @@ pub(crate) async fn start_counting_proxy(
         connect_addr,
         move |req, send| {
             let node_counter = Arc::clone(&request_counter);
-
             async move {
                 {
+                    let is_describe_table = req
+                        .headers()
+                        .get("x-amz-target")
+                        .is_some_and(|h| h == "DynamoDB_20120810.DescribeTable");
+
                     match *req.method() {
-                        Method::POST => node_counter.posts.fetch_add(1, Ordering::Relaxed),
-                        Method::GET => node_counter.gets.fetch_add(1, Ordering::Relaxed),
-                        _ => 0,
+                        Method::POST => {
+                            if is_describe_table {
+                                node_counter.describe_tables.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                node_counter.posts.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Method::GET => {
+                            node_counter.gets.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
                     };
                 }
                 proxy::forward_on_request(req, send).await
@@ -248,6 +269,13 @@ impl RequestCounter {
             .map(|(_, c)| c.posts.load(Ordering::Relaxed))
             .sum()
     }
+
+    pub(crate) fn total_describe_tables(&self) -> usize {
+        self.counter
+            .values()
+            .map(|c| c.describe_tables.load(Ordering::Relaxed))
+            .sum()
+    }
 }
 
 // Make calls without caring about the result, used to count where calls are directed.
@@ -255,6 +283,76 @@ async fn make_n_calls(client: &AlternatorClient, n: usize) {
     for _ in 0..n {
         let _ = client.list_tables().send().await;
     }
+}
+
+pub(crate) async fn create_table(client: &AlternatorClient, table_name: &str) {
+    client
+        .create_table()
+        .table_name(table_name)
+        .attribute_definitions(
+            aws_sdk_dynamodb::types::AttributeDefinition::builder()
+                .attribute_name("id")
+                .attribute_type(aws_sdk_dynamodb::types::ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            aws_sdk_dynamodb::types::KeySchemaElement::builder()
+                .attribute_name("id")
+                .key_type(aws_sdk_dynamodb::types::KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+}
+
+pub(crate) async fn put_item(client: &AlternatorClient, table_name: &str, item: &str) {
+    let _ = client
+        .put_item()
+        .table_name(table_name)
+        .item(
+            "id",
+            aws_sdk_dynamodb::types::AttributeValue::S(item.to_string()),
+        )
+        .send()
+        .await;
+}
+
+pub(crate) async fn delete_item(client: &AlternatorClient, table_name: &str, item: &str) {
+    let _ = client
+        .delete_item()
+        .table_name(table_name)
+        .key(
+            "id",
+            aws_sdk_dynamodb::types::AttributeValue::S(item.to_string()),
+        )
+        .send()
+        .await;
+}
+
+pub(crate) async fn update_item(
+    client: &AlternatorClient,
+    table_name: &str,
+    item: &str,
+    new: &str,
+) {
+    let _ = client
+        .update_item()
+        .table_name(table_name)
+        .key(
+            "id",
+            aws_sdk_dynamodb::types::AttributeValue::S(item.to_string()),
+        )
+        .update_expression("SET val = :v")
+        .expression_attribute_values(
+            ":v",
+            aws_sdk_dynamodb::types::AttributeValue::S(new.to_string()),
+        )
+        .send()
+        .await;
 }
 
 // Create a basic client with scope.
@@ -292,6 +390,34 @@ async fn wait_until_live_nodes_match(client: &AlternatorClient, ips: Vec<&str>) 
             ips, POLLING_TIMEOUT
         )
     });
+}
+
+fn create_client_with_scope_and_affinity(
+    cluster: &Cluster,
+    scope: RoutingScope,
+    affinity_config: KeyRouteAffinityConfig,
+) -> AlternatorClient {
+    AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .region(aws_sdk_dynamodb::config::Region::new("eu-central-1"))
+            .behavior_version_latest()
+            .endpoint_url(default_endpoint_url(cluster))
+            .routing_scope(scope)
+            .key_route_affinity(affinity_config)
+            .build(),
+    )
+}
+
+fn expected_first_node<'a>(nodes: &'a [&str], partition_key_value: &str) -> &'a str {
+    let pk = AttributeValue::S(partition_key_value.to_string());
+    let hash = hasher::hash_attribute_value(&pk).unwrap();
+
+    let mut rng = GoRand::new(hash as i64);
+    let idx = rng.intn(nodes.len() as i32) as usize;
+    nodes[idx]
 }
 
 #[tokio::test]
@@ -578,5 +704,151 @@ async fn round_robin_test() {
         }
 
         request_counter.reset();
+    }
+}
+
+/// Test if describe table is called exactly once when partition key info is not provided.
+#[tokio::test]
+#[cfg_attr(not(ccm_tests), ignore)]
+async fn describe_table_called_exactly_once_without_config() {
+    let mut guard = get_cluster().await;
+    let cluster = &mut *guard;
+
+    let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
+    let request_counter = RequestCounter::from_cluster(cluster);
+    start_proxies(cluster, PROXY_PORT, &request_counter).await;
+
+    let table_name = format!("test_table_{}", uuid::Uuid::new_v4());
+    let affinity_config = KeyRouteAffinityConfig::builder()
+        .with_type(KeyRouteAffinityType::AnyWrite)
+        .build();
+    let client = create_client_with_scope_and_affinity(cluster, scope.clone(), affinity_config);
+    create_table(&client, &table_name).await;
+
+    assert_eq!(request_counter.total_describe_tables(), 0);
+
+    for i in 0..5 {
+        put_item(&client, &table_name, &format!("key_{}", i + 1)).await;
+    }
+
+    tokio::time::timeout(POLLING_TIMEOUT, async {
+        loop {
+            if request_counter.total_describe_tables() == 1 {
+                break;
+            }
+            tokio::time::sleep(POLLING_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "DescribeTable was not called exactly once; got {}",
+            request_counter.total_describe_tables()
+        )
+    });
+
+    for _ in 0..3 {
+        for j in 0..=5 {
+            let item = format!("key_{}", j);
+            update_item(&client, &table_name, &item, &format!("new_{}", item)).await;
+        }
+    }
+
+    assert_eq!(request_counter.total_describe_tables(), 1);
+
+    for i in 0..5 {
+        delete_item(&client, &table_name, &format!("key_{}", i + 1)).await;
+    }
+
+    assert_eq!(request_counter.total_describe_tables(), 1);
+}
+
+#[tokio::test]
+#[cfg_attr(not(ccm_tests), ignore)]
+async fn describe_table_not_called_with_config() {
+    let mut guard = get_cluster().await;
+    let cluster = &mut *guard;
+
+    let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
+    let request_counter = RequestCounter::from_cluster(cluster);
+    start_proxies(cluster, PROXY_PORT, &request_counter).await;
+
+    let table_name = format!("test_table_{}", uuid::Uuid::new_v4());
+    let affinity_config = KeyRouteAffinityConfig::builder()
+        .with_type(KeyRouteAffinityType::AnyWrite)
+        .with_pk_info(&table_name, "id")
+        .build();
+    let client = create_client_with_scope_and_affinity(cluster, scope.clone(), affinity_config);
+    create_table(&client, &table_name).await;
+
+    assert_eq!(request_counter.total_describe_tables(), 0);
+
+    for i in 0..5 {
+        put_item(&client, &table_name, &format!("key_{}", i + 1)).await;
+    }
+
+    assert_eq!(request_counter.total_describe_tables(), 0);
+
+    for _ in 0..3 {
+        for j in 0..=5 {
+            let item = format!("key_{}", j);
+            update_item(&client, &table_name, &item, &format!("new_{}", item)).await;
+        }
+    }
+
+    assert_eq!(request_counter.total_describe_tables(), 0);
+
+    for i in 0..5 {
+        delete_item(&client, &table_name, &format!("key_{}", i + 1)).await;
+    }
+
+    assert_eq!(request_counter.total_describe_tables(), 0);
+}
+
+/// Test if the routing is deterministic, and all calls go to the same node.
+#[tokio::test]
+#[cfg_attr(not(ccm_tests), ignore)]
+async fn affinity_deterministic_routing_test() {
+    let mut guard = get_cluster().await;
+    let cluster = &mut *guard;
+
+    let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
+    let request_counter = RequestCounter::from_cluster(cluster);
+
+    start_proxies(cluster, PROXY_PORT, &request_counter).await;
+    let table_name = format!("test_table_{}", uuid::Uuid::new_v4());
+    let affinity_config = KeyRouteAffinityConfig::builder()
+        .with_type(KeyRouteAffinityType::AnyWrite)
+        .with_pk_info(&table_name, "id")
+        .build();
+    let client = create_client_with_scope_and_affinity(cluster, scope.clone(), affinity_config);
+    wait_until_live_nodes_match(
+        &client,
+        scope_utils::working_nodes_ips_in_scope(cluster, &scope),
+    )
+    .await;
+    create_table(&client, &table_name).await;
+
+    for i in 0..5 {
+        request_counter.reset();
+
+        let item = format!("key_{}", i + 1);
+        put_item(&client, &table_name, &item).await;
+        for _ in 0..=5 {
+            update_item(&client, &table_name, &item, &format!("new_{}", item)).await;
+        }
+        delete_item(&client, &table_name, &item).await;
+
+        let ips_in_scope = scope_utils::ips_in_scope(cluster, &scope);
+
+        let called_node_ip = ips_in_scope
+            .iter()
+            .find(|ip| request_counter.get(ip).posts() > 0)
+            .unwrap();
+
+        assert_eq!(request_counter.get_posts_to_other_ips(&[called_node_ip]), 0);
+
+        let expected_ip = expected_first_node(ips_in_scope.as_slice(), &item);
+        assert_eq!(*called_node_ip, expected_ip);
     }
 }
