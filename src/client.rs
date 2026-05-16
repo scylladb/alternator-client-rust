@@ -30,13 +30,12 @@ impl AlternatorClient {
         let enforce_header_whitelist = extensions.enforce_header_whitelist.unwrap_or(true);
         let has_region = dynamodb_config.region().is_some();
 
-        let mut dynamodb_config =
-            dynamodb_config
-                .to_builder()
-                .interceptor(AlternatorInterceptor::new(
-                    request_compression,
-                    enforce_header_whitelist,
-                ));
+        let mut builder = dynamodb_config
+            .to_builder()
+            .interceptor(AlternatorInterceptor::new(
+                request_compression,
+                enforce_header_whitelist,
+            ));
 
         // If live nodes are not in config - create new config with live nodes.
         let (config, live_nodes) = if let Some(nodes) = config.live_nodes() {
@@ -48,18 +47,49 @@ impl AlternatorClient {
             (config, None)
         };
 
-        if let Some(nodes) = &live_nodes {
-            dynamodb_config =
-                dynamodb_config.interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()));
-        }
-
         if !has_region {
-            dynamodb_config.set_region(Some(aws_sdk_dynamodb::config::Region::from_static(
+            builder = builder.region(Some(aws_sdk_dynamodb::config::Region::from_static(
                 "us-east-1",
             )));
         }
 
-        let dynamodb_config = dynamodb_config.build();
+        let routing_interceptor: Option<aws_sdk_dynamodb::config::SharedInterceptor> = match (
+            live_nodes.as_ref(),
+            config.key_route_affinity().filter(|c| c.is_enabled()),
+        ) {
+            (None, _) => None,
+            (Some(nodes), None) => Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
+                RoundRobinQueryPlanInterceptor::new(nodes.clone()),
+            )),
+            (Some(nodes), Some(cfg)) => {
+                // The affinity interceptor needs a PartitionKeyResolver, which needs a client
+                // to make DescribeTable calls. Using the main client for that would create a
+                // cycle: main client -> affinity interceptor -> resolver -> DescribeTable
+                // -> main client. Build a separate discovery client from the same base config
+                // but with round-robin routing only..
+                let pk_discovery_client = aws_sdk_dynamodb::Client::from_conf(
+                    builder
+                        .clone()
+                        .interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()))
+                        .build(),
+                );
+                let resolver =
+                    std::sync::Arc::new(keyrouting::resolver::PartitionKeyResolver::new(
+                        pk_discovery_client,
+                        cfg.pk_info_per_table.clone(),
+                    ));
+                Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
+                    AffinityQueryPlanInterceptor::new(cfg.clone(), nodes.clone(), resolver),
+                ))
+            }
+        };
+
+        if let Some(interceptor) = routing_interceptor {
+            builder = builder.interceptor(interceptor);
+        }
+
+        let dynamodb_config = builder.build();
+
         let dynamodb_client = aws_sdk_dynamodb::Client::from_conf(dynamodb_config);
 
         if let Some(nodes) = live_nodes {
