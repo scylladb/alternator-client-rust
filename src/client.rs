@@ -4,8 +4,8 @@ use crate::*;
 ///
 /// A simple wrapper around [aws_sdk_dynamodb::Client], that adds hooks with alternator-specific optimizations.
 ///
-/// By default, enables gzip request compression, strips requests from headers that are not used by alternator,
-/// and chooses an arbitrary aws region, as alternator doesn't require one.
+/// By default, enables round-robin load balancing, gzip request compression, strips requests from headers
+/// that are not used by alternator, and chooses an arbitrary aws region, as alternator doesn't require one.
 ///
 /// Can be build using [AlternatorConfig] like so:
 /// ```ignore
@@ -38,7 +38,16 @@ impl AlternatorClient {
                     enforce_header_whitelist,
                 ));
 
-        let live_nodes = LiveNodes::new(&config);
+        // If live nodes are not in config - create new config with live nodes.
+        let (config, live_nodes) = if let Some(nodes) = config.live_nodes() {
+            (config, Some(nodes))
+        } else if let Some(nodes) = LiveNodes::new(&config) {
+            let config = config.to_builder().live_nodes(nodes.clone()).build();
+            (config, Some(nodes))
+        } else {
+            (config, None)
+        };
+
         if let Some(nodes) = &live_nodes {
             dynamodb_config =
                 dynamodb_config.interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()));
@@ -61,6 +70,13 @@ impl AlternatorClient {
             dynamodb_client,
             config,
         }
+    }
+
+    pub fn from_conf_with_live_nodes(
+        config: AlternatorConfig,
+        live_nodes: std::sync::Arc<LiveNodes>,
+    ) -> Self {
+        Self::from_conf(config.to_builder().live_nodes(live_nodes).build())
     }
 
     pub fn new(sdk_config: &aws_types::sdk_config::SdkConfig) -> Self {
