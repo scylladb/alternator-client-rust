@@ -18,6 +18,7 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) scheme: Option<String>,
     pub(crate) port: Option<u16>,
     pub(crate) seed_hosts: Option<Vec<String>>,
+    pub(crate) live_nodes: Option<std::sync::Arc<LiveNodes>>,
 }
 
 /// [AlternatorClient]'s config
@@ -146,6 +147,21 @@ impl AlternatorConfig {
     pub fn seed_hosts(&self) -> Option<Vec<String>> {
         self.alternator_ext.seed_hosts.clone()
     }
+
+    /// The [`LiveNodes`] instance shared into this config, if any.
+    ///
+    /// On a config you have built but not yet used, this is [`None`] unless you
+    /// set it via [`live_nodes`], and [`None`] means a client built from it will
+    /// construct its own. On the config a client stores ([`config()`]), this is
+    /// populated: the constructor sets the instance it created so the stored config
+    /// reflects what the client actually uses. It is [`None`] there only if
+    /// constructing [`LiveNodes`] failed.
+    ///
+    /// [`live_nodes`]: Self::live_nodes
+    /// [`config()`]: AlternatorClient::config
+    pub fn live_nodes(&self) -> Option<std::sync::Arc<LiveNodes>> {
+        self.alternator_ext.live_nodes.clone()
+    }
 }
 
 /// Builder for [AlternatorConfig]
@@ -161,6 +177,7 @@ impl AlternatorConfig {
 ///     .build();
 ///
 /// let client = AlternatorClient::from_conf(config);
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct AlternatorBuilder {
     pub(crate) dynamodb_builder: aws_sdk_dynamodb::config::Builder,
@@ -389,6 +406,80 @@ impl AlternatorBuilder {
     /// Use with [`AlternatorBuilder::scheme`] and [`AlternatorBuilder::port`] to construct the endpoint URIs.
     pub fn set_seed_hosts(&mut self, seed_hosts: Vec<String>) -> &mut Self {
         self.alternator_ext.seed_hosts = Some(seed_hosts);
+        self
+    }
+
+    /// Share an existing [`LiveNodes`] instance across clients (optional).
+    ///
+    /// By default you never need to call this. Every client built from a config
+    /// constructs its own [`LiveNodes`] and spawns a background task that discovers
+    /// and periodically refreshes the set of live cluster nodes. If you run several
+    /// clients with the same load-balancing settings, each one spawns its own task,
+    /// and they all do identical work.
+    ///
+    /// Setting this lets those clients share a single [`LiveNodes`], and therefore
+    /// a single discovery task instead of each running their own.
+    ///
+    /// The discovery task is owned by the [`LiveNodes`] instance: it lives as long
+    /// as the instance does and stops once the last [`Arc`] to it is dropped. The
+    /// instance is shared through an [`Arc`], so handing the same one to several
+    /// clients is exactly how they come to share that one task.
+    ///
+    /// When you pass a shared instance, these settings on this config are
+    /// ignored - the shared [`LiveNodes`] already has its own, fixed at the
+    /// time it was constructed:
+    /// - active and idle refresh intervals
+    /// - routing scope
+    /// - seed hosts
+    /// - scheme and port
+    ///
+    /// Construct the instance to share with [`LiveNodes::new`], then pass it here.
+    /// If you already have a built [`AlternatorConfig`],
+    /// [`AlternatorClient::from_conf_with_live_nodes`] takes both at once, so you
+    /// don't have to rebuild the config yourself to inject the instance.
+    ///
+    /// For more information, see [`LiveNodes`].
+    ///
+    /// [`Arc`]: std::sync::Arc
+    pub fn live_nodes(mut self, live_nodes: std::sync::Arc<LiveNodes>) -> Self {
+        self.set_live_nodes(live_nodes);
+        self
+    }
+
+    /// Share an existing [`LiveNodes`] instance across clients (optional).
+    ///
+    /// By default you never need to call this. Every client built from a config
+    /// constructs its own [`LiveNodes`] and spawns a background task that discovers
+    /// and periodically refreshes the set of live cluster nodes. If you run several
+    /// clients with the same load-balancing settings, each one spawns its own task,
+    /// and they all do identical work.
+    ///
+    /// Setting this lets those clients share a single [`LiveNodes`], and therefore
+    /// a single discovery task instead of each running their own.
+    ///
+    /// The discovery task is owned by the [`LiveNodes`] instance: it lives as long
+    /// as the instance does and stops once the last [`Arc`] to it is dropped. The
+    /// instance is shared through an [`Arc`], so handing the same one to several
+    /// clients is exactly how they come to share that one task.
+    ///
+    /// When you pass a shared instance, these settings on this config are
+    /// ignored - the shared [`LiveNodes`] already has its own, fixed at the
+    /// time it was constructed:
+    /// - active and idle refresh intervals
+    /// - routing scope
+    /// - seed hosts
+    /// - scheme and port
+    ///
+    /// Construct the instance to share with [`LiveNodes::new`], then pass it here.
+    /// If you already have a built [`AlternatorConfig`],
+    /// [`AlternatorClient::from_conf_with_live_nodes`] takes both at once, so you
+    /// don't have to rebuild the config yourself to inject the instance.
+    ///
+    /// For more information, see [`LiveNodes`].
+    ///
+    /// [`Arc`]: std::sync::Arc
+    pub fn set_live_nodes(&mut self, live_nodes: std::sync::Arc<LiveNodes>) -> &mut Self {
+        self.alternator_ext.live_nodes = Some(live_nodes);
         self
     }
 }
@@ -998,5 +1089,32 @@ mod test {
             .build();
 
         assert_eq!(config.scheme(), Some("http".to_string()));
+    }
+
+    #[test]
+    fn test_live_nodes_sharing() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("http://127.0.0.1:8000")
+            .build();
+
+        let live_nodes = LiveNodes::new(&config).unwrap();
+
+        // The client can be built with the provided live_nodes instance.
+        let client1 = AlternatorClient::from_conf_with_live_nodes(config, live_nodes.clone());
+
+        // live_nodes can also be insterted into a new config.
+        let config2 = AlternatorConfig::builder()
+            .live_nodes(live_nodes.clone())
+            .behavior_version_latest()
+            .build();
+
+        let client2 = AlternatorClient::from_conf(config2);
+
+        // Assert that they point to the exact same Arc.
+        assert!(std::sync::Arc::ptr_eq(
+            &client1.config().live_nodes().unwrap(),
+            &client2.config().live_nodes().unwrap()
+        ));
     }
 }
