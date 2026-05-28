@@ -144,6 +144,7 @@ pub async fn test_request_compression_gzip(ctx: &mut HttpTestContext<Config>) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -193,6 +194,7 @@ pub async fn test_request_compression_zlib(ctx: &mut HttpTestContext<Config>) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -271,6 +273,7 @@ pub async fn test_enabled_by_per_request_customization(ctx: &mut HttpTestContext
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -380,6 +383,7 @@ pub async fn test_disabled_by_per_request_customization(ctx: &mut HttpTestContex
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),

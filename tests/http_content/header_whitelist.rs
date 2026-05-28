@@ -200,6 +200,7 @@ pub async fn test_without_credentials(ctx: &mut HttpTestContext<WithoutCredentia
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .enforce_header_whitelist(true)
             .allow_no_auth()
@@ -259,6 +260,7 @@ pub async fn test_with_credentials(ctx: &mut HttpTestContext<WithCredentialsConf
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .enforce_header_whitelist(true)
             .credentials_provider(
@@ -319,6 +321,7 @@ pub async fn test_whitelist_needed(ctx: &mut HttpTestContext<WhitelistNeededConf
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .enforce_header_whitelist(false)
             .credentials_provider(
@@ -429,6 +432,7 @@ pub async fn test_enabled_by_per_request_customization(
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -456,6 +460,7 @@ pub async fn test_disabled_by_per_request_customization(
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
