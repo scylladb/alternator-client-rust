@@ -50,7 +50,7 @@
 //!
 //! 1. If discovery is already running, return immediately (a relaxed atomic load, essentially free).
 //! 2. Runtime check: if no Tokio runtime is available on the current thread, return without spawning.
-//!    The task will be started lazily on the first [`get_next_node_round_robin`] call,
+//!    The task will be started lazily on the first [`get_next_node_round_robin`] or [`get_live_nodes`] call,
 //!    which is always invoked from within the request pipeline and therefore always inside a runtime.
 //! 3. A `compare_exchange` on `discovery_started` ensures that
 //!    exactly one caller wins the right to spawn the task, even under
@@ -69,6 +69,7 @@
 //! [`start`]: LiveNodes::start
 //! [`update_live_nodes`]: LiveNodes::update_live_nodes
 //! [`get_next_node_round_robin`]: LiveNodes::get_next_node_round_robin
+//! [`get_live_nodes`]: LiveNodes::get_live_nodes
 //! [`live_nodes`]: LiveNodes::live_nodes
 //! [`from_conf`]: crate::client::AlternatorClient::from_conf
 
@@ -226,6 +227,12 @@ impl LiveNodes {
         if was_idle {
             self.notify.notify_one();
         }
+    }
+
+    /// Returns a list of all current live nodes and updates the last activity timestamp.
+    pub fn get_live_nodes(self: &Arc<Self>) -> Vec<Arc<Url>> {
+        self.mark_activity();
+        self.live_nodes.load().as_ref().clone()
     }
 
     /// Returns the first live node not in `used_nodes` starting with the next node in round-robin order.

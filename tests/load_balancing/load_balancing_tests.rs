@@ -19,9 +19,8 @@ use tokio::sync::{Mutex, MutexGuard};
 const PROXY_PORT: u16 = 7999;
 const ALTERNATOR_PORT: u16 = 8000;
 
-// The client will use different refresh intervals for idle mode (when nothing happened for a while)
-// and active mode, when calls are being made. Exact value might change later.
-const ACTIVE_INTERVAL: Duration = Duration::from_secs(1);
+const POLLING_TIMEOUT: Duration = Duration::from_secs(5);
+const POLLING_INTERVAL: Duration = Duration::from_millis(50);
 
 // Since cluster creation is expensive, we create it once and reuse it for every test.
 // Before a test gets access to the cluster, we make sure that all nodes are up and their ports are set to default.
@@ -273,6 +272,28 @@ fn create_client_with_scope(cluster: &Cluster, scope: RoutingScope) -> Alternato
     )
 }
 
+// Poll until the client's live nodes match the given IPs, or timeout.
+async fn wait_until_live_nodes_match(client: &AlternatorClient, ips: Vec<&str>) {
+    let live_nodes = client.config().live_nodes().unwrap().clone();
+    tokio::time::timeout(POLLING_TIMEOUT, async {
+        loop {
+            let nodes = live_nodes.get_live_nodes();
+            let node_ips: Vec<&str> = nodes.iter().map(|url| url.host_str().unwrap()).collect();
+            if node_ips.len() == ips.len() && node_ips.iter().all(|ip| ips.contains(ip)) {
+                break;
+            }
+            tokio::time::sleep(POLLING_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "failed to update nodes\nexpected nodes {:?}, timed out after {:?}",
+            ips, POLLING_TIMEOUT
+        )
+    });
+}
+
 #[tokio::test]
 #[cfg_attr(not(ccm_tests), ignore)]
 async fn calls_correct_datacenter_scope_test() {
@@ -285,7 +306,11 @@ async fn calls_correct_datacenter_scope_test() {
     let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
     let client = create_client_with_scope(cluster, scope.clone());
 
-    tokio::time::sleep(ACTIVE_INTERVAL).await;
+    wait_until_live_nodes_match(
+        &client,
+        scope_utils::working_nodes_ips_in_scope(cluster, &scope),
+    )
+    .await;
     let n = 20;
     make_n_calls(&client, n).await;
 
@@ -313,7 +338,11 @@ async fn calls_correct_rack_scope_test() {
     let scope = scope_utils::rack_scope_from_index(cluster, 1, 1);
     let client = create_client_with_scope(cluster, scope.clone());
 
-    tokio::time::sleep(ACTIVE_INTERVAL).await;
+    wait_until_live_nodes_match(
+        &client,
+        scope_utils::working_nodes_ips_in_scope(cluster, &scope),
+    )
+    .await;
     let n = 20;
     make_n_calls(&client, n).await;
 
@@ -341,8 +370,16 @@ async fn node_shut_down_test() {
 
     // This counter holds all nodes that were shut down, sum of its counters should always be 0.
     let mut request_counter = RequestCounter::new();
-    while let Some(node) = scope_utils::scope_first_working_node_mut(cluster, &scope) {
-        tokio::time::sleep(ACTIVE_INTERVAL).await;
+    loop {
+        let ips_owned: Vec<String> = scope_utils::working_nodes_ips_in_scope(cluster, &scope)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let Some(node) = scope_utils::scope_first_working_node_mut(cluster, &scope) else {
+            break;
+        };
+        let ips: Vec<&str> = ips_owned.iter().map(String::as_str).collect();
+        wait_until_live_nodes_match(&client, ips).await;
         make_n_calls(&client, 10).await;
         assert_eq!(request_counter.total_posts(), 0);
         Ccm::stop_node(node).unwrap();
@@ -374,7 +411,12 @@ async fn scope_fallback_test() {
     make_n_calls(&client, 5).await;
 
     scope_utils::shut_down_scope(cluster, &scope);
-    tokio::time::sleep(ACTIVE_INTERVAL).await;
+    wait_until_live_nodes_match(
+        &client,
+        scope_utils::working_nodes_ips_in_scope(cluster, &fallback_scope),
+    )
+    .await;
+
     request_counter.reset();
 
     let n = 20;
@@ -401,7 +443,11 @@ async fn primary_scope_recover_test() {
     start_redirecting_proxies(cluster, PROXY_PORT, &request_counter).await;
 
     let client = create_client_with_scope(cluster, scope.clone());
-    tokio::time::sleep(ACTIVE_INTERVAL).await;
+    wait_until_live_nodes_match(
+        &client,
+        scope_utils::working_nodes_ips_in_scope(cluster, &fallback_scope),
+    )
+    .await;
 
     let n = 20;
     make_n_calls(&client, n).await;
@@ -414,7 +460,7 @@ async fn primary_scope_recover_test() {
     let mut nodes = scope_utils::nodes_in_scope_mut(cluster, &scope);
     let node_to_start = &mut nodes[0];
     Ccm::start_node(node_to_start).unwrap();
-    tokio::time::sleep(ACTIVE_INTERVAL).await;
+    wait_until_live_nodes_match(&client, vec![node_to_start.ip.as_str()]).await;
 
     request_counter.reset();
     make_n_calls(&client, n).await;
@@ -487,7 +533,11 @@ async fn node_restart_test() {
     let counter = request_counter.get(&stopped_node_ip);
     start_proxy_on_node(restarted_node.clone(), PROXY_PORT, counter.clone()).await;
 
-    tokio::time::sleep(ACTIVE_INTERVAL).await;
+    wait_until_live_nodes_match(
+        &client,
+        scope_utils::working_nodes_ips_in_scope(cluster, &scope),
+    )
+    .await;
     make_n_calls(&client, 20).await;
     assert!(counter.posts() > 0);
 }
@@ -503,7 +553,11 @@ async fn round_robin_test() {
 
     let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
     let client = create_client_with_scope(cluster, scope.clone());
-    tokio::time::sleep(ACTIVE_INTERVAL).await;
+    wait_until_live_nodes_match(
+        &client,
+        scope_utils::working_nodes_ips_in_scope(cluster, &scope),
+    )
+    .await;
 
     let n = 10;
 
