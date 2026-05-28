@@ -22,6 +22,11 @@
 //!    register it with HttpTestContext::register_resource()
 //!
 //! 5. You can override the initial on_request with HttpTestContext::set_on_request().
+//!
+//! **Note:** since load balancing is automatically enabled,
+//! the GETs from the discovery may interfere with the test logic.
+//! To work around this, you can disable load balancing by setting an empty list
+//! of seed hosts in the client configuration, using `.seed_hosts(Vec::<String>::new())`.
 
 use crate::http_content::proxy::*;
 
