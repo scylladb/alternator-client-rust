@@ -231,6 +231,7 @@ impl LiveNodes {
 
     /// Returns a list of all current live nodes and updates the last activity timestamp.
     pub fn get_live_nodes(self: &Arc<Self>) -> Vec<Arc<Url>> {
+        self.ensure_discovery_started();
         self.mark_activity();
         self.live_nodes.load().as_ref().clone()
     }
@@ -353,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn start_on_first_access() {
+    fn start_on_first_access_round_robin() {
         let nodes = LiveNodes::new(&test_config()).unwrap();
         LiveNodes::ensure_discovery_started(&nodes);
         assert!(!nodes.discovery_started.load(Ordering::Acquire));
@@ -361,6 +362,19 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let _ = nodes.get_next_node_round_robin(&std::collections::HashSet::new());
+        });
+        assert!(nodes.discovery_started.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn start_on_first_access() {
+        let nodes = LiveNodes::new(&test_config()).unwrap();
+        LiveNodes::ensure_discovery_started(&nodes);
+        assert!(!nodes.discovery_started.load(Ordering::Acquire));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let _ = nodes.get_live_nodes();
         });
         assert!(nodes.discovery_started.load(Ordering::Acquire));
     }
