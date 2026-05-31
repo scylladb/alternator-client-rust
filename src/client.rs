@@ -8,7 +8,7 @@ use crate::*;
 /// - enables round-robin load balancing
 /// - strips headers that are not used by the alternator from all requests
 /// - chooses an arbitrary aws region, as alternator doesn't require one
-/// - gzip request compression is enabled with threshold 1024 and level 6
+/// - does not use request compression
 ///
 /// Can be build using [AlternatorConfig] like so:
 /// ```ignore
@@ -29,7 +29,9 @@ impl AlternatorClient {
         let dynamodb_config = config.dynamodb_config.clone();
         let extensions = config.alternator_ext.clone();
 
-        let request_compression = extensions.request_compression.unwrap_or_default();
+        let request_compression = extensions
+            .request_compression
+            .unwrap_or(RequestCompression::disabled());
         let optimize_headers = extensions.optimize_headers.unwrap_or(true);
         let has_region = dynamodb_config.region().is_some();
 

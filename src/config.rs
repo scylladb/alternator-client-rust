@@ -77,7 +77,7 @@ impl AlternatorConfig {
     /// Take note, that this may break your own interceptors,
     /// if they happened to look inside the body after this happens.
     ///
-    /// By default, Gzip compression is used, with 1024 threshold and level 6 of compression.
+    /// Turned off by default.
     pub fn request_compression(&self) -> Option<RequestCompression> {
         self.alternator_ext.request_compression.clone()
     }
@@ -235,7 +235,7 @@ impl AlternatorBuilder {
     /// Take note, that this may break your own interceptors,
     /// if they happened to look inside the body after this happens.
     ///
-    /// By default, Gzip compression is used, with 1024 threshold and level 6 of compression.
+    /// Turned off by default.
     pub fn request_compression(mut self, request_compression: RequestCompression) -> Self {
         self.set_request_compression(request_compression);
         self
@@ -249,7 +249,7 @@ impl AlternatorBuilder {
     /// Take note, that this may break your own interceptors,
     /// if they happened to look inside the body after this happens.
     ///
-    /// By default, Gzip compression is used, with 1024 threshold and level 6 of compression.
+    /// Turned off by default.
     pub fn set_request_compression(
         &mut self,
         request_compression: RequestCompression,
