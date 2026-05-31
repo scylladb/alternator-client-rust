@@ -11,7 +11,7 @@ use crate::*;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AlternatorExtensions {
     pub(crate) request_compression: Option<RequestCompression>,
-    pub(crate) enforce_header_whitelist: Option<bool>,
+    pub(crate) optimize_headers: Option<bool>,
     pub(crate) active_interval: Option<std::time::Duration>,
     pub(crate) idle_interval: Option<std::time::Duration>,
     pub(crate) routing_scope: Option<RoutingScope>,
@@ -57,7 +57,7 @@ impl AlternatorConfig {
         AlternatorBuilder::from(config).build()
     }
 
-    /// Before sending each request, strip them from headers that are not used by the Alternator.
+    /// Before sending each request, strip the headers from them which are not used by the Alternator.
     ///
     /// This is done by an interceptor in `modify_before_transmit` hook.
     ///
@@ -65,8 +65,8 @@ impl AlternatorConfig {
     /// if they happened to look inside these headers after this happens.
     ///
     /// Turned on by default.
-    pub fn enforce_header_whitelist(&self) -> Option<bool> {
-        self.alternator_ext.enforce_header_whitelist
+    pub fn optimize_headers(&self) -> Option<bool> {
+        self.alternator_ext.optimize_headers
     }
 
     /// Enable / disable request compression.
@@ -201,7 +201,7 @@ impl AlternatorBuilder {
         }
     }
 
-    /// Before sending each request, strip them from headers that are not used by the Alternator.
+    /// Before sending each request, strip the headers from them which are not used by the Alternator.
     ///
     /// This is done by an interceptor in `modify_before_transmit` hook.
     ///
@@ -209,12 +209,12 @@ impl AlternatorBuilder {
     /// if they happened to look inside these headers after this happens.
     ///
     /// Turned on by default.
-    pub fn enforce_header_whitelist(mut self, enforce: bool) -> Self {
-        self.set_enforce_header_whitelist(enforce);
+    pub fn optimize_headers(mut self, optimize: bool) -> Self {
+        self.set_optimize_headers(optimize);
         self
     }
 
-    /// Before sending each request, strip them from headers that are not used by the Alternator.
+    /// Before sending each request, strip the headers from them which are not used by the Alternator.
     ///
     /// This is done by an interceptor in `modify_before_transmit` hook.
     ///
@@ -222,8 +222,8 @@ impl AlternatorBuilder {
     /// if they happened to look inside these headers after this happens.
     ///
     /// Turned on by default.
-    pub fn set_enforce_header_whitelist(&mut self, enforce: bool) -> &mut Self {
-        self.alternator_ext.enforce_header_whitelist = Some(enforce);
+    pub fn set_optimize_headers(&mut self, optimize: bool) -> &mut Self {
+        self.alternator_ext.optimize_headers = Some(optimize);
         self
     }
 
@@ -1031,7 +1031,7 @@ mod test {
             .behavior_version_latest()
             .build();
 
-        assert!(config.enforce_header_whitelist().is_none());
+        assert!(config.optimize_headers().is_none());
 
         assert_eq!(
             config
@@ -1042,7 +1042,7 @@ mod test {
 
         let config = config.to_builder().build();
 
-        assert!(config.enforce_header_whitelist().is_none());
+        assert!(config.optimize_headers().is_none());
 
         assert_eq!(
             config
@@ -1055,7 +1055,7 @@ mod test {
     #[test]
     fn config_does_not_add_hooks() {
         let config = AlternatorConfig::builder()
-            .enforce_header_whitelist(true)
+            .optimize_headers(true)
             .behavior_version_latest()
             .build();
 

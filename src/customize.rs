@@ -12,7 +12,7 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 ///     .customize()
 ///     .alternator_config_override(
 ///         AlternatorConfig::builder()
-///             .enforce_header_whitelist(false)
+///             .optimize_headers(false)
 ///             .request_compression(RequestCompression::disabled())
 ///             .behavior_version_latest()
 ///             .build()
@@ -36,11 +36,9 @@ impl<T, E, B> AlternatorCustomizableOperation<T, E, B> for CustomizableOperation
             ));
         }
 
-        if let Some(enforce_header_whitelist) =
-            config_override.alternator_ext.enforce_header_whitelist
-        {
-            this = this.interceptor(AlternatorOverrideInterceptor::for_enforce_header_whitelist(
-                enforce_header_whitelist,
+        if let Some(optimize_headers) = config_override.alternator_ext.optimize_headers {
+            this = this.interceptor(AlternatorOverrideInterceptor::for_optimize_headers(
+                optimize_headers,
             ));
         }
 
