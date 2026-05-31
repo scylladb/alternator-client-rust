@@ -4,8 +4,11 @@ use crate::*;
 ///
 /// A simple wrapper around [aws_sdk_dynamodb::Client], that adds hooks with alternator-specific optimizations.
 ///
-/// By default, enables round-robin load balancing, gzip request compression, strips requests from headers
-/// that are not used by alternator, and chooses an arbitrary aws region, as alternator doesn't require one.
+/// By default:
+/// - enables round-robin load balancing
+/// - strips headers that are not used by the alternator from all requests
+/// - chooses an arbitrary aws region, as alternator doesn't require one
+/// - gzip request compression is enabled with threshold 1024 and level 6
 ///
 /// Can be build using [AlternatorConfig] like so:
 /// ```ignore
@@ -27,14 +30,14 @@ impl AlternatorClient {
         let extensions = config.alternator_ext.clone();
 
         let request_compression = extensions.request_compression.unwrap_or_default();
-        let enforce_header_whitelist = extensions.enforce_header_whitelist.unwrap_or(true);
+        let optimize_headers = extensions.optimize_headers.unwrap_or(true);
         let has_region = dynamodb_config.region().is_some();
 
         let mut builder = dynamodb_config
             .to_builder()
             .interceptor(AlternatorInterceptor::new(
                 request_compression,
-                enforce_header_whitelist,
+                optimize_headers,
             ));
 
         // If live nodes are not in config - create new config with live nodes.
@@ -524,7 +527,7 @@ mod tests {
     fn test_client_stores_his_config_for_reference_only() {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
-                .enforce_header_whitelist(true)
+                .optimize_headers(true)
                 .behavior_version_latest()
                 .build(),
         );

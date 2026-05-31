@@ -9,4 +9,4 @@ mod driver_utils;
 
 pub mod body_compression;
 pub mod correct_line;
-pub mod header_whitelist;
+pub mod optimize_headers;

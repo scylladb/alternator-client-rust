@@ -26,13 +26,13 @@ use crate::keyrouting::resolver;
 #[derive(Debug)]
 pub(crate) struct AlternatorInterceptor {
     request_compression: RequestCompression,
-    enforce_header_whitelist: bool,
+    optimize_headers: bool,
 }
 impl AlternatorInterceptor {
-    pub fn new(request_compression: RequestCompression, enforce_header_whitelist: bool) -> Self {
+    pub fn new(request_compression: RequestCompression, optimize_headers: bool) -> Self {
         Self {
             request_compression,
-            enforce_header_whitelist,
+            optimize_headers,
         }
     }
 }
@@ -69,14 +69,14 @@ impl Intercept for AlternatorInterceptor {
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         // check for overrides
-        let enforce_header_whitelist = cfg
+        let optimize_headers = cfg
             .interceptor_state()
-            .load::<EnforceHeaderWhitelistStore>()
-            .map(|store| store.enforce_header_whitelist)
-            .unwrap_or(self.enforce_header_whitelist);
+            .load::<OptimizeHeadersStore>()
+            .map(|store| store.optimize_headers)
+            .unwrap_or(self.optimize_headers);
 
-        // enforce header whitelist
-        if enforce_header_whitelist {
+        // optimize headers
+        if optimize_headers {
             strip_headers(context.request_mut());
         }
 
@@ -121,10 +121,10 @@ impl Storable for RequestCompressionStore {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct EnforceHeaderWhitelistStore {
-    enforce_header_whitelist: bool,
+pub(crate) struct OptimizeHeadersStore {
+    optimize_headers: bool,
 }
-impl Storable for EnforceHeaderWhitelistStore {
+impl Storable for OptimizeHeadersStore {
     type Storer = StoreReplace<Self>;
 }
 
@@ -163,12 +163,10 @@ impl AlternatorOverrideInterceptor<RequestCompressionStore> {
         }
     }
 }
-impl AlternatorOverrideInterceptor<EnforceHeaderWhitelistStore> {
-    pub(crate) fn for_enforce_header_whitelist(enforce_header_whitelist: bool) -> Self {
+impl AlternatorOverrideInterceptor<OptimizeHeadersStore> {
+    pub(crate) fn for_optimize_headers(optimize_headers: bool) -> Self {
         AlternatorOverrideInterceptor {
-            store: EnforceHeaderWhitelistStore {
-                enforce_header_whitelist,
-            },
+            store: OptimizeHeadersStore { optimize_headers },
         }
     }
 }

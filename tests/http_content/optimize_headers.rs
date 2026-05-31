@@ -202,7 +202,7 @@ pub async fn test_without_credentials(ctx: &mut HttpTestContext<WithoutCredentia
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .enforce_header_whitelist(true)
+            .optimize_headers(true)
             .allow_no_auth()
             .build(),
     );
@@ -262,7 +262,7 @@ pub async fn test_with_credentials(ctx: &mut HttpTestContext<WithCredentialsConf
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .enforce_header_whitelist(true)
+            .optimize_headers(true)
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -323,7 +323,7 @@ pub async fn test_whitelist_needed(ctx: &mut HttpTestContext<WhitelistNeededConf
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .enforce_header_whitelist(false)
+            .optimize_headers(false)
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -348,8 +348,8 @@ async fn make_customized_calls(
 ) {
     let client_strips_headers = client
         .config()
-        .enforce_header_whitelist()
-        .expect("Enforce header whitelist not set while constructing client");
+        .optimize_headers()
+        .expect("optimize_headers not set while constructing client");
 
     // in the first call we assert that we can customize an operation to override client's config
     // proxy ensures that a whitelist is used (WithCredentialsConfig) or it isn't (WhitelistNeededConfig)
@@ -383,7 +383,7 @@ async fn make_customized_calls(
         .billing_mode(BillingMode::PayPerRequest)
         .customize()
         .alternator_config_override(
-            AlternatorConfig::builder().enforce_header_whitelist(!client_strips_headers),
+            AlternatorConfig::builder().optimize_headers(!client_strips_headers),
         )
         .send()
         .await
@@ -437,13 +437,13 @@ pub async fn test_enabled_by_per_request_customization(
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
-            .enforce_header_whitelist(false)
+            .optimize_headers(false)
             .build(),
     );
 
     // perform 2 calls to alternator, use proxy to peek and forward requests
     //
-    // first call overrides config's enforce_header_whitelist setting,
+    // first call overrides config's optimize_headers setting,
     // then proxy checks if it is stripped according to WithCredentialsConfig whitelist
     //
     // second call does not override the config
@@ -465,13 +465,13 @@ pub async fn test_disabled_by_per_request_customization(
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
-            .enforce_header_whitelist(true)
+            .optimize_headers(true)
             .build(),
     );
 
     // perform 2 calls to alternator, use proxy to peek and forward requests
     //
-    // first call overrides config's enforce_header_whitelist setting,
+    // first call overrides config's optimize_headers setting,
     // then proxy checks if request has not been stripped
     //
     // second call does not override the config
