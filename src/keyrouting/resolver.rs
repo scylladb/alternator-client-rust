@@ -105,6 +105,11 @@ impl PartitionKeyResolver {
             return;
         }
 
+        // If no Tokio runtime is available, we can't spawn the discovery task.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
         if !self.in_progress.insert(table_name.to_string()) {
             return;
         }
@@ -435,5 +440,84 @@ mod tests {
             let d = calculate_jittered_delay(base);
             assert!(d >= 1, "base {base} produced zero delay");
         }
+    }
+}
+
+/// Verifies that when making a request without a Tokio runtime,
+/// spawning the resolver task does not panic.
+///
+/// The default client can't make a request without a Tokio runtime without panicking,
+/// however it is possible, when using a custom HTTP client, whose connector doesn't require Tokio,
+/// and a custom sleep implementation that doesn't require Tokio.
+#[cfg(test)]
+mod tests_no_tokio_runtime {
+    use crate::keyrouting::KeyRouteAffinityType;
+    use crate::{AlternatorClient, AlternatorConfig};
+    use aws_smithy_async::rt::sleep::{AsyncSleep, Sleep};
+    use aws_smithy_runtime_api::client::http::{
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+    use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
+
+    /// A sleep impl that requires no Tokio runtime, by never actually sleeping.
+    #[derive(Debug, Clone)]
+    struct NoTokioSleep;
+    impl AsyncSleep for NoTokioSleep {
+        fn sleep(&self, _dur: std::time::Duration) -> Sleep {
+            Sleep::new(std::future::pending())
+        }
+    }
+
+    /// An HTTP client that requires no Tokio runtime, by doing no I/O.
+    ///     
+    /// It answers every request with an empty HTTP 400 - enough to let the
+    /// request proceed past the connector, never a real reply from a cluster.
+    #[derive(Debug, Clone)]
+    struct NoTokioHttp;
+    impl HttpClient for NoTokioHttp {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+    impl HttpConnector for NoTokioHttp {
+        fn call(&self, _req: HttpRequest) -> HttpConnectorFuture {
+            HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                StatusCode::try_from(400).unwrap(),
+                SdkBody::empty(),
+            )))
+        }
+    }
+
+    #[test]
+    fn request_without_tokio_runtime_does_not_panic() {
+        // A client with both Tokio dependencies swapped out, and affinity set to
+        // `KeyRouteAffinityType::AnyWrite` without any preconfigured PK info, so that the resolution
+        // trigger must be attempted.
+        let client = AlternatorClient::from_conf(
+            AlternatorConfig::builder()
+                .credentials_provider(
+                    aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+                )
+                .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:8000")
+                .http_client(NoTokioHttp)
+                .sleep_impl(NoTokioSleep)
+                .key_route_affinity(KeyRouteAffinityType::AnyWrite)
+                .build(),
+        );
+
+        // `send()` builds the future, `block_on` polls it with no Tokio runtime.
+        // This request is a `PutItem`, so in `AffinityQueryPlanInterceptor` it
+        // qualifies for affinity routing, misses the cache, and triggers discovery.
+        // Without the `Handle::try_current()` check in `trigger_discovery()`, this would
+        // panic trying to spawn the resolver task with no Tokio runtime present.
+        let _ = futures::executor::block_on(client.put_item().table_name("fake-table").send());
     }
 }
