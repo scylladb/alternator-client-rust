@@ -12,8 +12,8 @@ use crate::*;
 pub(crate) struct AlternatorExtensions {
     pub(crate) request_compression: Option<RequestCompression>,
     pub(crate) enforce_header_whitelist: Option<bool>,
-    pub(crate) active_interval: Option<u64>,
-    pub(crate) idle_interval: Option<u64>,
+    pub(crate) active_interval: Option<std::time::Duration>,
+    pub(crate) idle_interval: Option<std::time::Duration>,
     pub(crate) routing_scope: Option<RoutingScope>,
     pub(crate) scheme: Option<String>,
     pub(crate) port: Option<u16>,
@@ -82,32 +82,28 @@ impl AlternatorConfig {
         self.alternator_ext.request_compression.clone()
     }
 
-    /// Gets the active interval (in milliseconds) for refreshing the list of known nodes
-    /// when the client is active.
+    /// Gets the active interval for refreshing the list of known nodes when the client is active.
     ///
     /// While the client is sending requests to the cluster, the node list is refreshed at
     /// this interval to quickly detect topology changes.
     ///
-    /// The client is considered active when it has sent a request within the last
-    /// `idle_interval` milliseconds.
+    /// The client is considered active when it has sent a request within the last `idle_interval`.
     ///
-    /// The default value is 1000 ms (1 second).
-    pub fn active_interval(&self) -> Option<u64> {
+    /// The default value is 1 second.
+    pub fn active_interval(&self) -> Option<std::time::Duration> {
         self.alternator_ext.active_interval
     }
 
-    /// Gets the idle interval (in milliseconds) for refreshing the list of known nodes
-    /// when the client is idle.
+    /// Gets the idle interval for refreshing the list of known nodes when the client is idle.
     ///
     /// While no requests are being made to the cluster, the node list is refreshed at this
     /// longer interval to reduce unnecessary network traffic while still keeping the list
     /// reasonably up-to-date.
     ///
-    /// The client is considered idle when it hasn't sent a request within the last
-    /// `idle_interval` milliseconds.
+    /// The client is considered idle when it hasn't sent a request within the last `idle_interval`.
     ///
-    /// The default value is 60000 ms (1 minute).
-    pub fn idle_interval(&self) -> Option<u64> {
+    /// The default value is 1 minute.
+    pub fn idle_interval(&self) -> Option<std::time::Duration> {
         self.alternator_ext.idle_interval
     }
 
@@ -262,64 +258,56 @@ impl AlternatorBuilder {
         self
     }
 
-    /// Sets the active interval (in milliseconds) for refreshing the list of known nodes
-    /// when the client is active.
+    /// Sets the active interval for refreshing the list of known nodes when the client is active.
     ///
     /// While the client is sending requests to the cluster, the node list is refreshed at
     /// this interval to quickly detect topology changes.
     ///
-    /// The client is considered active when it has sent a request within the last
-    /// `idle_interval` milliseconds.
+    /// The client is considered active when it has sent a request within the last `idle_interval`.
     ///
-    /// The default value is 1000 ms (1 second).
-    pub fn active_interval(mut self, active_interval: u64) -> Self {
+    /// The default value is 1 second.
+    pub fn active_interval(mut self, active_interval: std::time::Duration) -> Self {
         self.set_active_interval(active_interval);
         self
     }
 
-    /// Sets the active interval (in milliseconds) for refreshing the list of known nodes
-    /// when the client is active.
+    /// Sets the active interval for refreshing the list of known nodes when the client is active.
     ///
     /// While the client is sending requests to the cluster, the node list is refreshed at
     /// this interval to quickly detect topology changes.
     ///
-    /// The client is considered active when it has sent a request within the last
-    /// `idle_interval` milliseconds.
+    /// The client is considered active when it has sent a request within the last `idle_interval`.
     ///
-    /// The default value is 1000 ms (1 second).
-    pub fn set_active_interval(&mut self, active_interval: u64) -> &mut Self {
+    /// The default value is 1 second.
+    pub fn set_active_interval(&mut self, active_interval: std::time::Duration) -> &mut Self {
         self.alternator_ext.active_interval = Some(active_interval);
         self
     }
 
-    /// Sets the idle interval (in milliseconds) for refreshing the list of known nodes
-    /// when the client is idle.
+    /// Sets the idle interval for refreshing the list of known nodes when the client is idle.
     ///
     /// While no requests are being made to the cluster, the node list is refreshed at this
     /// longer interval to reduce unnecessary network traffic while still keeping the list
     /// reasonably up-to-date.
     ///
-    /// The client is considered idle when it hasn't sent a request within the last
-    /// `idle_interval` milliseconds.
+    /// The client is considered idle when it hasn't sent a request within the last `idle_interval`.
     ///
-    /// The default value is 60000 ms (1 minute).
-    pub fn idle_interval(mut self, idle_interval: u64) -> Self {
+    /// The default value is 1 minute.
+    pub fn idle_interval(mut self, idle_interval: std::time::Duration) -> Self {
         self.set_idle_interval(idle_interval);
         self
     }
 
-    /// Sets the idle interval (in milliseconds) for refreshing the list of known nodes
-    /// when the client is idle.
+    /// Sets the idle interval for refreshing the list of known nodes when the client is idle.
     ///
     /// While no requests are being made to the cluster, the node list is refreshed at this
     /// longer interval to reduce unnecessary network traffic while still keeping the list
     /// reasonably up-to-date.
     ///
-    /// The client is considered idle when it hasn't sent a request within the last
-    /// `idle_interval` milliseconds.
+    /// The client is considered idle when it hasn't sent a request within the last `idle_interval`.
     ///
-    /// The default value is 60000 ms (1 minute).
-    pub fn set_idle_interval(&mut self, idle_interval: u64) -> &mut Self {
+    /// The default value is 1 minute.
+    pub fn set_idle_interval(&mut self, idle_interval: std::time::Duration) -> &mut Self {
         self.alternator_ext.idle_interval = Some(idle_interval);
         self
     }

@@ -83,8 +83,9 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use url::Url;
 
-const DEFAULT_ACTIVE_REFRESH_INTERVAL_MS: u64 = 1000;
-const DEFAULT_IDLE_REFRESH_INTERVAL_MS: u64 = 60000;
+const DEFAULT_ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug)]
 pub struct LiveNodes {
     routing_scope: RoutingScope,
@@ -106,10 +107,10 @@ impl LiveNodes {
     pub fn new(config: &crate::config::AlternatorConfig) -> Option<Arc<Self>> {
         let active_interval = config
             .active_interval()
-            .unwrap_or(DEFAULT_ACTIVE_REFRESH_INTERVAL_MS);
+            .unwrap_or(DEFAULT_ACTIVE_REFRESH_INTERVAL);
         let idle_interval = config
             .idle_interval()
-            .unwrap_or(DEFAULT_IDLE_REFRESH_INTERVAL_MS);
+            .unwrap_or(DEFAULT_IDLE_REFRESH_INTERVAL);
         let routing_scope = config
             .routing_scope()
             .unwrap_or(RoutingScope::from_cluster());
@@ -137,8 +138,8 @@ impl LiveNodes {
 
         Some(Arc::new(Self {
             routing_scope,
-            active_interval: Duration::from_millis(active_interval),
-            idle_interval: Duration::from_millis(idle_interval),
+            active_interval,
+            idle_interval,
             counter: Arc::new(AtomicUsize::new(0)),
             live_nodes: ArcSwap::from_pointee(seed_urls.clone()),
             seed_urls,
