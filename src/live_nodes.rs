@@ -5,8 +5,9 @@
 //! [`LiveNodes`] is constructed from an [`AlternatorConfig`] and seeded with a list of hosts.
 //! Once [`start`] is called, a background Tokio task
 //! periodically calls the [`update_live_nodes`] function which requests the known
-//! nodes in a random order to get an updated list of live nodes. After starting, the list is
-//! guaranteed to always contain nodes in the highest available scope in the fallback chain provided by the user.
+//! nodes in a random order to get an updated list of live nodes. After a
+//! successful refresh, the list is updated to nodes from the highest available
+//! scope in the fallback chain provided by the user.
 //! Underneath it uses a basic [`reqwest::Client`] with timeouts.
 //!
 //! # Polling cadence
@@ -22,8 +23,8 @@
 //!
 //! # Discovery mechanism
 //!
-//! Each refresh starts from the highest scope in fallback chain, it shuffles
-//! the current node list and walks it as a candidate queue:
+//! Each refresh starts from the highest scope in the fallback chain, shuffles
+//! the current node list, and walks it as a candidate queue:
 //! - If a node responds with a non-empty list, the list is used as the new live nodes list,
 //!   and the refresh ends.
 //! - If a node responds with an empty list, it is put back at the end of the queue,
@@ -33,7 +34,7 @@
 //! - If the queue is exhausted without a successful response, it is populated with
 //!   the seed nodes, and the process repeats. If the seeds are exhausted without success, the refresh ends with no changes.
 //!
-//! Once it successfully gets a non-empty response, atomically updates the [`live_nodes`] list using ['ArcSwap].
+//! Once it successfully gets a non-empty response, it atomically updates the [`live_nodes`] list using [`ArcSwap`].
 //!
 //!  # Lifetime
 //!
@@ -48,10 +49,10 @@
 //! It is handled by funneling start-up through a single idempotent entry point:
 //! [`ensure_discovery_started`]. It does three things, in order:
 //!
-//! 1. If discovery is already running, return immediately (a relaxed atomic load, essentially free).
+//! 1. If discovery is already running, return immediately (an atomic load, essentially free).
 //! 2. Runtime check: if no Tokio runtime is available on the current thread, return without spawning.
 //!    The task will be started lazily on the first [`get_next_node_round_robin`] or [`get_live_nodes`] call,
-//!    which is always invoked from within the request pipeline and therefore always inside a runtime.
+//!    which is typically invoked from within the request pipeline and therefore from within a runtime.
 //! 3. A `compare_exchange` on `discovery_started` ensures that
 //!    exactly one caller wins the right to spawn the task, even under
 //!    concurrent first-access from multiple threads.

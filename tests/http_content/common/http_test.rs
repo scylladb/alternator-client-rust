@@ -1,32 +1,34 @@
 //! # HTTP Content Tests Context
 //!
-//! All HTTP content tests perform driver calls to alternator.
-//! In the middle of the traffic, stands a proxy server that reads, validates and
-//! possibly modifies forwarded messages.
+//! All HTTP content tests perform driver calls to Alternator.
+//! A proxy server sits in the middle of the traffic, reads forwarded messages,
+//! validates them, and can optionally modify them.
 //!
-//! HttpTestContext provides a framework for such tests, integrated with test_context crate.
+//! `HttpTestContext` provides a framework for such tests and integrates with
+//! the `test_context` crate.
 //!
 //! ### Making tests
 //! 1. Define a cleanup function for your test and optionally the initial on_request
 //!    function to be called inside the proxy whenever a new request goes through.
 //!
-//!    Do this by writting a custom MyConfig struct that implements HttpTestConfig.
+//!    Do this by writing a custom `MyConfig` struct that implements `HttpTestConfig`.
 //!
 //! 2. Use HttpTestContext<MyConfig> as context for test_context crate, so that the proxy
-//!    sets up and cleanup is performed on finish.
+//!    is set up and cleanup is performed at the end.
 //!
 //! 3. Inside the test function, construct a new driver client with
-//!    endpoint HttpTestContext::get_proxy_address().
+//!    `HttpTestContext::get_proxy_address()` as the endpoint.
 //!
 //! 4. Whenever you create a resource that requires cleanup,
-//!    register it with HttpTestContext::register_resource()
+//!    register it with `HttpTestContext::register_resource()`.
 //!
-//! 5. You can override the initial on_request with HttpTestContext::set_on_request().
+//! 5. You can override the initial `on_request` with
+//!    `HttpTestContext::set_on_request()`.
 //!
-//! **Note:** since load balancing is automatically enabled,
-//! the GETs from the discovery may interfere with the test logic.
-//! To work around this, you can disable load balancing by setting an empty list
-//! of seed hosts in the client configuration, using `.seed_hosts(Vec::<String>::new())`.
+//! **Note:** Since load balancing is enabled automatically, the GET requests
+//! from discovery may interfere with the test logic. To work around this, you
+//! can disable load balancing by setting an empty list of seed hosts in the
+//! client configuration with `.seed_hosts(Vec::<String>::new())`.
 
 use crate::http_content::proxy::*;
 

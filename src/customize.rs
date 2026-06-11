@@ -2,24 +2,41 @@ use crate::*;
 
 use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 
-/// Trait to be implemented by Dynamodb's [CustomizableOperation].
+/// Extension trait for DynamoDB's [CustomizableOperation].
 ///
-/// It allows us to override [AlternatorConfig] at per-operation level, like so:
-/// ```ignore
+/// Build the client with a full [`AlternatorConfig`], then use a partial
+/// [`AlternatorConfig::builder()`] value to override Alternator settings for a
+/// single operation:
+/// ```no_run
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// use alternator_driver::{
+///     AlternatorClient,
+///     AlternatorConfig,
+///     AlternatorCustomizableOperation,
+///     RequestCompression,
+/// };
+///
+/// let config = AlternatorConfig::builder()
+///     .behavior_version_latest()
+///     .build();
+///
+/// let client = AlternatorClient::from_conf(config);
+///
 /// client
 ///     .create_table()
 ///     // ...
 ///     .customize()
 ///     .alternator_config_override(
+///         // Per-operation overrides take a builder, not a built config.
 ///         AlternatorConfig::builder()
 ///             .optimize_headers(false)
 ///             .request_compression(RequestCompression::disabled())
-///             .behavior_version_latest()
-///             .build()
+///             .behavior_version_latest(),
 ///     )
 ///     .send()
 ///     .await
 ///     .unwrap();
+/// # });
 /// ```
 pub trait AlternatorCustomizableOperation<T, E, B> {
     fn alternator_config_override(self, config_override: impl Into<AlternatorBuilder>) -> Self;

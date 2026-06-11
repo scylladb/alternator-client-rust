@@ -6,14 +6,16 @@ use crate::*;
 ///
 /// By default:
 /// - enables round-robin load balancing
-/// - strips headers that are not used by the alternator from all requests
-/// - chooses an arbitrary aws region, as alternator doesn't require one
+/// - strips headers that Alternator does not use from all requests
+/// - sets a default AWS region, as Alternator does not require a specific one
 /// - does not use request compression
 ///
-/// Can be build using [AlternatorConfig] like so:
-/// ```ignore
+/// Can be built with [AlternatorConfig] like so:
+/// ```
+/// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
+///    .behavior_version_latest()
 ///     // ...
 ///     .build();
 ///

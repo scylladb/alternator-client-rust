@@ -28,9 +28,11 @@ pub(crate) struct AlternatorExtensions {
 ///
 /// It is used to construct [AlternatorClient] like so:
 ///
-/// ```ignore
+/// ```
+/// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
+///     .behavior_version_latest()
 ///     // ...
 ///     .build();
 ///
@@ -57,7 +59,8 @@ impl AlternatorConfig {
         AlternatorBuilder::from(config).build()
     }
 
-    /// Before sending each request, strip the headers from them which are not used by the Alternator.
+    /// Before sending each request, strip headers that Alternator does not use
+    /// from the request.
     ///
     /// This is done by an interceptor in `modify_before_transmit` hook.
     ///
@@ -176,9 +179,11 @@ impl AlternatorConfig {
 ///
 /// It is used to construct [AlternatorClient] like so:
 ///
-/// ```ignore
+/// ```
+/// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
+///    .behavior_version_latest()
 ///     // ...
 ///     .build();
 ///
@@ -484,10 +489,14 @@ impl AlternatorBuilder {
     /// Sets the key route affinity configuration.
     ///
     /// Use it either with a pre-constructed [keyrouting::affinity_config::KeyRouteAffinityConfig]
-    /// or with a [keyrouting::affinity_config::KeyRouteAffinity] for simpler use cases.
-    /// Calling with [keyrouting::affinity_config::KeyRouteAffinityType::None], is equivalent to not setting the affinity at all.
+    /// or with a [keyrouting::affinity_config::KeyRouteAffinityType] for simpler
+    /// use cases. Calling with
+    /// [keyrouting::affinity_config::KeyRouteAffinityType::None] is equivalent
+    /// to not setting the affinity at all.
     ///
-    /// For more information see [keyrouting::affinity_config::KeyRouteAffinityConfig] and [keyrouting::affinity_config::KeyRouteAffinityType].
+    /// For more information, see
+    /// [keyrouting::affinity_config::KeyRouteAffinityConfig] and
+    /// [keyrouting::affinity_config::KeyRouteAffinityType].
     pub fn key_route_affinity(
         mut self,
         key_route_affinity: impl Into<keyrouting::affinity_config::KeyRouteAffinityConfig>,
@@ -499,10 +508,14 @@ impl AlternatorBuilder {
     /// Sets the key route affinity configuration.
     ///
     /// Use it either with a pre-constructed [keyrouting::affinity_config::KeyRouteAffinityConfig]
-    /// or with a [keyrouting::affinity_config::KeyRouteAffinity] for simpler use cases.
-    /// Calling with [keyrouting::affinity_config::KeyRouteAffinityType::None], is equivalent to not setting the affinity at all.
+    /// or with a [keyrouting::affinity_config::KeyRouteAffinityType] for simpler
+    /// use cases. Calling with
+    /// [keyrouting::affinity_config::KeyRouteAffinityType::None] is equivalent
+    /// to not setting the affinity at all.
     ///
-    /// For more information see [keyrouting::affinity_config::KeyRouteAffinityConfig] and [keyrouting::affinity_config::KeyRouteAffinityType].
+    /// For more information, see
+    /// [keyrouting::affinity_config::KeyRouteAffinityConfig] and
+    /// [keyrouting::affinity_config::KeyRouteAffinityType].
     pub fn set_key_route_affinity(
         &mut self,
         key_route_affinity: impl Into<keyrouting::affinity_config::KeyRouteAffinityConfig>,

@@ -18,7 +18,8 @@ pub struct RequestCompression {
     compression_with_threshold: Option<(CompressionAlgorithm, CompressionLevel, usize)>,
 }
 impl RequestCompression {
-    /// Represents request compression that is applied when http body size exceeds given threshold.
+    /// Represents request compression that is applied when the HTTP body size is
+    /// at least the given threshold.
     ///
     /// When threshold is zero, compression is always applied.
     pub fn enabled(
@@ -86,7 +87,7 @@ fn decompress_zlib(content: &[u8]) -> Option<Vec<u8>> {
 
 /// To be used in an interceptor
 ///
-/// Checks if size of the body exceeds specified threshold.
+/// Checks whether the body size meets the specified threshold.
 /// If so, tries to compress the body and modify `content-encoding` and `content-length` headers accordingly.
 ///
 /// If compression failed or request already contained the `content-encoding` header, leaves the request untouched.

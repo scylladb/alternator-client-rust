@@ -40,21 +40,26 @@ pub enum KeyRouteAffinityType {
 ///
 /// Build directly from a mode for the common case:
 ///
-/// ```ignore
+/// ```
+/// use alternator_driver::{KeyRouteAffinityConfig, KeyRouteAffinityType};
 /// let cfg: KeyRouteAffinityConfig = KeyRouteAffinityType::Rmw.into();
 /// ```
 ///
-/// Or when passing it directly to `AlternatorClientBuilder`:
-/// ```ignore
-/// let client = AlternatorDynamoDbClient::builder()
+/// Or when passing it directly to `AlternatorConfig::builder()`:
+/// ```
+/// use alternator_driver::{AlternatorClient, AlternatorConfig, KeyRouteAffinityType};
+/// let config = AlternatorConfig::builder()
+///     .behavior_version_latest()
 ///     .key_route_affinity(KeyRouteAffinityType::Rmw)
 ///     .build();
+/// let client = AlternatorClient::from_conf(config);
 /// ```
 ///
 /// Or via the builder to pre-configure PK names and skip the
 /// `DescribeTable` lookup:
 ///
-/// ```ignore
+/// ```
+/// use alternator_driver::{KeyRouteAffinityConfig, KeyRouteAffinityType};
 /// let cfg = KeyRouteAffinityConfig::builder()
 ///     .with_type(KeyRouteAffinityType::Rmw)
 ///     .with_pk_info("users", "user_id")

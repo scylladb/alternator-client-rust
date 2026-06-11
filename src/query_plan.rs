@@ -1,6 +1,7 @@
 //! Query plan for Alternator requests.
 //!
-//! The object is put in the config and on each requests is used to determine which node to send the request to.
+//! The object is stored in the config and is used on each request to determine
+//! which node to send the request to.
 
 use crate::keyrouting::go_rand::GoRand;
 use crate::live_nodes::LiveNodes;
