@@ -18,8 +18,10 @@
 //!
 //! Example for a table with composite key (user_id, timestamp):
 //!
-//! ```rust,ignore
+//! ```rust
 //! // Only hash the partition key (user_id)
+//! use alternator_driver::keyrouting::hasher::hash_attribute_value;
+//! use aws_sdk_dynamodb::types::AttributeValue;
 //! let partition_key = AttributeValue::S("user_123".to_string());
 //! let hash = hash_attribute_value(&partition_key);
 //! ```

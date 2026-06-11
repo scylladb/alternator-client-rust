@@ -1,36 +1,31 @@
-//! Header Whitelist Tests
-//! In this module we assert that the driver strips headers from requests when those headers are not used by alternator.
-//! We use a proxy to intercept messages sent between driver and alternator.
+//! Header whitelist tests.
 //!
-//! There are 5 test cases:
-//! 1. Without Credentials:
-//!    Disable use of credentials, then check if all requests follow specific header whitelist:
+//! This module verifies that the driver strips headers that Alternator does not
+//! use from outgoing requests. A proxy is used to intercept messages exchanged
+//! between the driver and Alternator.
+//!
+//! There are five test cases:
+//! 1. Without credentials:
+//!    Disable credentials and verify that requests follow this whitelist:
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding"]
-//!
-//! 2. With Credentials:
-//!    Enable use of credentials, then check if all requests follow specific header whitelist:
+//! 2. With credentials:
+//!    Enable credentials and verify that requests follow this whitelist:
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "authorization", "x-amz-date"]
+//! 3. Whitelist needed:
+//!    Enable credentials, disable header stripping, and verify that
+//!    unnecessary headers are present, confirming that stripping is useful.
+//! 4. Enabled by per-request customization:
+//!    Disable header stripping in the client config, override it for one call,
+//!    and then make another non-customized call to verify that the override
+//!    does not persist.
+//! 5. Disabled by per-request customization:
+//!    Enable header stripping in the client config, override it for one call,
+//!    and then make another non-customized call to verify that the override
+//!    does not persist.
 //!
-//! 3. Whitelist Needed:
-//!    Enable use of credentials, disable header stripping,
-//!    then check if unnecessary headers are used at all (therefore we in fact, need to strip them)
-//!
-//! 4. Enabled by Per Request Customization:
-//!    Disable header stripping in the config,
-//!    then customize a call to override it,
-//!    then make another non-customized call to assert the override doesn't last.
-//!
-//!    We use the same whitelist as in With Credentials test.
-//!     
-//! 5. Disabled by Per Request Customization:
-//!    Enable header stripping in the config,
-//!    then customize a call to override it,
-//!    then make another non-customized call to assert the override doesn't last.
-//!
-//!    We use the same whitelist as in With Credentials test.
-//!
-//! All share the same cleanup function, first 3 use the same set of driver calls,
-//! the last 2 also use the same set of driver calls.
+//! All tests share the same cleanup function. The first three also share the
+//! same set of driver calls, and the last two share another set of driver
+//! calls.
 //!
 use crate::http_content::driver_utils::*;
 use crate::http_content::http_test::*;

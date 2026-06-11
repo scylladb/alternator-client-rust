@@ -14,7 +14,7 @@
 //!    then customize a call to enable compression and assert it is correctly compressed,
 //!    then perform an uncustomized call to assert the customization doesn't last
 //!
-//! 4. Disabled by per-request compression
+//! 4. Disabled by per-request customization
 //!    Enable compression in client, then customize a call to disable the compression,
 //!    then assert the request was not compressed
 //!

@@ -1,6 +1,7 @@
 //! Correct Request Line Test
-//! This test asserts driver generates only requests with correct line: Method = POST, URI = "/".
-//! We use a proxy to intercept messages sent between driver and alternator.
+//! This test verifies that the driver generates only requests with the correct
+//! request line: method = POST, URI = "/".
+//! We use a proxy to intercept messages sent between the driver and Alternator.
 use crate::http_content::driver_utils::*;
 use crate::http_content::http_test::*;
 use crate::http_content::proxy::*;
