@@ -29,12 +29,18 @@ use crate::keyrouting::resolver;
 #[derive(Debug)]
 pub(crate) struct AlternatorInterceptor {
     request_compression: RequestCompression,
+    response_compression: ResponseCompression,
     optimize_headers: bool,
 }
 impl AlternatorInterceptor {
-    pub fn new(request_compression: RequestCompression, optimize_headers: bool) -> Self {
+    pub fn new(
+        request_compression: RequestCompression,
+        response_compression: ResponseCompression,
+        optimize_headers: bool,
+    ) -> Self {
         Self {
             request_compression,
+            response_compression,
             optimize_headers,
         }
     }
@@ -60,6 +66,21 @@ impl Intercept for AlternatorInterceptor {
         // message must be compressed before signing, but it's more efficient to do it before retry loop
         if let Some((algorithm, level, threshold)) = request_compression.get() {
             compress_request(context.request_mut(), algorithm, level, threshold);
+        }
+
+        // Insert Accept-Encoding header if response compression is enabled
+        let response_compression = cfg
+            .interceptor_state()
+            .load::<ResponseCompressionStore>()
+            .map(|store| store.response_compression.clone())
+            .unwrap_or(self.response_compression.clone());
+
+        if let Some(algorithms) = response_compression.get() {
+            let value = accept_encoding_header_value(algorithms);
+            context
+                .request_mut()
+                .headers_mut()
+                .insert("accept-encoding", value);
         }
 
         Ok(())
@@ -179,6 +200,14 @@ impl Storable for OptimizeHeadersStore {
     type Storer = StoreReplace<Self>;
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ResponseCompressionStore {
+    pub(crate) response_compression: ResponseCompression,
+}
+impl Storable for ResponseCompressionStore {
+    type Storer = StoreReplace<Self>;
+}
+
 /// An interceptor used to override [AlternatorClient]'s config.
 ///
 /// Adds specified config overrides to [ConfigBag], so that [AlternatorInterceptor] can later look for it.
@@ -218,6 +247,15 @@ impl AlternatorOverrideInterceptor<OptimizeHeadersStore> {
     pub(crate) fn for_optimize_headers(optimize_headers: bool) -> Self {
         AlternatorOverrideInterceptor {
             store: OptimizeHeadersStore { optimize_headers },
+        }
+    }
+}
+impl AlternatorOverrideInterceptor<ResponseCompressionStore> {
+    pub(crate) fn for_response_compression(response_compression: ResponseCompression) -> Self {
+        AlternatorOverrideInterceptor {
+            store: ResponseCompressionStore {
+                response_compression,
+            },
         }
     }
 }

@@ -11,6 +11,7 @@ use crate::*;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AlternatorExtensions {
     pub(crate) request_compression: Option<RequestCompression>,
+    pub(crate) response_compression: Option<ResponseCompression>,
     pub(crate) optimize_headers: Option<bool>,
     pub(crate) active_interval: Option<std::time::Duration>,
     pub(crate) idle_interval: Option<std::time::Duration>,
@@ -83,6 +84,18 @@ impl AlternatorConfig {
     /// Turned off by default.
     pub fn request_compression(&self) -> Option<RequestCompression> {
         self.alternator_ext.request_compression.clone()
+    }
+
+    /// Configures which response encodings the client advertises via `Accept-Encoding`.
+    ///
+    /// This only controls what the client *requests* from the server.
+    /// The server may still return uncompressed responses regardless of this setting.
+    /// Response decompression is based on the `Content-Encoding` header
+    /// and is independent of this configuration.
+    ///
+    /// Not set by default (disabled).
+    pub fn response_compression(&self) -> Option<ResponseCompression> {
+        self.alternator_ext.response_compression.clone()
     }
 
     /// Gets the active interval for refreshing the list of known nodes when the client is active.
@@ -260,6 +273,35 @@ impl AlternatorBuilder {
         request_compression: RequestCompression,
     ) -> &mut Self {
         self.alternator_ext.request_compression = Some(request_compression);
+        self
+    }
+
+    /// Configure which response encodings the client advertises via `Accept-Encoding`.
+    ///
+    /// This only controls what the client *requests* from the server.
+    /// The server may still return uncompressed responses regardless of this setting.
+    /// Response decompression is based on the `Content-Encoding` header
+    /// and is independent of this configuration.
+    ///
+    /// Not set by default (disabled).
+    pub fn response_compression(mut self, response_compression: ResponseCompression) -> Self {
+        self.set_response_compression(response_compression);
+        self
+    }
+
+    /// Configure which response encodings the client advertises via `Accept-Encoding`.
+    ///
+    /// This only controls what the client *requests* from the server.
+    /// The server may still return uncompressed responses regardless of this setting.
+    /// Response decompression is based on the `Content-Encoding` header
+    /// and is independent of this configuration.
+    ///
+    /// Not set by default (disabled).
+    pub fn set_response_compression(
+        &mut self,
+        response_compression: ResponseCompression,
+    ) -> &mut Self {
+        self.alternator_ext.response_compression = Some(response_compression);
         self
     }
 
@@ -1050,7 +1092,11 @@ mod test {
             config
                 .request_compression()
                 .expect("request compression is not set"),
-            RequestCompression::enabled(CompressionAlgorithm::Zlib, CompressionLevel::default(), 0)
+            RequestCompression::enabled(
+                CompressionAlgorithm::Zlib,
+                CompressionLevel::default(),
+                0
+            )
         );
 
         let config = config.to_builder().build();
@@ -1061,7 +1107,11 @@ mod test {
             config
                 .request_compression()
                 .expect("request compression is not set"),
-            RequestCompression::enabled(CompressionAlgorithm::Zlib, CompressionLevel::default(), 0)
+            RequestCompression::enabled(
+                CompressionAlgorithm::Zlib,
+                CompressionLevel::default(),
+                0
+            )
         );
     }
 
@@ -1157,5 +1207,89 @@ mod test {
             &client1.config().live_nodes().unwrap(),
             &client2.config().live_nodes().unwrap()
         ));
+    }
+
+    #[test]
+    fn config_remembers_response_compression() {
+        let config = AlternatorConfig::builder()
+            .response_compression(ResponseCompression::enabled(
+                ResponseCompressionAlgorithm::Gzip,
+            ))
+            .behavior_version_latest()
+            .build();
+
+        assert_eq!(
+            config
+                .response_compression()
+                .expect("response_compression not set"),
+            ResponseCompression::enabled(ResponseCompressionAlgorithm::Gzip)
+        );
+
+        // round-trip through to_builder
+        let config = config.to_builder().build();
+
+        assert_eq!(
+            config
+                .response_compression()
+                .expect("response_compression not set after round-trip"),
+            ResponseCompression::enabled(ResponseCompressionAlgorithm::Gzip)
+        );
+    }
+
+    #[test]
+    fn config_response_compression_disabled_roundtrip() {
+        let config = AlternatorConfig::builder()
+            .response_compression(ResponseCompression::disabled())
+            .behavior_version_latest()
+            .build();
+
+        assert_eq!(
+            config
+                .response_compression()
+                .expect("response_compression not set"),
+            ResponseCompression::disabled()
+        );
+
+        let config = config.to_builder().build();
+
+        assert_eq!(
+            config
+                .response_compression()
+                .expect("response_compression not set after round-trip"),
+            ResponseCompression::disabled()
+        );
+    }
+
+    #[test]
+    fn config_response_compression_unset_is_none() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .build();
+
+        assert!(config.response_compression().is_none());
+    }
+
+    #[test]
+    fn response_compression_default_is_disabled() {
+        let rc = ResponseCompression::default();
+        assert_eq!(rc.get(), None);
+    }
+
+    #[test]
+    fn response_compression_enabled_many() {
+        let rc = ResponseCompression::enabled_many([
+            ResponseCompressionAlgorithm::Gzip,
+            ResponseCompressionAlgorithm::Deflate,
+        ]);
+        assert_eq!(
+            rc.get(),
+            Some(
+                [
+                    ResponseCompressionAlgorithm::Gzip,
+                    ResponseCompressionAlgorithm::Deflate,
+                ]
+                .as_slice()
+            )
+        );
     }
 }

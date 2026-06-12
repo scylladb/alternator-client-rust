@@ -34,6 +34,7 @@ impl AlternatorClient {
         let request_compression = extensions
             .request_compression
             .unwrap_or(RequestCompression::disabled());
+        let response_compression = extensions.response_compression.unwrap_or_default();
         let optimize_headers = extensions.optimize_headers.unwrap_or(true);
         let has_region = dynamodb_config.region().is_some();
 
@@ -41,6 +42,7 @@ impl AlternatorClient {
             .to_builder()
             .interceptor(AlternatorInterceptor::new(
                 request_compression,
+                response_compression,
                 optimize_headers,
             ));
 

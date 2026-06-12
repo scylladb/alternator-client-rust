@@ -711,3 +711,300 @@ pub async fn test_response_decompression_unexpected_compression(ctx: &mut HttpTe
         .await
         .unwrap();
 }
+
+// =============================================================================
+// Response Compression Negotiation Tests (Accept-Encoding)
+//
+// These tests verify that the driver sends the correct Accept-Encoding header
+// based on the response_compression configuration.
+//
+// They also verify interaction with optimize_headers (Accept-Encoding must
+// survive header filtering).
+// =============================================================================
+
+/// Proxy handler that asserts the request contains Accept-Encoding: gzip.
+async fn assert_accept_encoding_gzip_on_request(
+    request: Request<Incoming>,
+    sender: Arc<Mutex<SendRequest<Full<Bytes>>>>,
+) -> Response<Full<Bytes>> {
+    let (parts, body) = collect_request(request).await;
+
+    let accept_encoding = parts
+        .headers
+        .get("accept-encoding")
+        .expect("accept-encoding header must be present");
+
+    assert!(
+        accept_encoding.to_str().unwrap().contains("gzip"),
+        "accept-encoding must contain gzip, got: {:?}",
+        accept_encoding
+    );
+
+    let (parts, body) = collect_received_response(parts, body, sender).await;
+    build_response(parts, body)
+}
+
+/// Proxy handler that asserts the request does NOT contain Accept-Encoding
+/// with a compression algorithm (may contain "identity" or be absent).
+async fn assert_no_compression_accept_encoding_on_request(
+    request: Request<Incoming>,
+    sender: Arc<Mutex<SendRequest<Full<Bytes>>>>,
+) -> Response<Full<Bytes>> {
+    let (parts, body) = collect_request(request).await;
+
+    if let Some(accept_encoding) = parts.headers.get("accept-encoding") {
+        let value = accept_encoding.to_str().unwrap();
+        assert!(
+            !value.contains("gzip") && !value.contains("deflate"),
+            "accept-encoding must not contain gzip or deflate when disabled, got: {:?}",
+            value
+        );
+    }
+
+    let (parts, body) = collect_received_response(parts, body, sender).await;
+    build_response(parts, body)
+}
+
+#[test_context(HttpTestContext<Config>)]
+#[tokio::test]
+pub async fn test_response_compression_sends_accept_encoding_gzip(
+    ctx: &mut HttpTestContext<Config>,
+) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .response_compression(ResponseCompression::enabled(
+                ResponseCompressionAlgorithm::Gzip,
+            ))
+            .build(),
+    );
+
+    ctx.set_on_request(assert_accept_encoding_gzip_on_request)
+        .await;
+
+    let table_name = format!("table_{}", Uuid::new_v4());
+    ctx.register_resource(table_name.clone());
+
+    client
+        .create_table()
+        .table_name(&table_name)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("ExampleKey")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("ExampleKey")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+}
+
+#[test_context(HttpTestContext<Config>)]
+#[tokio::test]
+pub async fn test_response_compression_disabled_does_not_send_accept_encoding(
+    ctx: &mut HttpTestContext<Config>,
+) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .response_compression(ResponseCompression::disabled())
+            .build(),
+    );
+
+    ctx.set_on_request(assert_no_compression_accept_encoding_on_request)
+        .await;
+
+    let table_name = format!("table_{}", Uuid::new_v4());
+    ctx.register_resource(table_name.clone());
+
+    client
+        .create_table()
+        .table_name(&table_name)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("ExampleKey")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("ExampleKey")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+}
+
+#[test_context(HttpTestContext<Config>)]
+#[tokio::test]
+pub async fn test_response_compression_enabled_by_per_request_customization(
+    ctx: &mut HttpTestContext<Config>,
+) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .response_compression(ResponseCompression::disabled())
+            .build(),
+    );
+
+    ctx.set_on_request(assert_accept_encoding_gzip_on_request)
+        .await;
+
+    let table_name = format!("table_{}", Uuid::new_v4());
+    ctx.register_resource(table_name.clone());
+
+    client
+        .create_table()
+        .table_name(&table_name)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("ExampleKey")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("ExampleKey")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .customize()
+        .alternator_config_override(AlternatorConfig::builder().response_compression(
+            ResponseCompression::enabled(ResponseCompressionAlgorithm::Gzip),
+        ))
+        .send()
+        .await
+        .unwrap();
+}
+
+#[test_context(HttpTestContext<Config>)]
+#[tokio::test]
+pub async fn test_response_compression_disabled_by_per_request_customization(
+    ctx: &mut HttpTestContext<Config>,
+) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .response_compression(ResponseCompression::enabled(
+                ResponseCompressionAlgorithm::Gzip,
+            ))
+            .build(),
+    );
+
+    ctx.set_on_request(assert_no_compression_accept_encoding_on_request)
+        .await;
+
+    let table_name = format!("table_{}", Uuid::new_v4());
+    ctx.register_resource(table_name.clone());
+
+    client
+        .create_table()
+        .table_name(&table_name)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("ExampleKey")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("ExampleKey")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .customize()
+        .alternator_config_override(
+            AlternatorConfig::builder().response_compression(ResponseCompression::disabled()),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+#[test_context(HttpTestContext<Config>)]
+#[tokio::test]
+pub async fn test_response_compression_with_optimize_headers(ctx: &mut HttpTestContext<Config>) {
+    // Accept-Encoding must survive header filtering when optimize_headers is enabled.
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .optimize_headers(true)
+            .response_compression(ResponseCompression::enabled(
+                ResponseCompressionAlgorithm::Gzip,
+            ))
+            .build(),
+    );
+
+    ctx.set_on_request(assert_accept_encoding_gzip_on_request)
+        .await;
+
+    let table_name = format!("table_{}", Uuid::new_v4());
+    ctx.register_resource(table_name.clone());
+
+    client
+        .create_table()
+        .table_name(&table_name)
+        .attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name("ExampleKey")
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .unwrap(),
+        )
+        .key_schema(
+            KeySchemaElement::builder()
+                .attribute_name("ExampleKey")
+                .key_type(KeyType::Hash)
+                .build()
+                .unwrap(),
+        )
+        .billing_mode(BillingMode::PayPerRequest)
+        .send()
+        .await
+        .unwrap();
+}

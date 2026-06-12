@@ -321,9 +321,30 @@ let client = AlternatorClient::from_conf(
 ```
 or by using `.customize().alternator_config_override()` to enable it for a specific driver call.
 
-Currently, the driver supports two algorithms: Gzip and Zlib. For either one, you can specify a compression level (default: 6). Compression is applied to requests whose body size exceeds the configured threshold; if the threshold is 0, every request is compressed.
+Currently, the driver supports two algorithms: Gzip and Deflate. For either one, you can specify a compression level (default: 6). Compression is applied to requests whose body size exceeds the configured threshold; if the threshold is 0, every request is compressed.
 
-Response compression is not yet supported by the driver.
+## Response compression
+
+The driver transparently decompresses gzip and deflate responses based on the `Content-Encoding` header. To request compressed responses, configure response compression in `AlternatorConfig`:
+
+```rust
+use alternator_driver::{AlternatorConfig, AlternatorClient, ResponseCompression, ResponseCompressionAlgorithm};
+
+let client = AlternatorClient::from_conf(
+    AlternatorConfig::builder()
+        .endpoint_url("http://10.0.0.1:8043")
+        .response_compression(ResponseCompression::enabled(
+            ResponseCompressionAlgorithm::Gzip,
+        ))
+        .behavior_version_latest()
+        .allow_no_auth()
+        .build(),
+);
+```
+
+or by using `.customize().alternator_config_override()` to enable it for a specific driver call.
+
+The default is `disabled()`; use `enabled()`, `enabled_many()`, or `enabled_all()` to advertise the desired encodings.
 
 ## Per-operation override
 
