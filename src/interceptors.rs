@@ -4,7 +4,8 @@ use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::interceptors::context::Input;
 use aws_smithy_runtime_api::client::interceptors::context::{
-    BeforeSerializationInterceptorContextMut, BeforeTransmitInterceptorContextMut,
+    BeforeDeserializationInterceptorContextMut, BeforeSerializationInterceptorContextMut,
+    BeforeTransmitInterceptorContextMut,
 };
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
@@ -109,6 +110,54 @@ impl Intercept for AlternatorInterceptor {
 
             request.set_uri(current.as_str())?;
         }
+
+        Ok(())
+    }
+
+    fn modify_before_deserialization(
+        &self,
+        context: &mut BeforeDeserializationInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let response = context.response_mut();
+
+        // Collect all Content-Encoding header values (may be repeated headers
+        // or comma-separated within a single header value).
+        let mut algorithms = Vec::new();
+        for header_value in response.headers().get_all("content-encoding") {
+            for token in header_value.split(',').map(|s| s.trim()) {
+                if token.is_empty() {
+                    continue;
+                }
+                match ResponseCompressionAlgorithm::from_content_encoding(token) {
+                    Some(algo) => algorithms.push(algo),
+                    None => {
+                        return Err(format!(
+                            "unsupported Content-Encoding: '{}'. Supported encodings are: gzip, deflate",
+                            token
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
+        if algorithms.is_empty() {
+            return Ok(());
+        }
+
+        // Take the body and wrap it with decompression
+        let body = std::mem::replace(
+            response.body_mut(),
+            aws_smithy_types::body::SdkBody::empty(),
+        );
+        let decompressed_body = crate::decompression::wrap_decompressed_body(body, algorithms)?;
+        *response.body_mut() = decompressed_body;
+
+        // Strip Content-Encoding and Content-Length headers
+        response.headers_mut().remove("content-encoding");
+        response.headers_mut().remove("content-length");
 
         Ok(())
     }

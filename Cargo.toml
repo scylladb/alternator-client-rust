@@ -11,7 +11,7 @@ aws-smithy-runtime-api = "1.10.0"
 aws-types = "1.3.11"
 aws-runtime = "1.5.18"
 tokio = { version = "1", features = ["full"] }
-aws-smithy-types = "1.3.6"
+aws-smithy-types = { version = "1.3.6", features = ["http-body-1-x"] }
 flate2 = "1.1.5"
 http-body-util = "0.1"
 anyhow = "1.0.102"
@@ -21,10 +21,15 @@ url = "2.5.8"
 arc-swap = "1.9.1"
 rand = "0.10.1"
 dashmap = "6.1.0"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+http-body = "1.0"
+bytes = "1"
 
 [dev-dependencies]
 aws-sdk-dynamodb = { version = "1.103.0", features = ["test-util"] }
-aws-smithy-types = { version = "1.3.6", features = ["http-body-1-x"] }
+aws-smithy-types = "1.3.6"
 aws-smithy-http-client = { version = "1.1.5", features = ["rustls-aws-lc"] }
 uuid = { version = "1.22.0", features = ["v4"] }
 hyper = { version = "1.8", features = ["client", "server", "http1"] }
