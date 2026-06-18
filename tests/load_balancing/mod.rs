@@ -1,5 +1,5 @@
-//! Integration tests using a real multi-node CCM cluster: load-balancing and
-//! routing, driven through counting proxies.
+//! Integration tests using a real multi-node CCM cluster: load-balancing /
+//! routing and HTTP connection reuse, both driven through counting proxies.
 
 #[path = "../common/proxy.rs"]
 pub mod proxy;
@@ -11,3 +11,5 @@ pub mod scope_utils;
 pub mod cluster_utils;
 
 pub mod load_balancing_tests;
+
+pub mod connection_reuse;

@@ -13,68 +13,8 @@ use aws_sdk_dynamodb::types::{
     AttributeAction, AttributeValue, AttributeValueUpdate, DeleteRequest, KeysAndAttributes,
     PutRequest, ReturnValue, Select, WriteRequest,
 };
-use hyper::Method;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-
-use ctor::dtor;
-use tokio::sync::{Mutex, MutexGuard};
-
-const PROXY_PORT: u16 = 7999;
-const ALTERNATOR_PORT: u16 = 8000;
-
-const POLLING_TIMEOUT: Duration = Duration::from_secs(5);
-const POLLING_INTERVAL: Duration = Duration::from_millis(50);
-
-// Since cluster creation is expensive, we create it once and reuse it for every test.
-// Before a test gets access to the cluster, we make sure that all nodes are up and their ports are set to default.
-// Datacenter 1 is a single node which is meant to never be shut down. Its address will be used as a seed address
-// for clients and as a redirect target for requests directed to shut down nodes.
-static CLUSTER: OnceLock<Mutex<Cluster>> = OnceLock::new();
-async fn get_cluster() -> MutexGuard<'static, Cluster> {
-    let mut cluster = CLUSTER
-        .get_or_init(|| {
-            let topology = TopologySpecBuilder::new()
-                .datacenter(DatacenterSpec::new().rack(1))
-                .datacenter(DatacenterSpec::new().rack(1).rack(2))
-                .datacenter(DatacenterSpec::new().rack(2).rack(1))
-                .build()
-                .unwrap();
-            let ip_prefix = IpPrefix::new("127.0.1.").unwrap();
-            let cluster_name = format!("test_cluster_{}", uuid::Uuid::new_v4());
-            let scylla_version = String::from("release:2025.1");
-            let cluster = Ccm::create_cluster(
-                cluster_name,
-                &topology,
-                ip_prefix,
-                ALTERNATOR_PORT,
-                scylla_version,
-            )
-            .unwrap();
-            Mutex::new(cluster)
-        })
-        .lock()
-        .await;
-
-    Ccm::start_cluster(&mut cluster).unwrap();
-    cluster.update_all_nodes_port(ALTERNATOR_PORT);
-    cluster
-}
-
-// Since the cluster is static, it never drops, so we use a destructor.
-#[dtor]
-fn clean_up_cluster() {
-    if let Some(cluster_mutex) = CLUSTER.get() {
-        let mut cluster = cluster_mutex.blocking_lock();
-        Ccm::remove_cluster(&mut cluster);
-    }
-}
-
-fn default_endpoint_url(cluster: &Cluster) -> String {
-    cluster.datacenters()[0].racks()[0].nodes()[0].address()
-}
+use std::sync::Arc;
 
 fn redirect_target_node(cluster: &Cluster) -> Node {
     cluster.datacenters()[0].racks()[0].nodes()[0].clone()

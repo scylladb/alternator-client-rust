@@ -73,7 +73,8 @@ pub(crate) fn default_endpoint_url(cluster: &Cluster) -> String {
     cluster.datacenters()[0].racks()[0].nodes()[0].address()
 }
 
-// Struct for counting requests made to the proxy. GETs, POSTs, and describe_tables are counted separately.
+// Struct for counting connections accepted / closed and requests made to the proxy.
+// GETs, POSTs, and describe_tables are counted separately.
 // GETs are service discovery calls, POSTs are the actual calls to DB, and describe_table calls
 // are from PartitionKeyResolver.
 #[derive(Debug)]
@@ -81,6 +82,8 @@ pub(crate) struct NodeCounter {
     posts: AtomicUsize,
     gets: AtomicUsize,
     describe_tables: AtomicUsize,
+    connects: AtomicUsize,
+    disconnects: AtomicUsize,
 }
 
 impl NodeCounter {
@@ -89,6 +92,8 @@ impl NodeCounter {
             posts: AtomicUsize::new(0),
             gets: AtomicUsize::new(0),
             describe_tables: AtomicUsize::new(0),
+            connects: AtomicUsize::new(0),
+            disconnects: AtomicUsize::new(0),
         }
     }
 
@@ -96,10 +101,20 @@ impl NodeCounter {
         self.posts.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn gets(&self) -> usize {
+        self.gets.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn connects(&self) -> usize {
+        self.connects.load(Ordering::Relaxed)
+    }
+
     fn reset(&self) {
         self.posts.store(0, Ordering::Relaxed);
         self.gets.store(0, Ordering::Relaxed);
         self.describe_tables.store(0, Ordering::Relaxed);
+        self.connects.store(0, Ordering::Relaxed);
+        self.disconnects.store(0, Ordering::Relaxed);
     }
 }
 
@@ -139,10 +154,31 @@ impl RequestCounter {
         }
     }
 
+    pub(crate) fn total_gets(&self) -> usize {
+        self.counter
+            .values()
+            .map(|c| c.gets.load(Ordering::Relaxed))
+            .sum()
+    }
+
     pub(crate) fn total_posts(&self) -> usize {
         self.counter
             .values()
             .map(|c| c.posts.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    pub(crate) fn total_connects(&self) -> usize {
+        self.counter
+            .values()
+            .map(|c| c.connects.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    pub(crate) fn total_disconnects(&self) -> usize {
+        self.counter
+            .values()
+            .map(|c| c.disconnects.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -173,6 +209,18 @@ pub(crate) async fn start_counting_proxy(
     connect_addr: String,
     request_counter: Arc<NodeCounter>,
 ) {
+    // Count every accepted / closed TCP connection.
+    let connect_counter = Arc::clone(&request_counter);
+    let on_connect: Box<dyn Fn(std::net::SocketAddr) + Send + Sync> = Box::new(move |_addr| {
+        connect_counter.connects.fetch_add(1, Ordering::Relaxed);
+    });
+    let disconnect_counter = Arc::clone(&request_counter);
+    let on_disconnect: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+        disconnect_counter
+            .disconnects
+            .fetch_add(1, Ordering::Relaxed);
+    });
+
     let proxy = proxy::Proxy::start(
         listen_addr,
         connect_addr,
@@ -202,8 +250,8 @@ pub(crate) async fn start_counting_proxy(
                 proxy::forward_on_request(req, send).await
             }
         },
-        None,
-        None,
+        Some(on_connect),
+        Some(on_disconnect),
     )
     .await;
 
@@ -266,6 +314,21 @@ pub(crate) fn create_client_with_scope(cluster: &Cluster, scope: RoutingScope) -
         minimal_builder()
             .endpoint_url(default_endpoint_url(cluster))
             .routing_scope(scope)
+            .build(),
+    )
+}
+
+// Like `create_client_with_scope`, but with a custom discovery active interval.
+pub(crate) fn create_client_with_scope_and_interval(
+    cluster: &Cluster,
+    scope: RoutingScope,
+    active_interval: Duration,
+) -> AlternatorClient {
+    AlternatorClient::from_conf(
+        minimal_builder()
+            .endpoint_url(default_endpoint_url(cluster))
+            .routing_scope(scope)
+            .active_interval(active_interval)
             .build(),
     )
 }
