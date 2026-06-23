@@ -20,11 +20,10 @@ pub enum KeyRouteAffinityType {
     /// transactions (LWT): routing same-key requests to the same
     /// coordinator reduces Paxos round-trips.
     Rmw,
-    /// Route all write operations (`PutItem`, `UpdateItem`, `DeleteItem`)
-    /// to the same coordinator per partition key, regardless of
-    /// conditions. `BatchWriteItem` is excluded — a single batch can
-    /// target multiple partition keys across multiple tables and can't be
-    /// routed to one coordinator.
+    /// Route write operations (`PutItem`, `UpdateItem`, `DeleteItem`, and
+    /// `BatchWriteItem`) to the same coordinator per partition key,
+    /// regardless of conditions. For `BatchWriteItem`, the first usable
+    /// partition key in the batch is used.
     AnyWrite,
 }
 

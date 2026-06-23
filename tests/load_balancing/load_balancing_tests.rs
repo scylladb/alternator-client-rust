@@ -12,8 +12,8 @@ use alternator_driver::keyrouting::affinity_config::{
 };
 use alternator_driver::keyrouting::{go_rand::GoRand, hasher};
 use aws_sdk_dynamodb::types::{
-    AttributeAction, AttributeValue, AttributeValueUpdate, KeysAndAttributes, PutRequest,
-    ReturnValue, Select, WriteRequest,
+    AttributeAction, AttributeValue, AttributeValueUpdate, DeleteRequest, KeysAndAttributes,
+    PutRequest, ReturnValue, Select, WriteRequest,
 };
 use hyper::Method;
 use std::collections::HashMap;
@@ -442,6 +442,7 @@ enum MatrixOperation {
     UpdateLegacyPutReturnUpdatedNew,
     UpdateLegacyPutReturnAllNew,
     BatchWritePut,
+    BatchWriteDelete,
     GetItem,
     BatchGetItem,
     Query,
@@ -450,7 +451,7 @@ enum MatrixOperation {
 }
 
 impl MatrixOperation {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         MatrixOperation::PutPlain,
         MatrixOperation::PutConditional,
         MatrixOperation::DeletePlain,
@@ -462,6 +463,7 @@ impl MatrixOperation {
         MatrixOperation::UpdateLegacyPutReturnUpdatedNew,
         MatrixOperation::UpdateLegacyPutReturnAllNew,
         MatrixOperation::BatchWritePut,
+        MatrixOperation::BatchWriteDelete,
         MatrixOperation::GetItem,
         MatrixOperation::BatchGetItem,
         MatrixOperation::Query,
@@ -484,6 +486,7 @@ impl MatrixOperation {
             }
             MatrixOperation::UpdateLegacyPutReturnAllNew => "update_legacy_put_return_all_new",
             MatrixOperation::BatchWritePut => "batch_write_put",
+            MatrixOperation::BatchWriteDelete => "batch_write_delete",
             MatrixOperation::GetItem => "get_item",
             MatrixOperation::BatchGetItem => "batch_get_item",
             MatrixOperation::Query => "query",
@@ -654,6 +657,16 @@ async fn send_matrix_operation(
                 .build()
                 .unwrap();
             let write = WriteRequest::builder().put_request(put).build();
+
+            let _ = client
+                .batch_write_item()
+                .request_items(table_name, vec![write])
+                .send()
+                .await;
+        }
+        MatrixOperation::BatchWriteDelete => {
+            let delete = DeleteRequest::builder().key("id", s(key)).build().unwrap();
+            let write = WriteRequest::builder().delete_request(delete).build();
 
             let _ = client
                 .batch_write_item()
@@ -1257,6 +1270,11 @@ async fn key_route_affinity_operation_matrix_test() {
         },
         OperationMatrixCase {
             mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::BatchWriteDelete,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
             operation: MatrixOperation::GetItem,
             expected_routing: ExpectedRouting::RoundRobin,
         },
@@ -1315,12 +1333,15 @@ async fn key_route_affinity_operation_matrix_test() {
             operation: MatrixOperation::UpdateExpression,
             expected_routing: ExpectedRouting::Affinity,
         },
-        // The Rust driver intentionally keeps BatchWriteItem on round-robin:
-        // one request can contain multiple partition keys and tables.
         OperationMatrixCase {
             mode: KeyRouteAffinityType::AnyWrite,
             operation: MatrixOperation::BatchWritePut,
-            expected_routing: ExpectedRouting::RoundRobin,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::BatchWriteDelete,
+            expected_routing: ExpectedRouting::Affinity,
         },
         OperationMatrixCase {
             mode: KeyRouteAffinityType::AnyWrite,
@@ -1391,6 +1412,84 @@ async fn key_route_affinity_operation_matrix_test() {
                 assert_round_robin_counts(&request_counter, node_ips.as_slice(), &case_label);
             }
         }
+    }
+}
+
+/// Test that multi-table BatchWriteItem affinity is deterministic for repeated
+/// requests constructed the same way, including when table entries are inserted
+/// in different orders.
+#[tokio::test]
+#[cfg_attr(not(ccm_tests), ignore)]
+async fn batch_write_affinity_multitable_routing_is_deterministic_test() {
+    let mut guard = get_cluster().await;
+    let cluster = &mut *guard;
+
+    let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
+    let request_counter = RequestCounter::from_cluster(cluster);
+
+    start_proxies(cluster, PROXY_PORT, &request_counter).await;
+
+    let test_id = uuid::Uuid::new_v4();
+    let a_table_name = format!("a_batch_test_{test_id}");
+    let z_table_name = format!("z_batch_test_{test_id}");
+    let client = create_client_with_scope_and_affinity(
+        cluster,
+        scope.clone(),
+        KeyRouteAffinityConfig::builder()
+            .with_type(KeyRouteAffinityType::AnyWrite)
+            .with_pk_info(&a_table_name, "id")
+            .with_pk_info(&z_table_name, "id")
+            .build(),
+    );
+    let node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
+
+    wait_until_live_nodes_match(&client, node_ips.clone()).await;
+    create_table(&client, &a_table_name).await;
+    create_table(&client, &z_table_name).await;
+
+    let a_key = "batch_a_key";
+    let z_key = "batch_z_key";
+    let expected_ip = expected_first_node(node_ips.as_slice(), a_key);
+
+    for z_table_first in [true, false] {
+        request_counter.reset();
+
+        for iteration in 0..node_ips.len() {
+            let a_put = PutRequest::builder()
+                .item("id", s(a_key))
+                .item("val", s(format!("a_value_{z_table_first}_{iteration}")))
+                .build()
+                .unwrap();
+            let z_put = PutRequest::builder()
+                .item("id", s(z_key))
+                .item("val", s(format!("z_value_{z_table_first}_{iteration}")))
+                .build()
+                .unwrap();
+            let a_write = WriteRequest::builder().put_request(a_put).build();
+            let z_write = WriteRequest::builder().put_request(z_put).build();
+
+            let builder = client.batch_write_item();
+            let builder = if z_table_first {
+                builder
+                    .request_items(z_table_name.as_str(), vec![z_write])
+                    .request_items(a_table_name.as_str(), vec![a_write])
+            } else {
+                builder
+                    .request_items(a_table_name.as_str(), vec![a_write])
+                    .request_items(z_table_name.as_str(), vec![z_write])
+            };
+
+            builder.send().await.unwrap();
+        }
+
+        let case_label = format!("batch_write_multitable_z_first_{z_table_first}");
+        assert_affinity_counts(
+            &request_counter,
+            node_ips.as_slice(),
+            expected_ip,
+            node_ips.len(),
+            &case_label,
+        );
     }
 }
 
