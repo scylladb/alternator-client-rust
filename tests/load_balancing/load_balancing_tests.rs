@@ -11,7 +11,10 @@ use alternator_driver::keyrouting::affinity_config::{
     KeyRouteAffinityConfig, KeyRouteAffinityType,
 };
 use alternator_driver::keyrouting::{go_rand::GoRand, hasher};
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{
+    AttributeAction, AttributeValue, AttributeValueUpdate, KeysAndAttributes, PutRequest,
+    ReturnValue, Select, WriteRequest,
+};
 use hyper::Method;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -420,6 +423,343 @@ fn expected_first_node<'a>(nodes: &'a [&str], partition_key_value: &str) -> &'a 
     nodes[idx]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedRouting {
+    Affinity,
+    RoundRobin,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MatrixOperation {
+    PutPlain,
+    PutConditional,
+    DeletePlain,
+    DeleteConditional,
+    UpdateLegacyPut,
+    UpdateLegacyAdd,
+    UpdateLegacyDeleteWithValue,
+    UpdateExpression,
+    UpdateLegacyPutReturnUpdatedNew,
+    UpdateLegacyPutReturnAllNew,
+    BatchWritePut,
+    GetItem,
+    BatchGetItem,
+    Query,
+    Scan,
+    ListTables,
+}
+
+impl MatrixOperation {
+    const ALL: [Self; 16] = [
+        MatrixOperation::PutPlain,
+        MatrixOperation::PutConditional,
+        MatrixOperation::DeletePlain,
+        MatrixOperation::DeleteConditional,
+        MatrixOperation::UpdateLegacyPut,
+        MatrixOperation::UpdateLegacyAdd,
+        MatrixOperation::UpdateLegacyDeleteWithValue,
+        MatrixOperation::UpdateExpression,
+        MatrixOperation::UpdateLegacyPutReturnUpdatedNew,
+        MatrixOperation::UpdateLegacyPutReturnAllNew,
+        MatrixOperation::BatchWritePut,
+        MatrixOperation::GetItem,
+        MatrixOperation::BatchGetItem,
+        MatrixOperation::Query,
+        MatrixOperation::Scan,
+        MatrixOperation::ListTables,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            MatrixOperation::PutPlain => "put_plain",
+            MatrixOperation::PutConditional => "put_conditional",
+            MatrixOperation::DeletePlain => "delete_plain",
+            MatrixOperation::DeleteConditional => "delete_conditional",
+            MatrixOperation::UpdateLegacyPut => "update_legacy_put",
+            MatrixOperation::UpdateLegacyAdd => "update_legacy_add",
+            MatrixOperation::UpdateLegacyDeleteWithValue => "update_legacy_delete_with_value",
+            MatrixOperation::UpdateExpression => "update_expression",
+            MatrixOperation::UpdateLegacyPutReturnUpdatedNew => {
+                "update_legacy_put_return_updated_new"
+            }
+            MatrixOperation::UpdateLegacyPutReturnAllNew => "update_legacy_put_return_all_new",
+            MatrixOperation::BatchWritePut => "batch_write_put",
+            MatrixOperation::GetItem => "get_item",
+            MatrixOperation::BatchGetItem => "batch_get_item",
+            MatrixOperation::Query => "query",
+            MatrixOperation::Scan => "scan",
+            MatrixOperation::ListTables => "list_tables",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OperationMatrixCase {
+    mode: KeyRouteAffinityType,
+    operation: MatrixOperation,
+    expected_routing: ExpectedRouting,
+}
+
+fn mode_name(mode: KeyRouteAffinityType) -> &'static str {
+    match mode {
+        KeyRouteAffinityType::None => "none",
+        KeyRouteAffinityType::Rmw => "rmw",
+        KeyRouteAffinityType::AnyWrite => "any_write",
+    }
+}
+
+fn s(value: impl Into<String>) -> AttributeValue {
+    AttributeValue::S(value.into())
+}
+
+fn key_map(key: &str) -> HashMap<String, AttributeValue> {
+    HashMap::from([("id".to_string(), s(key))])
+}
+
+async fn send_matrix_operation(
+    client: &AlternatorClient,
+    table_name: &str,
+    operation: MatrixOperation,
+    key: &str,
+    iteration: usize,
+) {
+    match operation {
+        MatrixOperation::PutPlain => {
+            let _ = client
+                .put_item()
+                .table_name(table_name)
+                .item("id", s(key))
+                .item("val", s(format!("value_{iteration}")))
+                .send()
+                .await;
+        }
+        MatrixOperation::PutConditional => {
+            let _ = client
+                .put_item()
+                .table_name(table_name)
+                .item("id", s(key))
+                .item("val", s(format!("value_{iteration}")))
+                .condition_expression("attribute_not_exists(missing_attr)")
+                .send()
+                .await;
+        }
+        MatrixOperation::DeletePlain => {
+            let _ = client
+                .delete_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .send()
+                .await;
+        }
+        MatrixOperation::DeleteConditional => {
+            let _ = client
+                .delete_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .condition_expression("attribute_not_exists(missing_attr)")
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyPut => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "val",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Put)
+                        .value(s(format!("value_{iteration}")))
+                        .build(),
+                )
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyAdd => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "counter",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Add)
+                        .value(AttributeValue::N("1".to_string()))
+                        .build(),
+                )
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyDeleteWithValue => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "tags",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Delete)
+                        .value(AttributeValue::Ss(vec!["tag".to_string()]))
+                        .build(),
+                )
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateExpression => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .update_expression("SET val = :v")
+                .expression_attribute_values(":v", s(format!("value_{iteration}")))
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyPutReturnUpdatedNew => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "val",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Put)
+                        .value(s(format!("value_{iteration}")))
+                        .build(),
+                )
+                .return_values(ReturnValue::UpdatedNew)
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyPutReturnAllNew => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "val",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Put)
+                        .value(s(format!("value_{iteration}")))
+                        .build(),
+                )
+                .return_values(ReturnValue::AllNew)
+                .send()
+                .await;
+        }
+        MatrixOperation::BatchWritePut => {
+            let put = PutRequest::builder()
+                .item("id", s(key))
+                .item("val", s(format!("value_{iteration}")))
+                .build()
+                .unwrap();
+            let write = WriteRequest::builder().put_request(put).build();
+
+            let _ = client
+                .batch_write_item()
+                .request_items(table_name, vec![write])
+                .send()
+                .await;
+        }
+        MatrixOperation::GetItem => {
+            let _ = client
+                .get_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .consistent_read(true)
+                .send()
+                .await;
+        }
+        MatrixOperation::BatchGetItem => {
+            let keys = KeysAndAttributes::builder()
+                .keys(key_map(key))
+                .consistent_read(true)
+                .build()
+                .unwrap();
+
+            let _ = client
+                .batch_get_item()
+                .request_items(table_name, keys)
+                .send()
+                .await;
+        }
+        MatrixOperation::Query => {
+            let _ = client
+                .query()
+                .table_name(table_name)
+                .key_condition_expression("id = :id")
+                .expression_attribute_values(":id", s(key))
+                .select(Select::Count)
+                .send()
+                .await;
+        }
+        MatrixOperation::Scan => {
+            let _ = client
+                .scan()
+                .table_name(table_name)
+                .select(Select::Count)
+                .send()
+                .await;
+        }
+        MatrixOperation::ListTables => {
+            let _ = client.list_tables().send().await;
+        }
+    }
+}
+
+fn assert_affinity_counts(
+    request_counter: &RequestCounter,
+    node_ips: &[&str],
+    expected_ip: &str,
+    expected_requests: usize,
+    case_label: &str,
+) {
+    assert_eq!(
+        request_counter.total_posts(),
+        expected_requests,
+        "{case_label}: unexpected total POST count"
+    );
+
+    for ip in node_ips {
+        let expected = if *ip == expected_ip {
+            expected_requests
+        } else {
+            0
+        };
+        assert_eq!(
+            request_counter.get(ip).posts(),
+            expected,
+            "{case_label}: unexpected POST count for {ip}"
+        );
+    }
+}
+
+fn assert_round_robin_counts(
+    request_counter: &RequestCounter,
+    node_ips: &[&str],
+    case_label: &str,
+) {
+    assert_eq!(
+        request_counter.total_posts(),
+        node_ips.len(),
+        "{case_label}: unexpected total POST count"
+    );
+
+    for ip in node_ips {
+        assert_eq!(
+            request_counter.get(ip).posts(),
+            1,
+            "{case_label}: round-robin request did not visit {ip} exactly once"
+        );
+    }
+
+    assert_eq!(
+        request_counter.get_posts_to_other_ips(node_ips),
+        0,
+        "{case_label}: request escaped the selected routing scope"
+    );
+}
+
 #[tokio::test]
 #[cfg_attr(not(ccm_tests), ignore)]
 async fn calls_correct_datacenter_scope_test() {
@@ -803,6 +1143,255 @@ async fn describe_table_not_called_with_config() {
     }
 
     assert_eq!(request_counter.total_describe_tables(), 0);
+}
+
+/// Matrix test for which DynamoDB operations use key-route affinity in each mode.
+#[tokio::test]
+#[cfg_attr(not(ccm_tests), ignore)]
+async fn key_route_affinity_operation_matrix_test() {
+    let mut guard = get_cluster().await;
+    let cluster = &mut *guard;
+
+    let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
+    let request_counter = RequestCounter::from_cluster(cluster);
+    start_proxies(cluster, PROXY_PORT, &request_counter).await;
+
+    let table_name = format!("test_table_{}", uuid::Uuid::new_v4());
+    {
+        // Drop the setup client before creating the three matrix clients: the
+        // test proxy accepts up to three concurrent client connections.
+        let setup_client = create_client_with_scope(cluster, scope.clone());
+        wait_until_live_nodes_match(
+            &setup_client,
+            scope_utils::working_nodes_ips_in_scope(cluster, &scope),
+        )
+        .await;
+        create_table(&setup_client, &table_name).await;
+    }
+
+    let none_client = create_client_with_scope_and_affinity(
+        cluster,
+        scope.clone(),
+        KeyRouteAffinityConfig::builder()
+            .with_type(KeyRouteAffinityType::None)
+            .with_pk_info(&table_name, "id")
+            .build(),
+    );
+    let rmw_client = create_client_with_scope_and_affinity(
+        cluster,
+        scope.clone(),
+        KeyRouteAffinityConfig::builder()
+            .with_type(KeyRouteAffinityType::Rmw)
+            .with_pk_info(&table_name, "id")
+            .build(),
+    );
+    let any_write_client = create_client_with_scope_and_affinity(
+        cluster,
+        scope.clone(),
+        KeyRouteAffinityConfig::builder()
+            .with_type(KeyRouteAffinityType::AnyWrite)
+            .with_pk_info(&table_name, "id")
+            .build(),
+    );
+    let node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
+
+    wait_until_live_nodes_match(&none_client, node_ips.clone()).await;
+    wait_until_live_nodes_match(&rmw_client, node_ips.clone()).await;
+    wait_until_live_nodes_match(&any_write_client, node_ips.clone()).await;
+
+    let mut cases = vec![
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::PutPlain,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::PutConditional,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::DeletePlain,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::DeleteConditional,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyPut,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyAdd,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyDeleteWithValue,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateExpression,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyPutReturnUpdatedNew,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyPutReturnAllNew,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::BatchWritePut,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::GetItem,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::BatchGetItem,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::Query,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::Scan,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::ListTables,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::PutPlain,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::DeletePlain,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateLegacyPut,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateLegacyAdd,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateLegacyDeleteWithValue,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateLegacyPutReturnUpdatedNew,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateExpression,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        // The Rust driver intentionally keeps BatchWriteItem on round-robin:
+        // one request can contain multiple partition keys and tables.
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::BatchWritePut,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::GetItem,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::BatchGetItem,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::Query,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::Scan,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::ListTables,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+    ];
+
+    cases.extend(
+        MatrixOperation::ALL
+            .into_iter()
+            .map(|operation| OperationMatrixCase {
+                mode: KeyRouteAffinityType::None,
+                operation,
+                expected_routing: ExpectedRouting::RoundRobin,
+            }),
+    );
+
+    request_counter.reset();
+
+    for case in cases {
+        let client = match case.mode {
+            KeyRouteAffinityType::None => &none_client,
+            KeyRouteAffinityType::Rmw => &rmw_client,
+            KeyRouteAffinityType::AnyWrite => &any_write_client,
+        };
+        let case_label = format!("{}_{}", mode_name(case.mode), case.operation.name());
+        let key = format!("matrix_key_{case_label}");
+
+        request_counter.reset();
+
+        for iteration in 0..node_ips.len() {
+            send_matrix_operation(client, &table_name, case.operation, &key, iteration).await;
+        }
+
+        match case.expected_routing {
+            ExpectedRouting::Affinity => {
+                let expected_ip = expected_first_node(node_ips.as_slice(), &key);
+                assert_affinity_counts(
+                    &request_counter,
+                    node_ips.as_slice(),
+                    expected_ip,
+                    node_ips.len(),
+                    &case_label,
+                );
+            }
+            ExpectedRouting::RoundRobin => {
+                assert_round_robin_counts(&request_counter, node_ips.as_slice(), &case_label);
+            }
+        }
+    }
 }
 
 /// Test if the routing is deterministic, and all calls go to the same node.
