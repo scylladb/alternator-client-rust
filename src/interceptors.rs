@@ -220,8 +220,8 @@ pub(crate) struct AffinityQueryPlanInterceptor {
 /// inspects the operation type, extracts the partition key if one applies,
 /// and constructs a seeded [QueryPlan] so that subsequent retries route to
 /// the same coordinator. Requests that don't qualify (read operations,
-/// `BatchWriteItem`, missing partition key info, unsupported PK types) get
-/// a basic round-robin plan instead.
+/// missing partition key info, unsupported PK types) get a basic round-robin
+/// plan instead.
 ///
 /// Partition key names are resolved lazily via [`PartitionKeyResolver`].
 /// On a cache miss, the request falls back to round-robin and discovery
@@ -256,24 +256,29 @@ impl AffinityQueryPlanInterceptor {
             return None;
         }
 
-        let table_name = op.table_name()?;
+        for candidate in op.partition_key_candidates() {
+            let pk_name = match self.resolver.get_partition_key(candidate.table_name) {
+                Some(cached_name) => cached_name,
+                None => {
+                    // CACHE MISS: Trigger background discovery.
+                    self.resolver.trigger_discovery(candidate.table_name);
 
-        let pk_name = match self.resolver.get_partition_key(table_name) {
-            Some(cached_name) => cached_name,
-            None => {
-                // CACHE MISS: Trigger background discovery.
-                self.resolver.trigger_discovery(table_name);
+                    // Use round-robin for this request.
+                    return None;
+                }
+            };
 
-                // Use round-robin for this request.
-                return None;
-            }
-        };
+            let Some(pk_value) = candidate.attributes.get(pk_name.as_ref()) else {
+                continue;
+            };
+            let Some(hash) = hasher::hash_attribute_value(pk_value) else {
+                continue;
+            };
 
-        // Get the partition key value.
-        let pk_value = op.partition_key(&pk_name)?;
+            return Some(QueryPlan::new_with_hash(self.live_nodes.clone(), hash));
+        }
 
-        let hash = hasher::hash_attribute_value(pk_value)?;
-        Some(QueryPlan::new_with_hash(self.live_nodes.clone(), hash))
+        None
     }
 
     /// Builds the [`QueryPlan`] for this request. Falls back to round-robin

@@ -1,27 +1,30 @@
 use aws_sdk_dynamodb::operation::{
-    delete_item::DeleteItemInput, put_item::PutItemInput, update_item::UpdateItemInput,
+    batch_write_item::BatchWriteItemInput, delete_item::DeleteItemInput, put_item::PutItemInput,
+    update_item::UpdateItemInput,
 };
 use aws_sdk_dynamodb::types::{AttributeAction, AttributeValue, ReturnValue};
 use aws_smithy_runtime_api::client::interceptors::context::Input;
+use std::collections::HashMap;
 
 use super::affinity_config::KeyRouteAffinityType;
 
 /// Typed view over the DynamoDB operations key route affinity cares about.
-///
-/// `BatchWriteItem` is intentionally absent: a single request can target
-/// multiple partition keys across multiple tables, so it can't be routed
-/// deterministically to one coordinator. Those requests fall back to
-/// round-robin balancing.
 pub(crate) enum DynamoOp<'a> {
     Put(&'a PutItemInput),
     Update(&'a UpdateItemInput),
     Delete(&'a DeleteItemInput),
+    BatchWrite(&'a BatchWriteItemInput),
+}
+
+pub(crate) struct PartitionKeyCandidate<'a> {
+    pub table_name: &'a str,
+    pub attributes: &'a HashMap<String, AttributeValue>,
 }
 
 impl<'a> DynamoOp<'a> {
     /// Downcast the SDK's type-erased input into one of the variants we care
-    /// about. Anything else (Scan, BatchWriteItem, TransactWriteItems, etc.)
-    /// yields `None` and the caller treats the request as non-applicable.
+    /// about. Anything else (Scan, Query, TransactWriteItems, etc.) yields
+    /// `None` and the caller treats the request as non-applicable.
     pub fn from_input(input: &'a Input) -> Option<Self> {
         if let Some(r) = input.downcast_ref::<PutItemInput>() {
             return Some(Self::Put(r));
@@ -31,6 +34,9 @@ impl<'a> DynamoOp<'a> {
         }
         if let Some(r) = input.downcast_ref::<DeleteItemInput>() {
             return Some(Self::Delete(r));
+        }
+        if let Some(r) = input.downcast_ref::<BatchWriteItemInput>() {
+            return Some(Self::BatchWrite(r));
         }
         None
     }
@@ -46,25 +52,73 @@ impl<'a> DynamoOp<'a> {
             Self::Put(r) => should_apply_put(mode, r),
             Self::Delete(r) => should_apply_delete(mode, r),
             Self::Update(r) => should_apply_update(mode, r),
+            Self::BatchWrite(_) => mode == KeyRouteAffinityType::AnyWrite,
         }
     }
 
-    /// Returns the request's target table name, or `None` if the SDK input doesn't have one set.
-    pub fn table_name(&self) -> Option<&str> {
+    /// Returns ordered candidate table/key maps that can provide a partition
+    /// key. Single-item operations return at most one candidate; BatchWriteItem
+    /// can return multiple candidates so the caller can use the first one with
+    /// cached metadata and a supported partition-key value.
+    pub fn partition_key_candidates(&self) -> Vec<PartitionKeyCandidate<'a>> {
         match self {
-            Self::Put(r) => r.table_name(),
-            Self::Update(r) => r.table_name(),
-            Self::Delete(r) => r.table_name(),
-        }
-    }
+            Self::Put(r) => r
+                .table_name()
+                .zip(r.item())
+                .map(|(table_name, attributes)| {
+                    vec![PartitionKeyCandidate {
+                        table_name,
+                        attributes,
+                    }]
+                })
+                .unwrap_or_default(),
+            Self::Update(r) => r
+                .table_name()
+                .zip(r.key())
+                .map(|(table_name, attributes)| {
+                    vec![PartitionKeyCandidate {
+                        table_name,
+                        attributes,
+                    }]
+                })
+                .unwrap_or_default(),
+            Self::Delete(r) => r
+                .table_name()
+                .zip(r.key())
+                .map(|(table_name, attributes)| {
+                    vec![PartitionKeyCandidate {
+                        table_name,
+                        attributes,
+                    }]
+                })
+                .unwrap_or_default(),
+            Self::BatchWrite(r) => {
+                let mut items: Vec<_> = r
+                    .request_items()
+                    .into_iter()
+                    .flat_map(|items| items.iter())
+                    .collect();
+                items.sort_unstable_by(|(left_table, _), (right_table, _)| {
+                    left_table.cmp(right_table)
+                });
 
-    /// Looks up the partition key value by attribute name. Returns `None`
-    /// if the key map is unset or the attribute is missing.
-    pub fn partition_key(&self, pk_name: &str) -> Option<&AttributeValue> {
-        match self {
-            Self::Put(r) => r.item().and_then(|m| m.get(pk_name)),
-            Self::Update(r) => r.key().and_then(|m| m.get(pk_name)),
-            Self::Delete(r) => r.key().and_then(|m| m.get(pk_name)),
+                items
+                    .into_iter()
+                    .flat_map(|(table_name, writes)| {
+                        writes.iter().filter_map(|write| {
+                            let attributes = write
+                                .delete_request()
+                                .map(|delete| delete.key())
+                                .or_else(|| write.put_request().map(|put| put.item()))?;
+
+                            Some(PartitionKeyCandidate {
+                                table_name,
+                                attributes,
+                            })
+                        })
+                    })
+                    .collect()
+            }
         }
     }
 }
@@ -137,7 +191,8 @@ mod tests {
     use super::*;
     use aws_sdk_dynamodb::operation::scan::ScanInput;
     use aws_sdk_dynamodb::types::{
-        AttributeAction, AttributeValue, AttributeValueUpdate, ExpectedAttributeValue, ReturnValue,
+        AttributeAction, AttributeValue, AttributeValueUpdate, DeleteRequest,
+        ExpectedAttributeValue, PutRequest, ReturnValue, WriteRequest,
     };
 
     fn s(v: &str) -> AttributeValue {
@@ -399,6 +454,90 @@ mod tests {
         assert!(should_apply_update(KeyRouteAffinityType::AnyWrite, &r));
     }
 
+    // ----- BatchWriteItem -----
+
+    fn put_write(pk_name: &str, value: &str) -> WriteRequest {
+        let put = PutRequest::builder()
+            .item(pk_name, s(value))
+            .item("other", s("x"))
+            .build()
+            .unwrap();
+        WriteRequest::builder().put_request(put).build()
+    }
+
+    fn delete_write(pk_name: &str, value: &str) -> WriteRequest {
+        let delete = DeleteRequest::builder()
+            .key(pk_name, s(value))
+            .build()
+            .unwrap();
+        WriteRequest::builder().delete_request(delete).build()
+    }
+
+    #[test]
+    fn batch_write_applies_only_for_any_write() {
+        let r = BatchWriteItemInput::builder()
+            .request_items("t", vec![put_write("pk", "k")])
+            .build()
+            .unwrap();
+        let op = DynamoOp::BatchWrite(&r);
+
+        assert!(!op.should_apply(KeyRouteAffinityType::None));
+        assert!(!op.should_apply(KeyRouteAffinityType::Rmw));
+        assert!(op.should_apply(KeyRouteAffinityType::AnyWrite));
+    }
+
+    #[test]
+    fn batch_write_partition_key_candidates_include_put_and_delete() {
+        let r = BatchWriteItemInput::builder()
+            .request_items("put_table", vec![put_write("pk", "put_key")])
+            .request_items("delete_table", vec![delete_write("pk", "delete_key")])
+            .build()
+            .unwrap();
+
+        let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().any(|candidate| {
+            candidate.table_name == "put_table"
+                && candidate.attributes.get("pk") == Some(&s("put_key"))
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.table_name == "delete_table"
+                && candidate.attributes.get("pk") == Some(&s("delete_key"))
+        }));
+    }
+
+    #[test]
+    fn batch_write_partition_key_candidates_are_sorted_by_table_name() {
+        let r = BatchWriteItemInput::builder()
+            .request_items("z_table", vec![put_write("pk", "z_key")])
+            .request_items("a_table", vec![put_write("pk", "a_key")])
+            .build()
+            .unwrap();
+
+        let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
+        let ordered_tables: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.table_name)
+            .collect();
+
+        assert_eq!(ordered_tables, vec!["a_table", "z_table"]);
+    }
+
+    #[test]
+    fn batch_write_ignores_empty_write_requests() {
+        let r = BatchWriteItemInput::builder()
+            .request_items("t", vec![WriteRequest::builder().build()])
+            .build()
+            .unwrap();
+
+        assert!(
+            DynamoOp::BatchWrite(&r)
+                .partition_key_candidates()
+                .is_empty()
+        );
+    }
+
     // ----- Enum dispatch / None mode -----
 
     #[test]
@@ -415,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn from_input_recognizes_put_update_delete() {
+    fn from_input_recognizes_put_update_delete_batch_write() {
         let p = PutItemInput::builder()
             .table_name("t")
             .item("pk", s("k"))
@@ -445,11 +584,20 @@ mod tests {
             DynamoOp::from_input(&Input::erase(d)),
             Some(DynamoOp::Delete(_))
         ));
+
+        let bw = BatchWriteItemInput::builder()
+            .request_items("t", vec![put_write("pk", "k")])
+            .build()
+            .unwrap();
+        assert!(matches!(
+            DynamoOp::from_input(&Input::erase(bw)),
+            Some(DynamoOp::BatchWrite(_))
+        ));
     }
 
     #[test]
     fn from_input_returns_none_for_unsupported_op() {
-        // Scan, BatchWriteItem, Query, etc. are intentionally not in the enum.
+        // Scan, Query, etc. are intentionally not in the enum.
         let scan = ScanInput::builder().table_name("t").build().unwrap();
         assert!(DynamoOp::from_input(&Input::erase(scan)).is_none());
     }
@@ -464,7 +612,11 @@ mod tests {
             .item("other", s("x"))
             .build()
             .unwrap();
-        assert_eq!(DynamoOp::Put(&r).partition_key("pk"), Some(&s("alice")));
+        let candidates = DynamoOp::Put(&r).partition_key_candidates();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].table_name, "t");
+        assert_eq!(candidates[0].attributes.get("pk"), Some(&s("alice")));
     }
 
     #[test]
@@ -474,7 +626,11 @@ mod tests {
             .key("pk", s("bob"))
             .build()
             .unwrap();
-        assert_eq!(DynamoOp::Update(&r).partition_key("pk"), Some(&s("bob")));
+        let candidates = DynamoOp::Update(&r).partition_key_candidates();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].table_name, "t");
+        assert_eq!(candidates[0].attributes.get("pk"), Some(&s("bob")));
     }
 
     #[test]
@@ -484,16 +640,16 @@ mod tests {
             .item("other", s("x"))
             .build()
             .unwrap();
-        assert!(DynamoOp::Put(&r).partition_key("pk").is_none());
+        let candidates = DynamoOp::Put(&r).partition_key_candidates();
+
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].attributes.contains_key("pk"));
     }
 
     #[test]
-    fn table_name_extracts_correctly() {
-        let p = PutItemInput::builder()
-            .table_name("users")
-            .item("pk", s("a"))
-            .build()
-            .unwrap();
-        assert_eq!(DynamoOp::Put(&p).table_name(), Some("users"));
+    fn missing_table_name_returns_no_candidates() {
+        let r = PutItemInput::builder().item("pk", s("a")).build().unwrap();
+
+        assert!(DynamoOp::Put(&r).partition_key_candidates().is_empty());
     }
 }
