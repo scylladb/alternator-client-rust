@@ -6,7 +6,7 @@
 use crate::keyrouting::go_rand::GoRand;
 use crate::live_nodes::LiveNodes;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use url::Url;
 
@@ -14,6 +14,11 @@ use url::Url;
 pub(crate) struct QueryPlan {
     live_nodes: Arc<LiveNodes>,
     state: Mutex<QueryPlanState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SortedAffinityNodes {
+    nodes: Vec<Arc<Url>>,
 }
 
 #[derive(Debug)]
@@ -25,6 +30,11 @@ enum QueryPlanState {
         // Boxed to prevent "large size difference between variants" warning
         go_rand: Box<GoRand>,
         remaining_nodes: Option<Vec<Arc<Url>>>,
+    },
+    /// Deterministic order with selected nodes before the rest.
+    PreferredNodes {
+        preferred_nodes: Vec<Arc<Url>>,
+        remaining_nodes: Option<VecDeque<Arc<Url>>>,
     },
 }
 
@@ -54,6 +64,27 @@ impl QueryPlan {
         }
     }
 
+    /// Creates a query plan that tries `preferred_nodes` first, then the
+    /// remaining live nodes in sorted order.
+    pub(crate) fn new_with_preferred_nodes(
+        live_nodes: Arc<LiveNodes>,
+        preferred_nodes: Vec<Arc<Url>>,
+    ) -> Self {
+        Self {
+            live_nodes,
+            state: Mutex::new(QueryPlanState::PreferredNodes {
+                preferred_nodes,
+                remaining_nodes: None,
+            }),
+        }
+    }
+
+    /// Returns the current live-node list in the canonical order used by
+    /// affinity routing.
+    pub(crate) fn sorted_affinity_nodes(live_nodes: &Arc<LiveNodes>) -> SortedAffinityNodes {
+        SortedAffinityNodes::from_live_nodes(live_nodes)
+    }
+
     /// Gets the next node to use in this query plan, or `None` if the plan is exhausted.
     ///
     /// With round-robin, on every attempt, the first node that hasn't been used yet in this request is returned.
@@ -73,8 +104,11 @@ impl QueryPlan {
                 go_rand,
                 remaining_nodes,
             } => {
-                let remaining =
-                    remaining_nodes.get_or_insert_with(|| self.live_nodes.get_live_nodes());
+                let remaining = remaining_nodes.get_or_insert_with(|| {
+                    let mut nodes = self.live_nodes.get_live_nodes();
+                    sort_node_urls(&mut nodes);
+                    nodes
+                });
 
                 if remaining.is_empty() {
                     return None;
@@ -90,8 +124,52 @@ impl QueryPlan {
 
                 Some(selected_node)
             }
+            QueryPlanState::PreferredNodes {
+                preferred_nodes,
+                remaining_nodes,
+            } => {
+                let remaining = remaining_nodes.get_or_insert_with(|| {
+                    let mut nodes = self.live_nodes.get_live_nodes();
+                    sort_node_urls(&mut nodes);
+
+                    let mut ordered = VecDeque::with_capacity(nodes.len());
+                    for preferred_node in preferred_nodes.iter() {
+                        if let Some(index) = nodes.iter().position(|node| node == preferred_node) {
+                            ordered.push_back(nodes.remove(index));
+                        }
+                    }
+                    ordered.extend(nodes);
+                    ordered
+                });
+
+                remaining.pop_front()
+            }
         }
     }
+}
+
+impl SortedAffinityNodes {
+    fn from_live_nodes(live_nodes: &Arc<LiveNodes>) -> Self {
+        let mut nodes = live_nodes.get_live_nodes();
+        sort_node_urls(&mut nodes);
+        Self { nodes }
+    }
+
+    /// Returns the first node the seeded affinity plan would select without
+    /// consuming a full query plan.
+    pub(crate) fn preferred_node_for_hash(&self, seed: u64) -> Option<Arc<Url>> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+
+        let mut go_rand = GoRand::new(seed as i64);
+        let idx = go_rand.intn(self.nodes.len() as i32) as usize;
+        Some(self.nodes[idx].clone())
+    }
+}
+
+fn sort_node_urls(nodes: &mut [Arc<Url>]) {
+    nodes.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
 }
 
 #[cfg(test)]
@@ -121,8 +199,11 @@ mod tests {
             count,
             "LiveNodes lost or duplicated seed entries"
         );
-        for (i, url) in urls.iter().enumerate() {
-            let expected_host = format!("node{}.example.com", i + 1);
+        let mut expected_hosts = (1..=count)
+            .map(|i| format!("node{i}.example.com"))
+            .collect::<Vec<_>>();
+        expected_hosts.sort_unstable();
+        for (url, expected_host) in urls.iter().zip(expected_hosts) {
             assert_eq!(url.host_str(), Some(expected_host.as_str()));
         }
 
@@ -151,14 +232,14 @@ mod tests {
 
     // ----- Cross-language test vectors -----
     //
-    // These tests are mirrored version of the ones in Java implementation.
+    // These vectors use the canonical lexicographic live-node order.
 
     #[test]
     fn cross_lang_seed_42_10_nodes() {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 42);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node6", "node9", "node5", "node2", "node7", "node1"],
+            vec!["node5", "node8", "node4", "node10", "node6", "node1"],
         );
     }
 
@@ -167,7 +248,7 @@ mod tests {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 123);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node6", "node1", "node4", "node3", "node10", "node5"],
+            vec!["node5", "node1", "node3", "node2", "node9", "node4"],
         );
     }
 
@@ -176,7 +257,7 @@ mod tests {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 999);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node5", "node10", "node4", "node1", "node2", "node3"],
+            vec!["node4", "node9", "node3", "node1", "node10", "node2"],
         );
     }
 
@@ -185,7 +266,7 @@ mod tests {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 0);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node5", "node1", "node2", "node10", "node6", "node8"],
+            vec!["node4", "node1", "node10", "node9", "node5", "node7"],
         );
     }
 
@@ -196,7 +277,7 @@ mod tests {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), u64::MAX);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node2", "node5", "node1", "node3", "node6", "node10"],
+            vec!["node10", "node4", "node1", "node2", "node5", "node9"],
         );
     }
 
@@ -214,7 +295,7 @@ mod tests {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 12345);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node4", "node5", "node1", "node7", "node6", "node8"],
+            vec!["node3", "node4", "node1", "node6", "node5", "node7"],
         );
     }
 
@@ -224,7 +305,28 @@ mod tests {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), i64::MAX as u64);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node2", "node7", "node8", "node1", "node10", "node4"],
+            vec!["node10", "node6", "node7", "node1", "node9", "node3"],
+        );
+    }
+
+    #[test]
+    fn preferred_nodes_plan_uses_selected_nodes_first_then_sorted_remaining() {
+        let live_nodes = make_live_nodes(5);
+        let preferred_3 = live_nodes
+            .get_live_nodes()
+            .into_iter()
+            .find(|node| node.host_str() == Some("node3.example.com"))
+            .expect("preferred node exists");
+        let preferred_5 = live_nodes
+            .get_live_nodes()
+            .into_iter()
+            .find(|node| node.host_str() == Some("node5.example.com"))
+            .expect("preferred node exists");
+        let plan = QueryPlan::new_with_preferred_nodes(live_nodes, vec![preferred_3, preferred_5]);
+
+        assert_eq!(
+            sequence(&plan, 5),
+            vec!["node3", "node5", "node1", "node2", "node4"],
         );
     }
 

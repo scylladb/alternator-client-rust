@@ -56,10 +56,10 @@ impl<'a> DynamoOp<'a> {
         }
     }
 
-    /// Returns ordered candidate table/key maps that can provide a partition
-    /// key. Single-item operations return at most one candidate; BatchWriteItem
-    /// can return multiple candidates so the caller can use the first one with
-    /// cached metadata and a supported partition-key value.
+    /// Returns candidate table/key maps that can provide a partition key.
+    /// Single-item operations return at most one candidate; BatchWriteItem can
+    /// return multiple candidates so the caller can apply batch-level routing
+    /// policy across all usable keys.
     pub fn partition_key_candidates(&self) -> Vec<PartitionKeyCandidate<'a>> {
         match self {
             Self::Put(r) => r
@@ -92,35 +92,31 @@ impl<'a> DynamoOp<'a> {
                     }]
                 })
                 .unwrap_or_default(),
-            Self::BatchWrite(r) => {
-                let mut items: Vec<_> = r
-                    .request_items()
-                    .into_iter()
-                    .flat_map(|items| items.iter())
-                    .collect();
-                items.sort_unstable_by(|(left_table, _), (right_table, _)| {
-                    left_table.cmp(right_table)
-                });
-
-                items
-                    .into_iter()
-                    .flat_map(|(table_name, writes)| {
-                        writes.iter().filter_map(|write| {
-                            let attributes = write
-                                .delete_request()
-                                .map(|delete| delete.key())
-                                .or_else(|| write.put_request().map(|put| put.item()))?;
-
-                            Some(PartitionKeyCandidate {
-                                table_name,
-                                attributes,
-                            })
+            Self::BatchWrite(r) => r
+                .request_items()
+                .into_iter()
+                .flat_map(|items| items.iter())
+                .flat_map(|(table_name, writes)| {
+                    writes.iter().filter_map(|write| {
+                        let attributes = batch_write_request_attributes(write)?;
+                        Some(PartitionKeyCandidate {
+                            table_name: table_name.as_str(),
+                            attributes,
                         })
                     })
-                    .collect()
-            }
+                })
+                .collect(),
         }
     }
+}
+
+fn batch_write_request_attributes(
+    write: &aws_sdk_dynamodb::types::WriteRequest,
+) -> Option<&HashMap<String, AttributeValue>> {
+    if let Some(delete) = write.delete_request() {
+        return Some(delete.key());
+    }
+    write.put_request().map(|put| put.item())
 }
 
 /// Checks if a `PutItem` operation qualifies for Key Route Affinity based on the configured mode.
@@ -533,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_write_partition_key_candidates_preserve_write_order_within_table() {
+    fn batch_write_partition_key_candidates_include_requests_without_pk() {
         let r = BatchWriteItemInput::builder()
             .request_items(
                 "t",
@@ -549,16 +545,30 @@ mod tests {
         let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
 
         assert_eq!(candidates.len(), 3);
-        assert_eq!(candidates[0].table_name, "t");
-        assert!(!candidates[0].attributes.contains_key("pk"));
-        assert_eq!(candidates[1].table_name, "t");
-        assert_eq!(candidates[1].attributes.get("pk"), Some(&s("delete_key")));
-        assert_eq!(candidates[2].table_name, "t");
-        assert_eq!(candidates[2].attributes.get("pk"), Some(&s("put_key")));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.table_name == "t")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| !candidate.attributes.contains_key("pk"))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.attributes.get("pk") == Some(&s("delete_key")))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.attributes.get("pk") == Some(&s("put_key")))
+        );
     }
 
     #[test]
-    fn batch_write_partition_key_candidates_are_sorted_by_table_name() {
+    fn batch_write_partition_key_candidates_include_multiple_tables() {
         for z_table_first in [true, false] {
             let builder = BatchWriteItemInput::builder();
             let builder = if z_table_first {
@@ -575,10 +585,14 @@ mod tests {
             let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
 
             assert_eq!(candidates.len(), 2);
-            assert_eq!(candidates[0].table_name, "a_table");
-            assert_eq!(candidates[0].attributes.get("pk"), Some(&s("a_key")));
-            assert_eq!(candidates[1].table_name, "z_table");
-            assert_eq!(candidates[1].attributes.get("pk"), Some(&s("z_key")));
+            assert!(candidates.iter().any(|candidate| {
+                candidate.table_name == "a_table"
+                    && candidate.attributes.get("pk") == Some(&s("a_key"))
+            }));
+            assert!(candidates.iter().any(|candidate| {
+                candidate.table_name == "z_table"
+                    && candidate.attributes.get("pk") == Some(&s("z_key"))
+            }));
         }
     }
 
@@ -594,6 +608,29 @@ mod tests {
                 .partition_key_candidates()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn batch_write_partition_key_candidates_use_put_items_and_delete_keys() {
+        let r = BatchWriteItemInput::builder()
+            .request_items(
+                "orders",
+                vec![put_write("pk", "put_key"), delete_write("pk", "delete_key")],
+            )
+            .build()
+            .unwrap();
+
+        let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().any(|candidate| {
+            candidate.attributes.get("pk") == Some(&s("put_key"))
+                && candidate.attributes.get("other") == Some(&s("x"))
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate.attributes.get("pk") == Some(&s("delete_key"))
+                && !candidate.attributes.contains_key("other")
+        }));
     }
 
     #[test]
