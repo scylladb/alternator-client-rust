@@ -465,6 +465,11 @@ mod tests {
         WriteRequest::builder().put_request(put).build()
     }
 
+    fn put_write_without_pk() -> WriteRequest {
+        let put = PutRequest::builder().item("other", s("x")).build().unwrap();
+        WriteRequest::builder().put_request(put).build()
+    }
+
     fn delete_write(pk_name: &str, value: &str) -> WriteRequest {
         let delete = DeleteRequest::builder()
             .key(pk_name, s(value))
@@ -487,41 +492,108 @@ mod tests {
     }
 
     #[test]
-    fn batch_write_partition_key_candidates_include_put_and_delete() {
+    fn batch_write_delete_applies_only_for_any_write() {
         let r = BatchWriteItemInput::builder()
-            .request_items("put_table", vec![put_write("pk", "put_key")])
-            .request_items("delete_table", vec![delete_write("pk", "delete_key")])
+            .request_items("t", vec![delete_write("pk", "k")])
+            .build()
+            .unwrap();
+        let op = DynamoOp::BatchWrite(&r);
+
+        assert!(!op.should_apply(KeyRouteAffinityType::None));
+        assert!(!op.should_apply(KeyRouteAffinityType::Rmw));
+        assert!(op.should_apply(KeyRouteAffinityType::AnyWrite));
+    }
+
+    #[test]
+    fn batch_write_partition_key_candidates_include_single_table_put() {
+        let r = BatchWriteItemInput::builder()
+            .request_items("t", vec![put_write("pk", "put_key")])
             .build()
             .unwrap();
 
         let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
 
-        assert_eq!(candidates.len(), 2);
-        assert!(candidates.iter().any(|candidate| {
-            candidate.table_name == "put_table"
-                && candidate.attributes.get("pk") == Some(&s("put_key"))
-        }));
-        assert!(candidates.iter().any(|candidate| {
-            candidate.table_name == "delete_table"
-                && candidate.attributes.get("pk") == Some(&s("delete_key"))
-        }));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].table_name, "t");
+        assert_eq!(candidates[0].attributes.get("pk"), Some(&s("put_key")));
+    }
+
+    #[test]
+    fn batch_write_partition_key_candidates_include_single_table_delete() {
+        let r = BatchWriteItemInput::builder()
+            .request_items("t", vec![delete_write("pk", "delete_key")])
+            .build()
+            .unwrap();
+
+        let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].table_name, "t");
+        assert_eq!(candidates[0].attributes.get("pk"), Some(&s("delete_key")));
+    }
+
+    #[test]
+    fn batch_write_partition_key_candidates_preserve_write_order_within_table() {
+        let r = BatchWriteItemInput::builder()
+            .request_items(
+                "t",
+                vec![
+                    put_write_without_pk(),
+                    delete_write("pk", "delete_key"),
+                    put_write("pk", "put_key"),
+                ],
+            )
+            .build()
+            .unwrap();
+
+        let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
+
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].table_name, "t");
+        assert!(!candidates[0].attributes.contains_key("pk"));
+        assert_eq!(candidates[1].table_name, "t");
+        assert_eq!(candidates[1].attributes.get("pk"), Some(&s("delete_key")));
+        assert_eq!(candidates[2].table_name, "t");
+        assert_eq!(candidates[2].attributes.get("pk"), Some(&s("put_key")));
     }
 
     #[test]
     fn batch_write_partition_key_candidates_are_sorted_by_table_name() {
+        for z_table_first in [true, false] {
+            let builder = BatchWriteItemInput::builder();
+            let builder = if z_table_first {
+                builder
+                    .request_items("z_table", vec![put_write("pk", "z_key")])
+                    .request_items("a_table", vec![put_write("pk", "a_key")])
+            } else {
+                builder
+                    .request_items("a_table", vec![put_write("pk", "a_key")])
+                    .request_items("z_table", vec![put_write("pk", "z_key")])
+            };
+            let r = builder.build().unwrap();
+
+            let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
+
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[0].table_name, "a_table");
+            assert_eq!(candidates[0].attributes.get("pk"), Some(&s("a_key")));
+            assert_eq!(candidates[1].table_name, "z_table");
+            assert_eq!(candidates[1].attributes.get("pk"), Some(&s("z_key")));
+        }
+    }
+
+    #[test]
+    fn batch_write_empty_batch_returns_no_candidates() {
         let r = BatchWriteItemInput::builder()
-            .request_items("z_table", vec![put_write("pk", "z_key")])
-            .request_items("a_table", vec![put_write("pk", "a_key")])
+            .request_items("t", Vec::new())
             .build()
             .unwrap();
 
-        let candidates = DynamoOp::BatchWrite(&r).partition_key_candidates();
-        let ordered_tables: Vec<_> = candidates
-            .iter()
-            .map(|candidate| candidate.table_name)
-            .collect();
-
-        assert_eq!(ordered_tables, vec!["a_table", "z_table"]);
+        assert!(
+            DynamoOp::BatchWrite(&r)
+                .partition_key_candidates()
+                .is_empty()
+        );
     }
 
     #[test]
