@@ -245,7 +245,25 @@ fn calculate_jittered_delay(base_delay: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_dynamodb::config::{BehaviorVersion, Region};
+    use crate::{
+        AffinityQueryPlanInterceptor, AlternatorClient, AlternatorConfig, AlternatorInterceptor,
+        LiveNodes, RequestCompression, RoundRobinQueryPlanInterceptor,
+    };
+    use aws_sdk_dynamodb::config::{BehaviorVersion, Credentials, Region};
+    use aws_sdk_dynamodb::types::AttributeValue;
+    use aws_smithy_runtime_api::client::http::{
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+    use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+    use aws_smithy_types::body::SdkBody;
+    use std::fmt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::watch;
+
+    const DESCRIBE_TABLE_TARGET: &str = "DynamoDB_20120810.DescribeTable";
+    const DESCRIBE_TABLE_RESPONSE: &str =
+        r#"{"Table":{"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}]}}"#;
 
     // ----- Test helpers -----
 
@@ -264,6 +282,201 @@ mod tests {
 
     fn make_resolver() -> Arc<PartitionKeyResolver> {
         Arc::new(PartitionKeyResolver::new(make_client(), HashMap::new()))
+    }
+
+    #[derive(Clone)]
+    struct MockDynamoHttp {
+        state: Arc<MockDynamoHttpState>,
+    }
+
+    struct MockDynamoHttpState {
+        describe_tables: AtomicUsize,
+        data_requests: AtomicUsize,
+        hold_first_describe: bool,
+        first_describe_release: watch::Sender<bool>,
+    }
+
+    impl fmt::Debug for MockDynamoHttp {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("MockDynamoHttp").finish_non_exhaustive()
+        }
+    }
+
+    impl MockDynamoHttp {
+        fn new() -> Self {
+            Self::with_first_describe_held(false)
+        }
+
+        fn with_held_first_describe() -> Self {
+            Self::with_first_describe_held(true)
+        }
+
+        fn with_first_describe_held(hold_first_describe: bool) -> Self {
+            let (first_describe_release, _) = watch::channel(false);
+            Self {
+                state: Arc::new(MockDynamoHttpState {
+                    describe_tables: AtomicUsize::new(0),
+                    data_requests: AtomicUsize::new(0),
+                    hold_first_describe,
+                    first_describe_release,
+                }),
+            }
+        }
+
+        fn describe_tables(&self) -> usize {
+            self.state.describe_tables.load(Ordering::SeqCst)
+        }
+
+        async fn wait_for_describe_tables(&self, expected: usize) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if self.describe_tables() >= expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("timed out waiting for DescribeTable request");
+        }
+
+        fn release_first_describe(&self) {
+            self.state.first_describe_release.send_replace(true);
+        }
+    }
+
+    impl HttpClient for MockDynamoHttp {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    impl HttpConnector for MockDynamoHttp {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let request = request
+                .try_into_http1x()
+                .expect("mock connector should receive an HTTP/1.x request");
+            let target = request
+                .headers()
+                .get("x-amz-target")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
+            if target == DESCRIBE_TABLE_TARGET {
+                let state = Arc::clone(&self.state);
+                let request_number = state.describe_tables.fetch_add(1, Ordering::SeqCst) + 1;
+                return HttpConnectorFuture::new(async move {
+                    if state.hold_first_describe && request_number == 1 {
+                        let mut release = state.first_describe_release.subscribe();
+                        while !*release.borrow_and_update() {
+                            release
+                                .changed()
+                                .await
+                                .expect("release sender must outlive first DescribeTable");
+                        }
+                    }
+                    Ok(json_response(DESCRIBE_TABLE_RESPONSE))
+                });
+            }
+
+            self.state.data_requests.fetch_add(1, Ordering::SeqCst);
+            HttpConnectorFuture::ready(Ok(json_response("{}")))
+        }
+    }
+
+    fn json_response(body: &'static str) -> HttpResponse {
+        let response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("x-amzn-requestid", "test-request-id")
+            .body(SdkBody::from(body))
+            .expect("valid mock HTTP response");
+        HttpResponse::try_from(response).expect("valid Smithy HTTP response")
+    }
+
+    fn make_affinity_client(
+        http_client: MockDynamoHttp,
+        affinity_config: crate::keyrouting::KeyRouteAffinityConfig,
+    ) -> (aws_sdk_dynamodb::Client, Arc<PartitionKeyResolver>) {
+        let live_nodes_config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("http://127.0.0.1:1")
+            .build();
+        let live_nodes = LiveNodes::new(&live_nodes_config).expect("seed node config is valid");
+
+        let base_builder = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::for_tests_with_session_token())
+            .endpoint_url("http://127.0.0.1:1")
+            .http_client(http_client)
+            .interceptor(AlternatorInterceptor::new(
+                RequestCompression::disabled(),
+                true,
+            ));
+
+        let discovery_client = aws_sdk_dynamodb::Client::from_conf(
+            base_builder
+                .clone()
+                .interceptor(RoundRobinQueryPlanInterceptor::new(live_nodes.clone()))
+                .build(),
+        );
+        let resolver = Arc::new(PartitionKeyResolver::new(
+            discovery_client,
+            affinity_config.pk_info_per_table.clone(),
+        ));
+
+        let client = aws_sdk_dynamodb::Client::from_conf(
+            base_builder
+                .interceptor(AffinityQueryPlanInterceptor::new(
+                    affinity_config,
+                    live_nodes,
+                    resolver.clone(),
+                ))
+                .build(),
+        );
+
+        (client, resolver)
+    }
+
+    async fn put_item(
+        client: &aws_sdk_dynamodb::Client,
+        table_name: &str,
+        pk_name: &str,
+        pk_value: &str,
+    ) {
+        client
+            .put_item()
+            .table_name(table_name)
+            .item(pk_name, AttributeValue::S(pk_value.to_string()))
+            .send()
+            .await
+            .expect("mocked PutItem should succeed");
+    }
+
+    async fn wait_for_partition_key(
+        resolver: &PartitionKeyResolver,
+        table_name: &str,
+        expected_pk: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if resolver
+                    .get_partition_key(table_name)
+                    .is_some_and(|pk| pk.as_ref() == expected_pk)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for partition-key discovery");
     }
 
     // ----- FailureRecord -----
@@ -410,6 +623,90 @@ mod tests {
         // bookkeeping is not: exactly one in_progress entry, no others.
         assert_eq!(resolver.in_progress.len(), 1);
         assert!(resolver.in_progress.contains("users"));
+    }
+
+    #[tokio::test]
+    async fn affinity_request_discovers_partition_key_once_and_reuses_cache() {
+        let http_client = MockDynamoHttp::with_held_first_describe();
+        let affinity_config = crate::keyrouting::KeyRouteAffinityConfig::builder()
+            .with_type(crate::keyrouting::KeyRouteAffinityType::AnyWrite)
+            .build();
+        let (client, resolver) = make_affinity_client(http_client.clone(), affinity_config);
+
+        put_item(&client, "users", "id", "first").await;
+        http_client.wait_for_describe_tables(1).await;
+
+        for i in 0..5 {
+            put_item(&client, "users", "id", &format!("in-flight-{i}")).await;
+        }
+        assert_eq!(
+            http_client.describe_tables(),
+            1,
+            "same-table cache misses while discovery is in flight must be deduplicated",
+        );
+
+        http_client.release_first_describe();
+        wait_for_partition_key(&resolver, "users", "pk").await;
+
+        for i in 0..3 {
+            put_item(&client, "users", "pk", &format!("cached-{i}")).await;
+        }
+        assert_eq!(
+            http_client.describe_tables(),
+            1,
+            "cached partition-key metadata should avoid repeated DescribeTable calls",
+        );
+    }
+
+    #[tokio::test]
+    async fn alternator_client_from_conf_wires_affinity_partition_key_discovery() {
+        let http_client = MockDynamoHttp::new();
+        let client = AlternatorClient::from_conf(
+            AlternatorConfig::builder()
+                .credentials_provider(Credentials::for_tests_with_session_token())
+                .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:1")
+                .http_client(http_client.clone())
+                .key_route_affinity(crate::keyrouting::KeyRouteAffinityType::AnyWrite)
+                .build(),
+        );
+
+        client
+            .put_item()
+            .table_name("users")
+            .item("id", AttributeValue::S("first".to_string()))
+            .send()
+            .await
+            .expect("mocked PutItem should succeed");
+
+        http_client.wait_for_describe_tables(1).await;
+        assert_eq!(
+            http_client.describe_tables(),
+            1,
+            "AlternatorClient::from_conf should wire affinity PK discovery",
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_request_with_preconfigured_partition_key_skips_discovery() {
+        let http_client = MockDynamoHttp::new();
+        let affinity_config = crate::keyrouting::KeyRouteAffinityConfig::builder()
+            .with_type(crate::keyrouting::KeyRouteAffinityType::AnyWrite)
+            .with_pk_info("users", "pk")
+            .build();
+        let (client, resolver) = make_affinity_client(http_client.clone(), affinity_config);
+
+        assert_eq!(resolver.get_partition_key("users").as_deref(), Some("pk"));
+
+        for i in 0..5 {
+            put_item(&client, "users", "pk", &format!("configured-{i}")).await;
+        }
+
+        assert_eq!(
+            http_client.describe_tables(),
+            0,
+            "preconfigured partition-key metadata should skip DescribeTable",
+        );
     }
 
     // ----- calculate_jittered_delay -----
