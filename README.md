@@ -270,12 +270,14 @@ let client = AlternatorClient::from_conf(
 
 ## Header stripping
 
-By default, the AWS Rust SDK attaches a number of headers to every DynamoDB request — some are required (`Host`, `Authorization`, `X-Amz-Date`, etc.), others are SDK metadata that Alternator doesn't use (`User-Agent` flavors, internal telemetry, retry information). For a small client-side optimization, this crate strips non-essential headers before transmission, keeping only the ones Alternator actually needs:
+By default, the AWS Rust SDK attaches a number of headers to every DynamoDB request — some are required for signed requests (`Host`, `Authorization`, `X-Amz-Date`, etc.), others are SDK metadata that Alternator doesn't use (`User-Agent` flavors, internal telemetry, retry information). For a small client-side optimization, this crate strips non-essential headers before transmission, keeping only the ones Alternator actually needs:
 - `host`
 - `x-amz-target`
 - `content-length`
 - `accept-encoding`
 - `content-encoding`
+
+For signed requests, it also keeps:
 - `authorization`
 - `x-amz-date`
 

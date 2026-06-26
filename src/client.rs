@@ -49,6 +49,7 @@ impl AlternatorClient {
             request_compression,
             response_compression,
             optimize_headers,
+            has_credentials_provider,
         ));
 
         // If live nodes are not in config - create new config with live nodes.
