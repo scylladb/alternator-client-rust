@@ -36,15 +36,20 @@ impl AlternatorClient {
             .unwrap_or(RequestCompression::disabled());
         let response_compression = extensions.response_compression.unwrap_or_default();
         let optimize_headers = extensions.optimize_headers.unwrap_or(true);
+        let has_credentials_provider = config.has_credentials_provider();
         let has_region = dynamodb_config.region().is_some();
 
-        let mut builder = dynamodb_config
-            .to_builder()
-            .interceptor(AlternatorInterceptor::new(
-                request_compression,
-                response_compression,
-                optimize_headers,
-            ));
+        let mut builder = dynamodb_config.to_builder();
+
+        if !has_credentials_provider {
+            builder = builder.allow_no_auth();
+        }
+
+        builder = builder.interceptor(AlternatorInterceptor::new(
+            request_compression,
+            response_compression,
+            optimize_headers,
+        ));
 
         // If live nodes are not in config - create new config with live nodes.
         let (config, live_nodes) = if let Some(nodes) = config.live_nodes() {
