@@ -96,9 +96,9 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
-The host in the URL is treated as a *seed*: the client immediately calls `/localnodes` on that node to discover the full cluster, and from that point onward all requests fan out across the discovered nodes. The endpoint URL is never used for actual data-plane traffic after discovery completes.
+The host in the URL is treated as a *seed*. For datacenter and rack scopes, the client calls `/localnodes` with the configured scope parameters. For the default cluster-wide scope, the client calls bare `/localnodes` on configured seed hosts and already-known live nodes, then unions the returned node lists. The endpoint URL is never used for actual data-plane traffic after discovery completes.
 
-To give the client multiple candidates for the initial `/localnodes` call, or for deployments where the seed node might be down at startup time, you can pass multiple seed addresses directly along with the scheme and the port:
+To give the client multiple candidates for initial discovery, or for deployments where a seed node might be down at startup time, pass multiple seed addresses directly along with the Alternator scheme and port:
 
 ```rust
 use alternator_driver::AlternatorConfig;
@@ -116,7 +116,7 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
-The client tries each seed in turn until one responds successfully to `/localnodes`. Once discovery succeeds, the seed list is no longer consulted (except as fallback if all currently-known nodes become unreachable).
+For cluster-wide scope, provide at least one working seed host from every datacenter that should receive traffic. If a datacenter has no working seed in the configuration, the client cannot reliably discover and refresh live Alternator nodes from that datacenter.
 
 ### Node discovery
 
@@ -137,7 +137,7 @@ The refresh task runs in the background for the lifetime of the client. It termi
 
 ### Routing scope
 
-By default, the client uses every Alternator node returned by `/localnodes`. For deployments spanning multiple datacenters or racks, you usually want requests to stay within a specific datacenter — or within a specific rack of a specific datacenter — to minimize cross-zone latency and bandwidth.
+By default, the client uses every live Alternator node it discovers across the cluster. For deployments spanning multiple datacenters or racks, you usually want requests to stay within a specific datacenter — or within a specific rack of a specific datacenter — to minimize cross-zone latency and bandwidth.
 
 This is configured via `RoutingScope`:
 
@@ -161,10 +161,6 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
-> **Note:** `RoutingScope::from_cluster()` currently routes only within a
-> single datacenter, not the whole cluster. See [issue #38](https://github.com/scylladb/alternator-client-rust/issues/38).
-
-
 ### Scope fallbacks
 
 A scope can be narrow enough that no nodes match it — for example, a specific rack that has no live nodes at the moment. In that case the client uses the configured fallback scope instead. Fallbacks are explicit and chainable:
@@ -186,7 +182,7 @@ let scope = RoutingScope::from_rack("dc1".to_string(), "rack1".to_string())
 The first one says:
 - prefer `rack1` of `dc1`
 - if no nodes there, use any node in `dc1`
-- if still nothing, use any node Alternator returns
+- if still nothing, use any live node discovered in the cluster
 
 The client walks the chain from preferred to broadest, picking the first scope that has live nodes.
 

@@ -119,8 +119,8 @@ impl AlternatorConfig {
     /// This function can be used multiple times to create a chain of fallback scopes.
     /// Requests will always be routed to the most preferred scope in the chain with available nodes.
     ///
-    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across nodes in the datacenter of the seed host.
-    /// If multiple seed hosts are provided, it will use the datacenter of one of the seed hosts, falling back to a different one if needed.
+    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across live nodes in all discovered datacenters.
+    /// Cluster scope requires at least one working seed host from every datacenter that should receive traffic.
     ///
     /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
     /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
@@ -326,8 +326,8 @@ impl AlternatorBuilder {
     /// This function can be used multiple times to create a chain of fallback scopes.
     /// Requests will always be routed to the most preferred scope in the chain with available nodes.
     ///
-    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across nodes in the datacenter of the seed host.
-    /// If multiple seed hosts are provided, it will use the datacenter of one of the seed hosts, falling back to a different one if needed.
+    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across live nodes in all discovered datacenters.
+    /// Cluster scope requires at least one working seed host from every datacenter that should receive traffic.
     ///
     /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
     /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
@@ -347,8 +347,8 @@ impl AlternatorBuilder {
     /// This function can be used multiple times to create a chain of fallback scopes.
     /// Requests will always be routed to the most preferred scope in the chain with available nodes.
     ///
-    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across nodes in the datacenter of the seed host.
-    /// If multiple seed hosts are provided, it will use the datacenter of one of the seed hosts, falling back to a different one if needed.
+    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across live nodes in all discovered datacenters.
+    /// Cluster scope requires at least one working seed host from every datacenter that should receive traffic.
     ///
     /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
     /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
