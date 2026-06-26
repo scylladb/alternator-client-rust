@@ -12,6 +12,7 @@ use crate::*;
 pub(crate) struct AlternatorExtensions {
     pub(crate) request_compression: Option<RequestCompression>,
     pub(crate) optimize_headers: Option<bool>,
+    pub(crate) has_credentials_provider: bool,
     pub(crate) active_interval: Option<std::time::Duration>,
     pub(crate) idle_interval: Option<std::time::Duration>,
     pub(crate) routing_scope: Option<RoutingScope>,
@@ -83,6 +84,10 @@ impl AlternatorConfig {
     /// Turned off by default.
     pub fn request_compression(&self) -> Option<RequestCompression> {
         self.alternator_ext.request_compression.clone()
+    }
+
+    pub(crate) fn has_credentials_provider(&self) -> bool {
+        self.alternator_ext.has_credentials_provider
     }
 
     /// Gets the active interval for refreshing the list of known nodes when the client is active.
@@ -527,9 +532,13 @@ impl AlternatorBuilder {
 
 impl From<&aws_types::sdk_config::SdkConfig> for AlternatorBuilder {
     fn from(sdk_config: &aws_types::sdk_config::SdkConfig) -> Self {
+        let has_credentials_provider = sdk_config.credentials_provider().is_some();
         AlternatorBuilder {
             dynamodb_builder: aws_sdk_dynamodb::config::Builder::from(sdk_config),
-            alternator_ext: AlternatorExtensions::default(),
+            alternator_ext: AlternatorExtensions {
+                has_credentials_provider,
+                ..Default::default()
+            },
         }
     }
 }
@@ -989,6 +998,7 @@ impl AlternatorBuilder {
         mut self,
         credentials_provider: impl aws_sdk_dynamodb::config::ProvideCredentials + 'static,
     ) -> Self {
+        self.alternator_ext.has_credentials_provider = true;
         self.dynamodb_builder = self
             .dynamodb_builder
             .credentials_provider(credentials_provider);
@@ -999,6 +1009,9 @@ impl AlternatorBuilder {
         &mut self,
         credentials_provider: Option<aws_sdk_dynamodb::config::SharedCredentialsProvider>,
     ) -> &mut Self {
+        if credentials_provider.is_some() {
+            self.alternator_ext.has_credentials_provider = true;
+        }
         self.dynamodb_builder
             .set_credentials_provider(credentials_provider);
         self
@@ -1079,6 +1092,28 @@ mod test {
                 .expect("does not have length")
                 == 0
         );
+    }
+
+    #[test]
+    fn shared_sdk_config_credentials_provider_is_remembered() {
+        let sdk_config = aws_types::SdkConfig::builder()
+            .credentials_provider(aws_sdk_dynamodb::config::SharedCredentialsProvider::new(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            ))
+            .build();
+
+        let config = AlternatorConfig::from(&sdk_config);
+
+        assert!(config.has_credentials_provider());
+    }
+
+    #[test]
+    fn shared_sdk_config_without_credentials_provider_is_no_auth() {
+        let sdk_config = aws_types::SdkConfig::builder().build();
+
+        let config = AlternatorConfig::from(&sdk_config);
+
+        assert!(!config.has_credentials_provider());
     }
 
     #[test]

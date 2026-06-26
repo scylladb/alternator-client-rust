@@ -177,6 +177,8 @@ impl HttpTestConfig for WithoutCredentialsConfig {
             rogue.unwrap(),
             whitelist
         );
+        assert!(!parts.headers.contains_key("authorization"));
+        assert!(!parts.headers.contains_key("x-amz-date"));
 
         // forward
         let (parts, body) = collect_received_response(parts, body, sender).await;
@@ -198,7 +200,6 @@ pub async fn test_without_credentials(ctx: &mut HttpTestContext<WithoutCredentia
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(true)
-            .allow_no_auth()
             .build(),
     );
 
@@ -237,6 +238,8 @@ impl HttpTestConfig for WithCredentialsConfig {
             rogue.unwrap(),
             whitelist
         );
+        assert!(parts.headers.contains_key("authorization"));
+        assert!(parts.headers.contains_key("x-amz-date"));
 
         // forward
         let (parts, body) = collect_received_response(parts, body, sender).await;

@@ -60,7 +60,6 @@ async fn main() {
     let config = AlternatorConfig::builder() // <-- was aws_sdk_dynamodb::Config::builder()
         .endpoint_url("http://localhost:8000")
         .behavior_version_latest()
-        .allow_no_auth()
         .build();
 
     // Build an AlternatorClient instead of an aws_sdk_dynamodb::Client.
@@ -78,6 +77,8 @@ async fn main() {
 }
 ```
 
+When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK.
+
 ## Load balancing
 
 A single Alternator cluster typically consists of multiple nodes, any of which can serve any request. This crate distributes requests across the live nodes of the cluster rather than sending everything to one address. There's no separate load-balancer process, routing happens entirely client-side.
@@ -92,7 +93,6 @@ use alternator_driver::AlternatorConfig;
 let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
     .behavior_version_latest()
-    .allow_no_auth()
     .build();
 ```
 
@@ -112,7 +112,6 @@ let config = AlternatorConfig::builder()
         "10.0.0.3",
     ])
     .behavior_version_latest()
-    .allow_no_auth()
     .build();
 ```
 
@@ -157,7 +156,6 @@ let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
     .routing_scope(scope)
     .behavior_version_latest()
-    .allow_no_auth()
     .build();
 ```
 
@@ -245,7 +243,6 @@ let client = AlternatorClient::from_conf(
         .endpoint_url("http://10.0.0.1:8043")
         .key_route_affinity(KeyRouteAffinityType::Rmw)
         .behavior_version_latest()
-        .allow_no_auth()
         .build(),
 );
 ```
@@ -268,7 +265,6 @@ let client = AlternatorClient::from_conf(
         .endpoint_url("http://10.0.0.1:8043")
         .key_route_affinity(affinity)
         .behavior_version_latest()
-        .allow_no_auth()
         .build(),
 );
 ```
@@ -297,7 +293,6 @@ let client = AlternatorClient::from_conf(
         .endpoint_url("http://10.0.0.1:8043")
         .optimize_headers(false)
         .behavior_version_latest()
-        .allow_no_auth()
         .build(),
 );
 ```
@@ -319,7 +314,6 @@ let client = AlternatorClient::from_conf(
             1024, // body-size threshold in bytes
         ))
         .behavior_version_latest()
-        .allow_no_auth()
         .build(),
 );
 ```
