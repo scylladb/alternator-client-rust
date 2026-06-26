@@ -4,21 +4,24 @@
 //! use from outgoing requests. A proxy is used to intercept messages exchanged
 //! between the driver and Alternator.
 //!
-//! There are five test cases:
+//! There are six test cases:
 //! 1. Without credentials:
 //!    Disable credentials and verify that requests follow this whitelist:
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding"]
-//! 2. With credentials:
+//! 2. Without credentials, with injected auth headers:
+//!    Disable credentials, inject auth headers before header stripping, and
+//!    verify that requests still follow the no-auth whitelist.
+//! 3. With credentials:
 //!    Enable credentials and verify that requests follow this whitelist:
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "authorization", "x-amz-date"]
-//! 3. Whitelist needed:
+//! 4. Whitelist needed:
 //!    Enable credentials, disable header stripping, and verify that
 //!    unnecessary headers are present, confirming that stripping is useful.
-//! 4. Enabled by per-request customization:
+//! 5. Enabled by per-request customization:
 //!    Disable header stripping in the client config, override it for one call,
 //!    and then make another non-customized call to verify that the override
 //!    does not persist.
-//! 5. Disabled by per-request customization:
+//! 6. Disabled by per-request customization:
 //!    Enable header stripping in the client config, override it for one call,
 //!    and then make another non-customized call to verify that the override
 //!    does not persist.
@@ -42,6 +45,11 @@ use test_context::test_context;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
+use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+use aws_smithy_types::config_bag::ConfigBag;
+
 use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
@@ -49,6 +57,26 @@ use aws_sdk_dynamodb::types::{
 };
 
 use alternator_driver::*;
+
+#[derive(Debug)]
+struct InjectAuthHeadersInterceptor;
+impl aws_sdk_dynamodb::config::Intercept for InjectAuthHeadersInterceptor {
+    fn name(&self) -> &'static str {
+        "InjectAuthHeadersInterceptor"
+    }
+
+    fn modify_before_transmit(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        _: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let headers = context.request_mut().headers_mut();
+        headers.insert("authorization", "AWS4-HMAC-SHA256 fake");
+        headers.insert("x-amz-date", "20260626T120000Z");
+        Ok(())
+    }
+}
 
 async fn cleanup_calls(resources: Vec<String>, alternator_address: &str) {
     let client = aws_sdk_dynamodb::Client::from_conf(
@@ -205,6 +233,27 @@ pub async fn test_without_credentials(ctx: &mut HttpTestContext<WithoutCredentia
 
     // perform calls to alternator, use proxy to peek and forward requests
     // proxy ensures all requests to have headers stripped according to the whitelist in WithoutCredentialsConfig
+    make_calls(&client, ctx).await;
+}
+
+#[test_context(HttpTestContext<WithoutCredentialsConfig>)]
+#[tokio::test]
+pub async fn test_without_credentials_drops_injected_auth_headers(
+    ctx: &mut HttpTestContext<WithoutCredentialsConfig>,
+) {
+    // construct client with credentials disabled
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .optimize_headers(true)
+            .interceptor(InjectAuthHeadersInterceptor)
+            .build(),
+    );
+
+    // perform calls to alternator, use proxy to peek and forward requests
+    // proxy ensures the injected auth headers are dropped according to the no-auth whitelist
     make_calls(&client, ctx).await;
 }
 

@@ -418,6 +418,7 @@ mod tests {
             .interceptor(AlternatorInterceptor::new(
                 RequestCompression::disabled(),
                 true,
+                true,
             ));
 
         let discovery_client = aws_sdk_dynamodb::Client::from_conf(

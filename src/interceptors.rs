@@ -27,12 +27,18 @@ use crate::keyrouting::resolver;
 pub(crate) struct AlternatorInterceptor {
     request_compression: RequestCompression,
     optimize_headers: bool,
+    preserve_auth_headers: bool,
 }
 impl AlternatorInterceptor {
-    pub fn new(request_compression: RequestCompression, optimize_headers: bool) -> Self {
+    pub fn new(
+        request_compression: RequestCompression,
+        optimize_headers: bool,
+        preserve_auth_headers: bool,
+    ) -> Self {
         Self {
             request_compression,
             optimize_headers,
+            preserve_auth_headers,
         }
     }
 }
@@ -74,10 +80,15 @@ impl Intercept for AlternatorInterceptor {
             .load::<OptimizeHeadersStore>()
             .map(|store| store.optimize_headers)
             .unwrap_or(self.optimize_headers);
+        let preserve_auth_headers = cfg
+            .interceptor_state()
+            .load::<PreserveAuthHeadersStore>()
+            .map(|store| store.preserve_auth_headers)
+            .unwrap_or(self.preserve_auth_headers);
 
         // optimize headers
         if optimize_headers {
-            strip_headers(context.request_mut());
+            strip_headers(context.request_mut(), preserve_auth_headers);
         }
 
         Ok(())
@@ -128,6 +139,14 @@ impl Storable for OptimizeHeadersStore {
     type Storer = StoreReplace<Self>;
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreserveAuthHeadersStore {
+    preserve_auth_headers: bool,
+}
+impl Storable for PreserveAuthHeadersStore {
+    type Storer = StoreReplace<Self>;
+}
+
 /// An interceptor used to override [AlternatorClient]'s config.
 ///
 /// Adds specified config overrides to [ConfigBag], so that [AlternatorInterceptor] can later look for it.
@@ -167,6 +186,15 @@ impl AlternatorOverrideInterceptor<OptimizeHeadersStore> {
     pub(crate) fn for_optimize_headers(optimize_headers: bool) -> Self {
         AlternatorOverrideInterceptor {
             store: OptimizeHeadersStore { optimize_headers },
+        }
+    }
+}
+impl AlternatorOverrideInterceptor<PreserveAuthHeadersStore> {
+    pub(crate) fn for_preserve_auth_headers(preserve_auth_headers: bool) -> Self {
+        AlternatorOverrideInterceptor {
+            store: PreserveAuthHeadersStore {
+                preserve_auth_headers,
+            },
         }
     }
 }

@@ -47,6 +47,7 @@ impl AlternatorClient {
         builder = builder.interceptor(AlternatorInterceptor::new(
             request_compression,
             optimize_headers,
+            has_credentials_provider,
         ));
 
         // If live nodes are not in config - create new config with live nodes.
