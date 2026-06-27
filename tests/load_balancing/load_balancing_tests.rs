@@ -1,291 +1,48 @@
 use crate::ccm_wrapper::ccm::*;
 use crate::ccm_wrapper::cluster::*;
-use crate::ccm_wrapper::topology_spec::*;
-use crate::load_balancing::proxy;
+use crate::load_balancing::cluster_utils::*;
 use crate::load_balancing::scope_utils;
 
 use alternator_driver::AlternatorClient;
-use alternator_driver::AlternatorConfig;
 use alternator_driver::RoutingScope;
 use alternator_driver::keyrouting::affinity_config::{
     KeyRouteAffinityConfig, KeyRouteAffinityType,
 };
 use alternator_driver::keyrouting::{go_rand::GoRand, hasher};
-use aws_sdk_dynamodb::types::AttributeValue;
-use hyper::Method;
+use aws_sdk_dynamodb::types::{
+    AttributeAction, AttributeValue, AttributeValueUpdate, DeleteRequest, KeysAndAttributes,
+    PutRequest, ReturnValue, Select, WriteRequest,
+};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
-
-use ctor::dtor;
-use tokio::sync::{Mutex, MutexGuard};
-
-const PROXY_PORT: u16 = 7999;
-const ALTERNATOR_PORT: u16 = 8000;
-
-const POLLING_TIMEOUT: Duration = Duration::from_secs(5);
-const POLLING_INTERVAL: Duration = Duration::from_millis(50);
-
-// Since cluster creation is expensive, we create it once and reuse it for every test.
-// Before a test gets access to the cluster, we make sure that all nodes are up and their ports are set to default.
-// Datacenter 1 is a single node which is meant to never be shut down. Its address will be used as a seed address
-// for clients and as a redirect target for requests directed to shut down nodes.
-static CLUSTER: OnceLock<Mutex<Cluster>> = OnceLock::new();
-async fn get_cluster() -> MutexGuard<'static, Cluster> {
-    let mut cluster = CLUSTER
-        .get_or_init(|| {
-            let topology = TopologySpecBuilder::new()
-                .datacenter(DatacenterSpec::new().rack(1))
-                .datacenter(DatacenterSpec::new().rack(1).rack(2))
-                .datacenter(DatacenterSpec::new().rack(2).rack(1))
-                .build()
-                .unwrap();
-            let ip_prefix = IpPrefix::new("127.0.1.").unwrap();
-            let cluster_name = format!("test_cluster_{}", uuid::Uuid::new_v4());
-            let scylla_version = String::from("release:2025.1");
-            let cluster = Ccm::create_cluster(
-                cluster_name,
-                &topology,
-                ip_prefix,
-                ALTERNATOR_PORT,
-                scylla_version,
-            )
-            .unwrap();
-            Mutex::new(cluster)
-        })
-        .lock()
-        .await;
-
-    Ccm::start_cluster(&mut cluster).unwrap();
-    cluster.update_all_nodes_port(ALTERNATOR_PORT);
-    cluster
-}
-
-// Since the cluster is static, it never drops, so we use a destructor.
-#[dtor]
-fn clean_up_cluster() {
-    if let Some(cluster_mutex) = CLUSTER.get() {
-        let mut cluster = cluster_mutex.blocking_lock();
-        Ccm::remove_cluster(&mut cluster);
-    }
-}
-
-fn default_endpoint_url(cluster: &Cluster) -> String {
-    cluster.datacenters()[0].racks()[0].nodes()[0].address()
-}
+use std::sync::Arc;
 
 fn redirect_target_node(cluster: &Cluster) -> Node {
     cluster.datacenters()[0].racks()[0].nodes()[0].clone()
 }
 
-// Struct for counting requests made to the proxy. GETs, POSTs, and describe_tables are counted separately.
-// GETs are service discovery calls, POSTs are the actual calls to DB, and describe_table calls
-// are from PartitionKeyResolver.
-#[derive(Debug)]
-pub(crate) struct NodeCounter {
-    posts: AtomicUsize,
-    gets: AtomicUsize,
-    describe_tables: AtomicUsize,
-}
-
-impl NodeCounter {
-    fn new() -> Self {
-        Self {
-            posts: AtomicUsize::new(0),
-            gets: AtomicUsize::new(0),
-            describe_tables: AtomicUsize::new(0),
-        }
-    }
-
-    pub(crate) fn posts(&self) -> usize {
-        self.posts.load(Ordering::Relaxed)
-    }
-
-    fn reset(&self) {
-        self.posts.store(0, Ordering::Relaxed);
-        self.gets.store(0, Ordering::Relaxed);
-        self.describe_tables.store(0, Ordering::Relaxed);
-    }
-}
-
-pub(crate) async fn start_counting_proxy(
-    listen_addr: String,
-    connect_addr: String,
-    request_counter: Arc<NodeCounter>,
-) {
-    let proxy = proxy::Proxy::start(
-        listen_addr,
-        connect_addr,
-        move |req, send| {
-            let node_counter = Arc::clone(&request_counter);
-            async move {
-                {
-                    let is_describe_table = req
-                        .headers()
-                        .get("x-amz-target")
-                        .is_some_and(|h| h == "DynamoDB_20120810.DescribeTable");
-
-                    match *req.method() {
-                        Method::POST => {
-                            if is_describe_table {
-                                node_counter.describe_tables.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                node_counter.posts.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Method::GET => {
-                            node_counter.gets.fetch_add(1, Ordering::Relaxed);
-                        }
-                        _ => {}
-                    };
-                }
-                proxy::forward_on_request(req, send).await
-            }
-        },
-        None,
-        None,
-    )
-    .await;
-
-    // Avoid a dead-code warning.
-    let _ = proxy.address();
-
-    // We deliberately detach the proxy task here.
-    // Each test has its own Tokio runtime, so dropping the runtime will abort
-    // this task and cleanly release the listener and connection resources.
-    // Only one test at a time can use the cluster, so old proxies will be dropped before new ones are created.
-    tokio::spawn(async move {
-        proxy.run().await;
-    });
-}
-
 // This proxy is used in tests where we check if calls are made to a node that is down.
 // Redirecting calls to a different node allows us to count calls to the stopped node,
 // while also allowing the client to use it for discovery without connection errors.
-pub(crate) async fn start_redirecting_proxy(
-    from: &Node,
-    to: &Node,
-    request_counter: Arc<NodeCounter>,
-) {
+async fn start_redirecting_proxy(from: &Node, to: &Node, request_counter: Arc<NodeCounter>) {
     let listen_addr = format!("{}:{}", from.ip.clone(), from.alternator_port);
     let connect_addr = format!("{}:{}", to.ip.clone(), ALTERNATOR_PORT);
     start_counting_proxy(listen_addr, connect_addr, request_counter).await;
 }
 
-// This is the proxy that calls to the node go through. Used to count calls and ensure that client calls the correct nodes.
-pub(crate) async fn start_proxy_on_node(
-    node: Node,
-    proxy_port: u16,
-    request_counter: Arc<NodeCounter>,
-) {
-    let listen_addr = format!("{}:{}", node.ip, proxy_port);
-    let connect_addr = format!("{}:{}", node.ip, ALTERNATOR_PORT);
-    start_counting_proxy(listen_addr, connect_addr, request_counter).await;
-}
-
-pub(crate) async fn start_proxies(
-    cluster: &mut Cluster,
-    proxy_port: u16,
-    request_counter: &RequestCounter,
-) {
-    cluster.update_all_nodes_port(proxy_port);
-    let counter = &request_counter.counter;
-    for node in cluster.nodes() {
-        if node.is_up {
-            let node_counter = Arc::clone(counter.get(&node.ip).unwrap());
-            start_proxy_on_node(node.clone(), proxy_port, node_counter).await;
-        }
-    }
-}
-
-pub(crate) async fn start_redirecting_proxies(
+async fn start_redirecting_proxies(
     cluster: &mut Cluster,
     proxy_port: u16,
     request_counter: &RequestCounter,
 ) {
     cluster.update_all_nodes_port(proxy_port);
     let to = &redirect_target_node(cluster);
-    let counter = &request_counter.counter;
     for node in cluster.nodes() {
-        let node_counter = Arc::clone(counter.get(&node.ip).unwrap());
+        let node_counter = request_counter.get(&node.ip);
         start_redirecting_proxy(node, to, node_counter).await;
     }
 }
 
-// Struct with a hashmap underneath for holding and monitoring the counters for multiple nodes.
-#[derive(Debug)]
-pub(crate) struct RequestCounter {
-    counter: HashMap<String, Arc<NodeCounter>>,
-}
-
-impl RequestCounter {
-    pub(crate) fn new() -> Self {
-        Self {
-            counter: HashMap::new(),
-        }
-    }
-
-    pub(crate) fn from_cluster(cluster: &Cluster) -> Self {
-        let counter = cluster
-            .nodes()
-            .iter()
-            .map(|node| (node.ip.clone(), Arc::new(NodeCounter::new())))
-            .collect();
-        Self { counter }
-    }
-
-    pub(crate) fn get(&self, ip: &str) -> Arc<NodeCounter> {
-        Arc::clone(self.counter.get(ip).unwrap())
-    }
-
-    pub(crate) fn add(&mut self, ip: String) {
-        self.counter.insert(ip, Arc::new(NodeCounter::new()));
-    }
-
-    pub(crate) fn reset(&self) {
-        for c in self.counter.values() {
-            c.reset();
-        }
-    }
-
-    pub(crate) fn total_posts(&self) -> usize {
-        self.counter
-            .values()
-            .map(|c| c.posts.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    pub(crate) fn get_posts_to_ips(&self, ips: &[&str]) -> usize {
-        ips.iter()
-            .map(|ip| self.counter.get(*ip).unwrap().posts.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    pub(crate) fn get_posts_to_other_ips(&self, ips: &[&str]) -> usize {
-        self.counter
-            .iter()
-            .filter(|(ip, _)| !ips.contains(&ip.as_str()))
-            .map(|(_, c)| c.posts.load(Ordering::Relaxed))
-            .sum()
-    }
-
-    pub(crate) fn total_describe_tables(&self) -> usize {
-        self.counter
-            .values()
-            .map(|c| c.describe_tables.load(Ordering::Relaxed))
-            .sum()
-    }
-}
-
-// Make calls without caring about the result, used to count where calls are directed.
-async fn make_n_calls(client: &AlternatorClient, n: usize) {
-    for _ in 0..n {
-        let _ = client.list_tables().send().await;
-    }
-}
-
-pub(crate) async fn create_table(client: &AlternatorClient, table_name: &str) {
+async fn create_table(client: &AlternatorClient, table_name: &str) {
     client
         .create_table()
         .table_name(table_name)
@@ -309,7 +66,7 @@ pub(crate) async fn create_table(client: &AlternatorClient, table_name: &str) {
         .unwrap();
 }
 
-pub(crate) async fn put_item(client: &AlternatorClient, table_name: &str, item: &str) {
+async fn put_item(client: &AlternatorClient, table_name: &str, item: &str) {
     let _ = client
         .put_item()
         .table_name(table_name)
@@ -321,7 +78,7 @@ pub(crate) async fn put_item(client: &AlternatorClient, table_name: &str, item: 
         .await;
 }
 
-pub(crate) async fn delete_item(client: &AlternatorClient, table_name: &str, item: &str) {
+async fn delete_item(client: &AlternatorClient, table_name: &str, item: &str) {
     let _ = client
         .delete_item()
         .table_name(table_name)
@@ -333,12 +90,7 @@ pub(crate) async fn delete_item(client: &AlternatorClient, table_name: &str, ite
         .await;
 }
 
-pub(crate) async fn update_item(
-    client: &AlternatorClient,
-    table_name: &str,
-    item: &str,
-    new: &str,
-) {
+async fn update_item(client: &AlternatorClient, table_name: &str, item: &str, new: &str) {
     let _ = client
         .update_item()
         .table_name(table_name)
@@ -355,55 +107,13 @@ pub(crate) async fn update_item(
         .await;
 }
 
-// Create a basic client with scope.
-fn create_client_with_scope(cluster: &Cluster, scope: RoutingScope) -> AlternatorClient {
-    AlternatorClient::from_conf(
-        AlternatorConfig::builder()
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
-            .region(aws_sdk_dynamodb::config::Region::new("eu-central-1"))
-            .behavior_version_latest()
-            .endpoint_url(default_endpoint_url(cluster))
-            .routing_scope(scope)
-            .build(),
-    )
-}
-
-// Poll until the client's live nodes match the given IPs, or timeout.
-async fn wait_until_live_nodes_match(client: &AlternatorClient, ips: Vec<&str>) {
-    let live_nodes = client.config().live_nodes().unwrap().clone();
-    tokio::time::timeout(POLLING_TIMEOUT, async {
-        loop {
-            let nodes = live_nodes.get_live_nodes();
-            let node_ips: Vec<&str> = nodes.iter().map(|url| url.host_str().unwrap()).collect();
-            if node_ips.len() == ips.len() && node_ips.iter().all(|ip| ips.contains(ip)) {
-                break;
-            }
-            tokio::time::sleep(POLLING_INTERVAL).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "failed to update nodes\nexpected nodes {:?}, timed out after {:?}",
-            ips, POLLING_TIMEOUT
-        )
-    });
-}
-
 fn create_client_with_scope_and_affinity(
     cluster: &Cluster,
     scope: RoutingScope,
     affinity_config: KeyRouteAffinityConfig,
 ) -> AlternatorClient {
     AlternatorClient::from_conf(
-        AlternatorConfig::builder()
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
-            .region(aws_sdk_dynamodb::config::Region::new("eu-central-1"))
-            .behavior_version_latest()
+        minimal_builder()
             .endpoint_url(default_endpoint_url(cluster))
             .routing_scope(scope)
             .key_route_affinity(affinity_config)
@@ -414,10 +124,392 @@ fn create_client_with_scope_and_affinity(
 fn expected_first_node<'a>(nodes: &'a [&str], partition_key_value: &str) -> &'a str {
     let pk = AttributeValue::S(partition_key_value.to_string());
     let hash = hasher::hash_attribute_value(&pk).unwrap();
+    let mut nodes = nodes.to_vec();
+    nodes.sort_unstable();
 
     let mut rng = GoRand::new(hash as i64);
     let idx = rng.intn(nodes.len() as i32) as usize;
     nodes[idx]
+}
+
+fn find_two_keys_on_one_node_and_one_on_another(
+    nodes: &[&str],
+    key_prefix: &str,
+) -> (String, String, String, String) {
+    let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+
+    for i in 0..1000 {
+        let key = format!("{key_prefix}_{i}");
+        let node = expected_first_node(nodes, &key).to_string();
+        buckets.entry(node).or_default().push(key);
+    }
+
+    let (majority_node, majority_keys) = buckets
+        .iter()
+        .find(|(_, keys)| keys.len() >= 2)
+        .expect("test key space should contain two keys for one node");
+    let other_key = buckets
+        .iter()
+        .find(|(node, keys)| *node != majority_node && !keys.is_empty())
+        .map(|(_, keys)| keys[0].clone())
+        .expect("test key space should contain another node");
+
+    (
+        majority_keys[0].clone(),
+        majority_keys[1].clone(),
+        other_key,
+        majority_node.clone(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedRouting {
+    Affinity,
+    RoundRobin,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MatrixOperation {
+    PutPlain,
+    PutConditional,
+    DeletePlain,
+    DeleteConditional,
+    UpdateLegacyPut,
+    UpdateLegacyAdd,
+    UpdateLegacyDeleteWithValue,
+    UpdateExpression,
+    UpdateLegacyPutReturnUpdatedNew,
+    UpdateLegacyPutReturnAllNew,
+    BatchWritePut,
+    BatchWriteDelete,
+    GetItem,
+    BatchGetItem,
+    Query,
+    Scan,
+    ListTables,
+}
+
+impl MatrixOperation {
+    const ALL: [Self; 17] = [
+        MatrixOperation::PutPlain,
+        MatrixOperation::PutConditional,
+        MatrixOperation::DeletePlain,
+        MatrixOperation::DeleteConditional,
+        MatrixOperation::UpdateLegacyPut,
+        MatrixOperation::UpdateLegacyAdd,
+        MatrixOperation::UpdateLegacyDeleteWithValue,
+        MatrixOperation::UpdateExpression,
+        MatrixOperation::UpdateLegacyPutReturnUpdatedNew,
+        MatrixOperation::UpdateLegacyPutReturnAllNew,
+        MatrixOperation::BatchWritePut,
+        MatrixOperation::BatchWriteDelete,
+        MatrixOperation::GetItem,
+        MatrixOperation::BatchGetItem,
+        MatrixOperation::Query,
+        MatrixOperation::Scan,
+        MatrixOperation::ListTables,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            MatrixOperation::PutPlain => "put_plain",
+            MatrixOperation::PutConditional => "put_conditional",
+            MatrixOperation::DeletePlain => "delete_plain",
+            MatrixOperation::DeleteConditional => "delete_conditional",
+            MatrixOperation::UpdateLegacyPut => "update_legacy_put",
+            MatrixOperation::UpdateLegacyAdd => "update_legacy_add",
+            MatrixOperation::UpdateLegacyDeleteWithValue => "update_legacy_delete_with_value",
+            MatrixOperation::UpdateExpression => "update_expression",
+            MatrixOperation::UpdateLegacyPutReturnUpdatedNew => {
+                "update_legacy_put_return_updated_new"
+            }
+            MatrixOperation::UpdateLegacyPutReturnAllNew => "update_legacy_put_return_all_new",
+            MatrixOperation::BatchWritePut => "batch_write_put",
+            MatrixOperation::BatchWriteDelete => "batch_write_delete",
+            MatrixOperation::GetItem => "get_item",
+            MatrixOperation::BatchGetItem => "batch_get_item",
+            MatrixOperation::Query => "query",
+            MatrixOperation::Scan => "scan",
+            MatrixOperation::ListTables => "list_tables",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OperationMatrixCase {
+    mode: KeyRouteAffinityType,
+    operation: MatrixOperation,
+    expected_routing: ExpectedRouting,
+}
+
+fn mode_name(mode: KeyRouteAffinityType) -> &'static str {
+    match mode {
+        KeyRouteAffinityType::None => "none",
+        KeyRouteAffinityType::Rmw => "rmw",
+        KeyRouteAffinityType::AnyWrite => "any_write",
+    }
+}
+
+fn s(value: impl Into<String>) -> AttributeValue {
+    AttributeValue::S(value.into())
+}
+
+fn key_map(key: &str) -> HashMap<String, AttributeValue> {
+    HashMap::from([("id".to_string(), s(key))])
+}
+
+async fn send_matrix_operation(
+    client: &AlternatorClient,
+    table_name: &str,
+    operation: MatrixOperation,
+    key: &str,
+    iteration: usize,
+) {
+    match operation {
+        MatrixOperation::PutPlain => {
+            let _ = client
+                .put_item()
+                .table_name(table_name)
+                .item("id", s(key))
+                .item("val", s(format!("value_{iteration}")))
+                .send()
+                .await;
+        }
+        MatrixOperation::PutConditional => {
+            let _ = client
+                .put_item()
+                .table_name(table_name)
+                .item("id", s(key))
+                .item("val", s(format!("value_{iteration}")))
+                .condition_expression("attribute_not_exists(missing_attr)")
+                .send()
+                .await;
+        }
+        MatrixOperation::DeletePlain => {
+            let _ = client
+                .delete_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .send()
+                .await;
+        }
+        MatrixOperation::DeleteConditional => {
+            let _ = client
+                .delete_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .condition_expression("attribute_not_exists(missing_attr)")
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyPut => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "val",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Put)
+                        .value(s(format!("value_{iteration}")))
+                        .build(),
+                )
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyAdd => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "counter",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Add)
+                        .value(AttributeValue::N("1".to_string()))
+                        .build(),
+                )
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyDeleteWithValue => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "tags",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Delete)
+                        .value(AttributeValue::Ss(vec!["tag".to_string()]))
+                        .build(),
+                )
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateExpression => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .update_expression("SET val = :v")
+                .expression_attribute_values(":v", s(format!("value_{iteration}")))
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyPutReturnUpdatedNew => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "val",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Put)
+                        .value(s(format!("value_{iteration}")))
+                        .build(),
+                )
+                .return_values(ReturnValue::UpdatedNew)
+                .send()
+                .await;
+        }
+        MatrixOperation::UpdateLegacyPutReturnAllNew => {
+            let _ = client
+                .update_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .attribute_updates(
+                    "val",
+                    AttributeValueUpdate::builder()
+                        .action(AttributeAction::Put)
+                        .value(s(format!("value_{iteration}")))
+                        .build(),
+                )
+                .return_values(ReturnValue::AllNew)
+                .send()
+                .await;
+        }
+        MatrixOperation::BatchWritePut => {
+            let put = PutRequest::builder()
+                .item("id", s(key))
+                .item("val", s(format!("value_{iteration}")))
+                .build()
+                .unwrap();
+            let write = WriteRequest::builder().put_request(put).build();
+
+            let _ = client
+                .batch_write_item()
+                .request_items(table_name, vec![write])
+                .send()
+                .await;
+        }
+        MatrixOperation::BatchWriteDelete => {
+            let delete = DeleteRequest::builder().key("id", s(key)).build().unwrap();
+            let write = WriteRequest::builder().delete_request(delete).build();
+
+            let _ = client
+                .batch_write_item()
+                .request_items(table_name, vec![write])
+                .send()
+                .await;
+        }
+        MatrixOperation::GetItem => {
+            let _ = client
+                .get_item()
+                .table_name(table_name)
+                .key("id", s(key))
+                .consistent_read(true)
+                .send()
+                .await;
+        }
+        MatrixOperation::BatchGetItem => {
+            let keys = KeysAndAttributes::builder()
+                .keys(key_map(key))
+                .consistent_read(true)
+                .build()
+                .unwrap();
+
+            let _ = client
+                .batch_get_item()
+                .request_items(table_name, keys)
+                .send()
+                .await;
+        }
+        MatrixOperation::Query => {
+            let _ = client
+                .query()
+                .table_name(table_name)
+                .key_condition_expression("id = :id")
+                .expression_attribute_values(":id", s(key))
+                .select(Select::Count)
+                .send()
+                .await;
+        }
+        MatrixOperation::Scan => {
+            let _ = client
+                .scan()
+                .table_name(table_name)
+                .select(Select::Count)
+                .send()
+                .await;
+        }
+        MatrixOperation::ListTables => {
+            let _ = client.list_tables().send().await;
+        }
+    }
+}
+
+fn assert_affinity_counts(
+    request_counter: &RequestCounter,
+    node_ips: &[&str],
+    expected_ip: &str,
+    expected_requests: usize,
+    case_label: &str,
+) {
+    assert_eq!(
+        request_counter.total_posts(),
+        expected_requests,
+        "{case_label}: unexpected total POST count"
+    );
+
+    for ip in node_ips {
+        let expected = if *ip == expected_ip {
+            expected_requests
+        } else {
+            0
+        };
+        assert_eq!(
+            request_counter.get(ip).posts(),
+            expected,
+            "{case_label}: unexpected POST count for {ip}"
+        );
+    }
+}
+
+fn assert_round_robin_counts(
+    request_counter: &RequestCounter,
+    node_ips: &[&str],
+    case_label: &str,
+) {
+    assert_eq!(
+        request_counter.total_posts(),
+        node_ips.len(),
+        "{case_label}: unexpected total POST count"
+    );
+
+    for ip in node_ips {
+        assert_eq!(
+            request_counter.get(ip).posts(),
+            1,
+            "{case_label}: round-robin request did not visit {ip} exactly once"
+        );
+    }
+
+    assert_eq!(
+        request_counter.get_posts_to_other_ips(node_ips),
+        0,
+        "{case_label}: request escaped the selected routing scope"
+    );
 }
 
 #[tokio::test]
@@ -803,6 +895,346 @@ async fn describe_table_not_called_with_config() {
     }
 
     assert_eq!(request_counter.total_describe_tables(), 0);
+}
+
+/// Matrix test for which DynamoDB operations use key-route affinity in each mode.
+#[tokio::test]
+#[cfg_attr(not(ccm_tests), ignore)]
+async fn key_route_affinity_operation_matrix_test() {
+    let mut guard = get_cluster().await;
+    let cluster = &mut *guard;
+
+    let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
+    let request_counter = RequestCounter::from_cluster(cluster);
+    start_proxies(cluster, PROXY_PORT, &request_counter).await;
+
+    let table_name = format!("test_table_{}", uuid::Uuid::new_v4());
+    {
+        // Drop the setup client before creating the three matrix clients: the
+        // test proxy accepts up to three concurrent client connections.
+        let setup_client = create_client_with_scope(cluster, scope.clone());
+        wait_until_live_nodes_match(
+            &setup_client,
+            scope_utils::working_nodes_ips_in_scope(cluster, &scope),
+        )
+        .await;
+        create_table(&setup_client, &table_name).await;
+    }
+
+    let none_client = create_client_with_scope_and_affinity(
+        cluster,
+        scope.clone(),
+        KeyRouteAffinityConfig::builder()
+            .with_type(KeyRouteAffinityType::None)
+            .with_pk_info(&table_name, "id")
+            .build(),
+    );
+    let rmw_client = create_client_with_scope_and_affinity(
+        cluster,
+        scope.clone(),
+        KeyRouteAffinityConfig::builder()
+            .with_type(KeyRouteAffinityType::Rmw)
+            .with_pk_info(&table_name, "id")
+            .build(),
+    );
+    let any_write_client = create_client_with_scope_and_affinity(
+        cluster,
+        scope.clone(),
+        KeyRouteAffinityConfig::builder()
+            .with_type(KeyRouteAffinityType::AnyWrite)
+            .with_pk_info(&table_name, "id")
+            .build(),
+    );
+    let node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
+
+    wait_until_live_nodes_match(&none_client, node_ips.clone()).await;
+    wait_until_live_nodes_match(&rmw_client, node_ips.clone()).await;
+    wait_until_live_nodes_match(&any_write_client, node_ips.clone()).await;
+
+    let mut cases = vec![
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::PutPlain,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::PutConditional,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::DeletePlain,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::DeleteConditional,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyPut,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyAdd,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyDeleteWithValue,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateExpression,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyPutReturnUpdatedNew,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::UpdateLegacyPutReturnAllNew,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::BatchWritePut,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::BatchWriteDelete,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::GetItem,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::BatchGetItem,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::Query,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::Scan,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::Rmw,
+            operation: MatrixOperation::ListTables,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::PutPlain,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::DeletePlain,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateLegacyPut,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateLegacyAdd,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateLegacyDeleteWithValue,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateLegacyPutReturnUpdatedNew,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::UpdateExpression,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::BatchWritePut,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::BatchWriteDelete,
+            expected_routing: ExpectedRouting::Affinity,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::GetItem,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::BatchGetItem,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::Query,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::Scan,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+        OperationMatrixCase {
+            mode: KeyRouteAffinityType::AnyWrite,
+            operation: MatrixOperation::ListTables,
+            expected_routing: ExpectedRouting::RoundRobin,
+        },
+    ];
+
+    cases.extend(
+        MatrixOperation::ALL
+            .into_iter()
+            .map(|operation| OperationMatrixCase {
+                mode: KeyRouteAffinityType::None,
+                operation,
+                expected_routing: ExpectedRouting::RoundRobin,
+            }),
+    );
+
+    request_counter.reset();
+
+    for case in cases {
+        let client = match case.mode {
+            KeyRouteAffinityType::None => &none_client,
+            KeyRouteAffinityType::Rmw => &rmw_client,
+            KeyRouteAffinityType::AnyWrite => &any_write_client,
+        };
+        let case_label = format!("{}_{}", mode_name(case.mode), case.operation.name());
+        let key = format!("matrix_key_{case_label}");
+
+        request_counter.reset();
+
+        for iteration in 0..node_ips.len() {
+            send_matrix_operation(client, &table_name, case.operation, &key, iteration).await;
+        }
+
+        match case.expected_routing {
+            ExpectedRouting::Affinity => {
+                let expected_ip = expected_first_node(node_ips.as_slice(), &key);
+                assert_affinity_counts(
+                    &request_counter,
+                    node_ips.as_slice(),
+                    expected_ip,
+                    node_ips.len(),
+                    &case_label,
+                );
+            }
+            ExpectedRouting::RoundRobin => {
+                assert_round_robin_counts(&request_counter, node_ips.as_slice(), &case_label);
+            }
+        }
+    }
+}
+
+/// Test that multi-table BatchWriteItem affinity is deterministic for repeated
+/// requests constructed the same way, including when table entries are inserted
+/// in different orders.
+#[tokio::test]
+#[cfg_attr(not(ccm_tests), ignore)]
+async fn batch_write_affinity_multitable_routing_is_deterministic_test() {
+    let mut guard = get_cluster().await;
+    let cluster = &mut *guard;
+
+    let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
+    let request_counter = RequestCounter::from_cluster(cluster);
+
+    start_proxies(cluster, PROXY_PORT, &request_counter).await;
+
+    let test_id = uuid::Uuid::new_v4();
+    let a_table_name = format!("a_batch_test_{test_id}");
+    let z_table_name = format!("z_batch_test_{test_id}");
+    let client = create_client_with_scope_and_affinity(
+        cluster,
+        scope.clone(),
+        KeyRouteAffinityConfig::builder()
+            .with_type(KeyRouteAffinityType::AnyWrite)
+            .with_pk_info(&a_table_name, "id")
+            .with_pk_info(&z_table_name, "id")
+            .build(),
+    );
+    let node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
+
+    wait_until_live_nodes_match(&client, node_ips.clone()).await;
+    create_table(&client, &a_table_name).await;
+    create_table(&client, &z_table_name).await;
+
+    let (a_key_1, a_key_2, z_key, expected_ip) =
+        find_two_keys_on_one_node_and_one_on_another(node_ips.as_slice(), "batch_multi_key");
+
+    for z_table_first in [true, false] {
+        request_counter.reset();
+
+        for iteration in 0..node_ips.len() {
+            let a_put_1 = PutRequest::builder()
+                .item("id", s(&a_key_1))
+                .item("val", s(format!("a_value_1_{z_table_first}_{iteration}")))
+                .build()
+                .unwrap();
+            let a_put_2 = PutRequest::builder()
+                .item("id", s(&a_key_2))
+                .item("val", s(format!("a_value_2_{z_table_first}_{iteration}")))
+                .build()
+                .unwrap();
+            let z_put = PutRequest::builder()
+                .item("id", s(&z_key))
+                .item("val", s(format!("z_value_{z_table_first}_{iteration}")))
+                .build()
+                .unwrap();
+            let a_write_1 = WriteRequest::builder().put_request(a_put_1).build();
+            let a_write_2 = WriteRequest::builder().put_request(a_put_2).build();
+            let z_write = WriteRequest::builder().put_request(z_put).build();
+
+            let builder = client.batch_write_item();
+            let builder = if z_table_first {
+                builder
+                    .request_items(z_table_name.as_str(), vec![z_write])
+                    .request_items(a_table_name.as_str(), vec![a_write_1, a_write_2])
+            } else {
+                builder
+                    .request_items(a_table_name.as_str(), vec![a_write_2, a_write_1])
+                    .request_items(z_table_name.as_str(), vec![z_write])
+            };
+
+            builder.send().await.unwrap();
+        }
+
+        let case_label = format!("batch_write_multitable_z_first_{z_table_first}");
+        assert_affinity_counts(
+            &request_counter,
+            node_ips.as_slice(),
+            &expected_ip,
+            node_ips.len(),
+            &case_label,
+        );
+    }
 }
 
 /// Test if the routing is deterministic, and all calls go to the same node.
