@@ -119,7 +119,7 @@ impl LiveNodes {
         let port = config.port();
         let seed_nodes = config.seed_hosts().unwrap_or_default();
 
-        let seed_urls = seed_nodes
+        let mut seed_urls = seed_nodes
             .iter()
             .filter_map(|addr| {
                 let mut url = Url::parse(&format!("{}://{}", alternator_scheme, addr)).ok()?;
@@ -127,6 +127,7 @@ impl LiveNodes {
                 Some(Arc::new(url))
             })
             .collect::<Vec<_>>();
+        seed_urls.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
         if seed_urls.is_empty() {
             return None;
         }

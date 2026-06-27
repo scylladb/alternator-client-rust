@@ -417,10 +417,42 @@ fn create_client_with_scope_and_affinity(
 fn expected_first_node<'a>(nodes: &'a [&str], partition_key_value: &str) -> &'a str {
     let pk = AttributeValue::S(partition_key_value.to_string());
     let hash = hasher::hash_attribute_value(&pk).unwrap();
+    let mut nodes = nodes.to_vec();
+    nodes.sort_unstable();
 
     let mut rng = GoRand::new(hash as i64);
     let idx = rng.intn(nodes.len() as i32) as usize;
     nodes[idx]
+}
+
+fn find_two_keys_on_one_node_and_one_on_another(
+    nodes: &[&str],
+    key_prefix: &str,
+) -> (String, String, String, String) {
+    let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
+
+    for i in 0..1000 {
+        let key = format!("{key_prefix}_{i}");
+        let node = expected_first_node(nodes, &key).to_string();
+        buckets.entry(node).or_default().push(key);
+    }
+
+    let (majority_node, majority_keys) = buckets
+        .iter()
+        .find(|(_, keys)| keys.len() >= 2)
+        .expect("test key space should contain two keys for one node");
+    let other_key = buckets
+        .iter()
+        .find(|(node, keys)| *node != majority_node && !keys.is_empty())
+        .map(|(_, keys)| keys[0].clone())
+        .expect("test key space should contain another node");
+
+    (
+        majority_keys[0].clone(),
+        majority_keys[1].clone(),
+        other_key,
+        majority_node.clone(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1447,35 +1479,40 @@ async fn batch_write_affinity_multitable_routing_is_deterministic_test() {
     create_table(&client, &a_table_name).await;
     create_table(&client, &z_table_name).await;
 
-    let a_key = "batch_a_key";
-    let z_key = "batch_z_key";
-    let expected_ip = expected_first_node(node_ips.as_slice(), a_key);
+    let (a_key_1, a_key_2, z_key, expected_ip) =
+        find_two_keys_on_one_node_and_one_on_another(node_ips.as_slice(), "batch_multi_key");
 
     for z_table_first in [true, false] {
         request_counter.reset();
 
         for iteration in 0..node_ips.len() {
-            let a_put = PutRequest::builder()
-                .item("id", s(a_key))
-                .item("val", s(format!("a_value_{z_table_first}_{iteration}")))
+            let a_put_1 = PutRequest::builder()
+                .item("id", s(&a_key_1))
+                .item("val", s(format!("a_value_1_{z_table_first}_{iteration}")))
+                .build()
+                .unwrap();
+            let a_put_2 = PutRequest::builder()
+                .item("id", s(&a_key_2))
+                .item("val", s(format!("a_value_2_{z_table_first}_{iteration}")))
                 .build()
                 .unwrap();
             let z_put = PutRequest::builder()
-                .item("id", s(z_key))
+                .item("id", s(&z_key))
                 .item("val", s(format!("z_value_{z_table_first}_{iteration}")))
                 .build()
                 .unwrap();
-            let a_write = WriteRequest::builder().put_request(a_put).build();
+            let a_write_1 = WriteRequest::builder().put_request(a_put_1).build();
+            let a_write_2 = WriteRequest::builder().put_request(a_put_2).build();
             let z_write = WriteRequest::builder().put_request(z_put).build();
 
             let builder = client.batch_write_item();
             let builder = if z_table_first {
                 builder
                     .request_items(z_table_name.as_str(), vec![z_write])
-                    .request_items(a_table_name.as_str(), vec![a_write])
+                    .request_items(a_table_name.as_str(), vec![a_write_1, a_write_2])
             } else {
                 builder
-                    .request_items(a_table_name.as_str(), vec![a_write])
+                    .request_items(a_table_name.as_str(), vec![a_write_2, a_write_1])
                     .request_items(z_table_name.as_str(), vec![z_write])
             };
 
@@ -1486,7 +1523,7 @@ async fn batch_write_affinity_multitable_routing_is_deterministic_test() {
         assert_affinity_counts(
             &request_counter,
             node_ips.as_slice(),
-            expected_ip,
+            &expected_ip,
             node_ips.len(),
             &case_label,
         );

@@ -22,8 +22,9 @@ pub enum KeyRouteAffinityType {
     Rmw,
     /// Route write operations (`PutItem`, `UpdateItem`, `DeleteItem`, and
     /// `BatchWriteItem`) to the same coordinator per partition key,
-    /// regardless of conditions. For `BatchWriteItem`, the first usable
-    /// partition key in the batch is used.
+    /// regardless of conditions. For `BatchWriteItem`, usable partition keys
+    /// vote for preferred coordinators. Voted coordinators are tried first by
+    /// descending vote count, with deterministic node-order tie breaking.
     AnyWrite,
 }
 
