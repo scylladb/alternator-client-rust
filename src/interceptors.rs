@@ -243,6 +243,23 @@ impl AffinityQueryPlanInterceptor {
         }
     }
 
+    fn candidate_partition_key_hash(
+        &self,
+        candidate: &classifier::PartitionKeyCandidate<'_>,
+    ) -> Option<u64> {
+        let pk_name = match self.resolver.get_partition_key(candidate.table_name) {
+            Some(cached_name) => cached_name,
+            None => {
+                // CACHE MISS: Trigger background discovery.
+                self.resolver.trigger_discovery(candidate.table_name);
+                return None;
+            }
+        };
+
+        let pk_value = candidate.attributes.get(pk_name.as_ref())?;
+        hasher::hash_attribute_value(pk_value)
+    }
+
     /// Tries to build an affinity-routed plan for `input`. Returns `None`
     /// when affinity doesn't apply or no usable partition key can be found. On
     /// cache miss this also triggers background PK discovery as a side effect.
@@ -262,19 +279,7 @@ impl AffinityQueryPlanInterceptor {
 
         if !is_batch_write {
             for candidate in candidates {
-                let pk_name = match self.resolver.get_partition_key(candidate.table_name) {
-                    Some(cached_name) => cached_name,
-                    None => {
-                        // CACHE MISS: Trigger background discovery.
-                        self.resolver.trigger_discovery(candidate.table_name);
-                        continue;
-                    }
-                };
-
-                let Some(pk_value) = candidate.attributes.get(pk_name.as_ref()) else {
-                    continue;
-                };
-                let Some(hash) = hasher::hash_attribute_value(pk_value) else {
+                let Some(hash) = self.candidate_partition_key_hash(&candidate) else {
                     continue;
                 };
 
@@ -288,19 +293,7 @@ impl AffinityQueryPlanInterceptor {
         let mut votes: HashMap<Arc<Url>, usize> = HashMap::new();
 
         for candidate in candidates {
-            let pk_name = match self.resolver.get_partition_key(candidate.table_name) {
-                Some(cached_name) => cached_name,
-                None => {
-                    // CACHE MISS: Trigger background discovery.
-                    self.resolver.trigger_discovery(candidate.table_name);
-                    continue;
-                }
-            };
-
-            let Some(pk_value) = candidate.attributes.get(pk_name.as_ref()) else {
-                continue;
-            };
-            let Some(hash) = hasher::hash_attribute_value(pk_value) else {
+            let Some(hash) = self.candidate_partition_key_hash(&candidate) else {
                 continue;
             };
 
