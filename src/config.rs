@@ -14,6 +14,7 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) response_compression: Option<ResponseCompression>,
     pub(crate) optimize_headers: Option<bool>,
     pub(crate) has_credentials_provider: bool,
+    pub(crate) disable_implicit_no_auth: bool,
     pub(crate) active_interval: Option<std::time::Duration>,
     pub(crate) idle_interval: Option<std::time::Duration>,
     pub(crate) routing_scope: Option<RoutingScope>,
@@ -22,6 +23,39 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) seed_hosts: Option<Vec<String>>,
     pub(crate) live_nodes: Option<std::sync::Arc<LiveNodes>>,
     pub(crate) key_route_affinity: Option<keyrouting::affinity_config::KeyRouteAffinityConfig>,
+}
+
+const UNSUPPORTED_AUTH_API_MESSAGE: &str = "Alternator supports only SigV4 with static credentials or no-auth. Use credentials_provider(...), per-request config_override(...credentials_provider(...)), auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID]) for strict signed requests, or allow_no_auth(). Custom AWS SDK auth schemes and resolvers are not supported.";
+
+fn unsupported_auth_api(api: &str) -> ! {
+    panic!("{api} is not supported by alternator-driver: {UNSUPPORTED_AUTH_API_MESSAGE}");
+}
+
+fn is_supported_auth_scheme(
+    scheme_id: &aws_smithy_runtime_api::client::auth::AuthSchemeId,
+) -> bool {
+    scheme_id == &aws_runtime::auth::sigv4::SCHEME_ID
+        || scheme_id == &aws_smithy_runtime::client::auth::no_auth::NO_AUTH_SCHEME_ID
+}
+
+fn normalize_auth_scheme_preference(
+    preference: aws_smithy_runtime_api::client::auth::AuthSchemePreference,
+) -> (
+    Vec<aws_smithy_runtime_api::client::auth::AuthSchemeId>,
+    bool,
+) {
+    let preference: Vec<_> = preference.into_iter().collect();
+    if let Some(scheme_id) = preference.iter().find(|id| !is_supported_auth_scheme(id)) {
+        panic!(
+            "unsupported auth scheme preference {:?}: {UNSUPPORTED_AUTH_API_MESSAGE}",
+            scheme_id.inner()
+        );
+    }
+    let disable_implicit_no_auth = !preference.is_empty()
+        && !preference
+            .iter()
+            .any(|id| id == &aws_smithy_runtime::client::auth::no_auth::NO_AUTH_SCHEME_ID);
+    (preference, disable_implicit_no_auth)
 }
 
 /// [AlternatorClient]'s config
@@ -101,6 +135,10 @@ impl AlternatorConfig {
 
     pub(crate) fn has_credentials_provider(&self) -> bool {
         self.alternator_ext.has_credentials_provider
+    }
+
+    pub(crate) fn disable_implicit_no_auth(&self) -> bool {
+        self.alternator_ext.disable_implicit_no_auth
     }
 
     /// Gets the active interval for refreshing the list of known nodes when the client is active.
@@ -575,10 +613,16 @@ impl AlternatorBuilder {
 impl From<&aws_types::sdk_config::SdkConfig> for AlternatorBuilder {
     fn from(sdk_config: &aws_types::sdk_config::SdkConfig) -> Self {
         let has_credentials_provider = sdk_config.credentials_provider().is_some();
+        let disable_implicit_no_auth = sdk_config
+            .auth_scheme_preference()
+            .cloned()
+            .map(|preference| normalize_auth_scheme_preference(preference).1)
+            .unwrap_or(false);
         AlternatorBuilder {
             dynamodb_builder: aws_sdk_dynamodb::config::Builder::from(sdk_config),
             alternator_ext: AlternatorExtensions {
                 has_credentials_provider,
+                disable_implicit_no_auth,
                 ..Default::default()
             },
         }
@@ -723,30 +767,24 @@ impl AlternatorBuilder {
     }
 
     pub fn push_auth_scheme(
-        mut self,
-        auth_scheme: impl aws_smithy_runtime_api::client::auth::AuthScheme + 'static,
+        self,
+        _auth_scheme: impl aws_smithy_runtime_api::client::auth::AuthScheme + 'static,
     ) -> Self {
-        self.dynamodb_builder = self.dynamodb_builder.push_auth_scheme(auth_scheme);
-        self
+        unsupported_auth_api("push_auth_scheme")
     }
 
     pub fn auth_scheme_resolver(
-        mut self,
-        auth_scheme_resolver: impl aws_sdk_dynamodb::config::auth::ResolveAuthScheme + 'static,
+        self,
+        _auth_scheme_resolver: impl aws_sdk_dynamodb::config::auth::ResolveAuthScheme + 'static,
     ) -> Self {
-        self.dynamodb_builder = self
-            .dynamodb_builder
-            .auth_scheme_resolver(auth_scheme_resolver);
-        self
+        unsupported_auth_api("auth_scheme_resolver")
     }
 
     pub fn set_auth_scheme_resolver(
         &mut self,
-        auth_scheme_resolver: impl aws_sdk_dynamodb::config::auth::ResolveAuthScheme + 'static,
+        _auth_scheme_resolver: impl aws_sdk_dynamodb::config::auth::ResolveAuthScheme + 'static,
     ) -> &mut Self {
-        self.dynamodb_builder
-            .set_auth_scheme_resolver(auth_scheme_resolver);
-        self
+        unsupported_auth_api("set_auth_scheme_resolver")
     }
 
     pub fn allow_no_auth(mut self) -> Self {
@@ -763,6 +801,9 @@ impl AlternatorBuilder {
         mut self,
         preference: impl Into<aws_smithy_runtime_api::client::auth::AuthSchemePreference>,
     ) -> Self {
+        let (preference, disable_implicit_no_auth) =
+            normalize_auth_scheme_preference(preference.into());
+        self.alternator_ext.disable_implicit_no_auth = disable_implicit_no_auth;
         self.dynamodb_builder = self.dynamodb_builder.auth_scheme_preference(preference);
         self
     }
@@ -771,6 +812,15 @@ impl AlternatorBuilder {
         &mut self,
         preference: Option<aws_smithy_runtime_api::client::auth::AuthSchemePreference>,
     ) -> &mut Self {
+        let preference = preference.map(|preference| {
+            let (preference, disable_implicit_no_auth) =
+                normalize_auth_scheme_preference(preference);
+            self.alternator_ext.disable_implicit_no_auth = disable_implicit_no_auth;
+            preference.into()
+        });
+        if preference.is_none() {
+            self.alternator_ext.disable_implicit_no_auth = false;
+        }
         self.dynamodb_builder.set_auth_scheme_preference(preference);
         self
     }
@@ -1164,6 +1214,67 @@ mod test {
         let config = AlternatorConfig::from(&sdk_config);
 
         assert!(!config.has_credentials_provider());
+    }
+
+    #[test]
+    fn shared_sdk_config_auth_scheme_preference_is_remembered() {
+        let sdk_config = aws_types::SdkConfig::builder()
+            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
+            .build();
+
+        let config = AlternatorConfig::from(&sdk_config);
+
+        assert!(config.disable_implicit_no_auth());
+    }
+
+    #[test]
+    fn sigv4_auth_scheme_preference_disables_implicit_no_auth() {
+        let config = AlternatorConfig::builder()
+            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
+            .behavior_version_latest()
+            .build();
+
+        assert!(config.disable_implicit_no_auth());
+    }
+
+    #[test]
+    fn no_auth_scheme_preference_keeps_implicit_no_auth_enabled() {
+        let config = AlternatorConfig::builder()
+            .auth_scheme_preference([aws_smithy_runtime::client::auth::no_auth::NO_AUTH_SCHEME_ID])
+            .behavior_version_latest()
+            .build();
+
+        assert!(!config.disable_implicit_no_auth());
+    }
+
+    #[test]
+    fn clearing_auth_scheme_preference_restores_implicit_no_auth() {
+        let mut builder = AlternatorConfig::builder()
+            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID]);
+
+        builder.set_auth_scheme_preference(None);
+        let config = builder.behavior_version_latest().build();
+
+        assert!(!config.disable_implicit_no_auth());
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported auth scheme preference")]
+    fn unsupported_auth_scheme_preference_panics() {
+        let _ = AlternatorConfig::builder()
+            .auth_scheme_preference([aws_smithy_runtime_api::client::auth::AuthSchemeId::new(
+                "sigv4a",
+            )])
+            .behavior_version_latest()
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "Alternator supports only SigV4 with static credentials or no-auth")]
+    fn unsupported_auth_scheme_resolver_panics() {
+        let _ = AlternatorConfig::builder().auth_scheme_resolver(
+            aws_sdk_dynamodb::config::auth::DefaultAuthSchemeResolver::default(),
+        );
     }
 
     #[test]
