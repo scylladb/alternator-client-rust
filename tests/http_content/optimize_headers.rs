@@ -280,7 +280,7 @@ pub async fn test_per_request_credentials_preserve_signed_headers(
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(true)
-            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
+            .require_auth()
             .build(),
     );
 
@@ -308,7 +308,7 @@ pub async fn test_missing_per_request_credentials_fails_before_no_auth_fallback(
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(true)
-            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
+            .require_auth()
             .build(),
     );
 

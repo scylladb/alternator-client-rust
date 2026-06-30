@@ -77,7 +77,7 @@ async fn main() {
 }
 ```
 
-When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK. Alternator supports only SigV4 with static credentials or no-auth; custom AWS SDK auth schemes and auth scheme resolvers are rejected. Use `auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
+When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK. Alternator supports only SigV4 with static credentials or no-auth; custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are rejected. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
 
 ## Load balancing
 
