@@ -34,6 +34,11 @@
 //! - If the queue is exhausted without a successful response, it is populated with
 //!   the seed nodes, and the process repeats. If the seeds are exhausted without success, the refresh ends with no changes.
 //!
+//! For cluster-wide scope, the refresh queries `/localnodes` from configured
+//! seed nodes and already-known live nodes, then unions the responses. To cover
+//! all datacenters, the initial configuration must include at least one working
+//! seed host from every datacenter that should receive traffic.
+//!
 //! Once it successfully gets a non-empty response, it atomically updates the [`live_nodes`] list using [`ArcSwap`].
 //!
 //!  # Lifetime
@@ -162,6 +167,67 @@ impl LiveNodes {
         Ok(url)
     }
 
+    async fn fetch_live_nodes_for_scope(
+        &self,
+        scope: &RoutingScope,
+        node_addr: &Url,
+    ) -> Option<Vec<Arc<Url>>> {
+        let url = scope.build_localnodes_url(node_addr.clone());
+        let mut nodes = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .ok()?
+            .json::<Vec<String>>()
+            .await
+            .ok()?;
+
+        nodes.sort();
+        Some(
+            nodes
+                .into_iter()
+                .filter_map(|addr| self.host_to_uri(&addr).ok().map(Arc::new))
+                .collect(),
+        )
+    }
+
+    fn cluster_discovery_candidates(&self) -> Vec<Arc<Url>> {
+        let mut candidates = self.live_nodes.load().as_ref().clone();
+        candidates.extend(self.seed_urls.iter().cloned());
+        candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        candidates.dedup_by(|a, b| a.as_str() == b.as_str());
+        candidates.shuffle(&mut rand::rng());
+        candidates
+    }
+
+    async fn discover_cluster_live_nodes(&self) -> Option<Vec<Arc<Url>>> {
+        let scope = RoutingScope::from_cluster();
+        let mut new_nodes = Vec::new();
+        let mut got_response = false;
+
+        for node_addr in self.cluster_discovery_candidates() {
+            if node_is_in_list(&node_addr, &new_nodes) {
+                continue;
+            }
+
+            if let Some(mut nodes) = self.fetch_live_nodes_for_scope(&scope, &node_addr).await {
+                got_response = true;
+                new_nodes.append(&mut nodes);
+                new_nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                new_nodes.dedup_by(|a, b| a.as_str() == b.as_str());
+            }
+        }
+
+        if !got_response {
+            return None;
+        }
+
+        new_nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        new_nodes.dedup_by(|a, b| a.as_str() == b.as_str());
+        Some(new_nodes)
+    }
+
     /// Ensures the background discovery task is running.
     ///
     /// Idempotent and safe to call from any context: returns immediately if
@@ -274,33 +340,36 @@ impl LiveNodes {
         let mut using_seeds = false;
 
         while let Some(node_addr) = candidates.pop_front() {
-            let url = scope.build_localnodes_url((*node_addr).clone());
-            let result = async {
-                self.client
-                    .get(url)
-                    .send()
-                    .await
-                    .ok()?
-                    .json::<Vec<String>>()
-                    .await
-                    .ok()
+            if scope.is_cluster() {
+                let Some(new_nodes) = self.discover_cluster_live_nodes().await else {
+                    return;
+                };
+
+                if new_nodes.is_empty() {
+                    let Some(fallback) = scope.fallback() else {
+                        return;
+                    };
+                    scope = fallback;
+                    candidates.push_back(node_addr);
+                    continue;
+                }
+
+                if **self.live_nodes.load() != new_nodes {
+                    self.live_nodes.store(Arc::new(new_nodes));
+                }
+                return;
             }
-            .await;
+
+            let result = self.fetch_live_nodes_for_scope(scope, &node_addr).await;
 
             // Request failed: try the next candidate, or fall back to seeds.
-            let Some(mut nodes) = result else {
+            let Some(new_nodes) = result else {
                 if candidates.is_empty() && !using_seeds {
                     using_seeds = true;
                     candidates = self.seed_urls.clone().into();
                 }
                 continue;
             };
-
-            nodes.sort();
-            let new_nodes: Vec<Arc<Url>> = nodes
-                .into_iter()
-                .filter_map(|addr| self.host_to_uri(&addr).ok().map(Arc::new))
-                .collect();
 
             // Empty result: retry under a fallback scope if one exists.
             if new_nodes.is_empty() {
@@ -318,6 +387,13 @@ impl LiveNodes {
             return;
         }
     }
+}
+
+fn node_is_in_list(node: &Url, nodes: &[Arc<Url>]) -> bool {
+    nodes.iter().any(|known| {
+        known.host_str() == node.host_str()
+            && known.port_or_known_default() == node.port_or_known_default()
+    })
 }
 
 impl Drop for LiveNodes {

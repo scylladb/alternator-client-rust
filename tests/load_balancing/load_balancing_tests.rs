@@ -107,6 +107,36 @@ async fn update_item(client: &AlternatorClient, table_name: &str, item: &str, ne
         .await;
 }
 
+fn create_client_with_scope_and_seed_hosts(
+    cluster: &Cluster,
+    scope: RoutingScope,
+    seed_hosts: Vec<String>,
+) -> AlternatorClient {
+    AlternatorClient::from_conf(
+        minimal_builder()
+            .scheme("http")
+            .port(cluster.nodes()[0].alternator_port)
+            .seed_hosts(seed_hosts)
+            .routing_scope(scope)
+            .build(),
+    )
+}
+
+fn first_working_seed_per_datacenter(cluster: &Cluster) -> Vec<String> {
+    cluster
+        .datacenters()
+        .iter()
+        .filter_map(|datacenter| {
+            datacenter
+                .racks()
+                .iter()
+                .flat_map(|rack| rack.nodes().iter())
+                .find(|node| node.is_up)
+                .map(|node| node.ip.clone())
+        })
+        .collect()
+}
+
 fn create_client_with_scope_and_affinity(
     cluster: &Cluster,
     scope: RoutingScope,
@@ -573,6 +603,31 @@ async fn calls_correct_rack_scope_test() {
             .get_posts_to_other_ips(scope_utils::ips_in_scope(cluster, &scope).as_slice()),
         0
     );
+}
+
+#[tokio::test]
+#[cfg_attr(not(ccm_tests), ignore)]
+async fn calls_correct_cluster_scope_test() {
+    let mut guard = get_cluster().await;
+    let cluster = &mut *guard;
+
+    let request_counter = RequestCounter::from_cluster(cluster);
+    start_proxies(cluster, PROXY_PORT, &request_counter).await;
+
+    let scope = RoutingScope::from_cluster();
+    let client = create_client_with_scope_and_seed_hosts(
+        cluster,
+        scope.clone(),
+        first_working_seed_per_datacenter(cluster),
+    );
+    let live_node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
+
+    wait_until_live_nodes_match(&client, live_node_ips.clone()).await;
+
+    request_counter.reset();
+    make_n_calls(&client, live_node_ips.len()).await;
+
+    assert_round_robin_counts(&request_counter, &live_node_ips, "cluster scope");
 }
 
 #[tokio::test]
