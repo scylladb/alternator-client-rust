@@ -16,7 +16,7 @@ jobs:
     steps:
     - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
     - name: Static analysis
-      run: make static
+      run: make lint
 
   tests:
     runs-on: ubuntu-latest
@@ -25,7 +25,5 @@ jobs:
     - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
     - name: Install scylla-ccm
       run: pip3 install https://github.com/scylladb/scylla-ccm/archive/master.zip
-    - name: CCM tests
-      run: make ccm-tests
     - name: Tests
-      run: make test
+      run: make test-all
