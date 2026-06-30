@@ -11,9 +11,12 @@ pub struct RoutingScope {
 }
 
 impl RoutingScope {
-    /// Note that the cluster scope does not actually mean that client will use the whole cluster, but rather that it
-    /// won't specify any datacenter or rack. This means that load balancing will happen across nodes in the datacenter of
-    /// the node that it queried for local nodes, so one of the seed hosts or the nodes that it knew at the moment of fallback.
+    /// Routes across the whole cluster.
+    ///
+    /// The client queries `/localnodes` on configured seed hosts and
+    /// already-known live nodes, then unions the returned node lists.
+    /// Provide at least one working seed host from every datacenter that should
+    /// receive traffic.
     pub fn from_cluster() -> Self {
         Self {
             dc: None,
@@ -80,6 +83,10 @@ impl RoutingScope {
             }
         }
         base_url
+    }
+
+    pub(crate) fn is_cluster(&self) -> bool {
+        self.dc.is_none() && self.rack.is_none()
     }
 
     pub fn fallback(&self) -> Option<&RoutingScope> {
