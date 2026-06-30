@@ -50,6 +50,9 @@ pub struct Proxy<'a> {
 }
 
 impl<'a> Proxy<'a> {
+    // This file is compiled separately into multiple integration-test crates.
+    // Some crates only use the plain entrypoint, others only the TLS one.
+    #[allow(dead_code)]
     pub async fn start<F, Fut>(
         listen_address: String,
         connect_address: String,
@@ -64,7 +67,99 @@ impl<'a> Proxy<'a> {
             + 'static,
         Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
     {
+        Self::start_with_accept(
+            listen_address,
+            connect_address,
+            on_request,
+            on_client_connect,
+            on_client_disconnect,
+            |stream| async move { TokioIo::new(stream) },
+        )
+        .await
+    }
+
+    pub async fn run(self) {
+        self.task.await;
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.listen_address
+    }
+
+    async fn bind_listener(address: String) -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind(address).await.unwrap();
+        let listen_address = listener.local_addr().unwrap();
+        (listener, listen_address)
+    }
+
+    async fn connect_server(
+        address: String,
+    ) -> (
+        Arc<Mutex<SendRequest<Full<Bytes>>>>,
+        Pin<Box<Fuse<impl Future<Output = Result<(), hyper::Error>>>>>,
+    ) {
+        let stream = TcpStream::connect(address).await.unwrap();
+        let stream = TokioIo::new(stream);
+        let client = hyper_client::Builder::new();
+        let (sender, connection) = client.handshake::<_, Full<Bytes>>(stream).await.unwrap();
+        let sender = Arc::new(Mutex::new(sender));
+
+        (sender, Box::pin(connection.fuse()))
+    }
+
+    /// Like [`start`], but wraps connections with TLS using the provided acceptor.
+    // This file is compiled separately into multiple integration-test crates.
+    // Some crates only use the TLS entrypoint, others only the plain one.
+    #[allow(dead_code)]
+    pub async fn start_tls<F, Fut>(
+        listen_address: String,
+        connect_address: String,
+        on_request: F,
+        on_client_connect: Option<Box<dyn Fn(SocketAddr) + Send + Sync>>,
+        on_client_disconnect: Option<Box<dyn Fn() + Send + Sync>>,
+        acceptor: tokio_rustls::TlsAcceptor,
+    ) -> Proxy<'a>
+    where
+        F: Fn(Request<Incoming>, Arc<Mutex<SendRequest<Full<Bytes>>>>) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+    {
+        Self::start_with_accept(
+            listen_address,
+            connect_address,
+            on_request,
+            on_client_connect,
+            on_client_disconnect,
+            move |stream| {
+                let acceptor = acceptor.clone();
+                async move { TokioIo::new(acceptor.accept(stream).await.unwrap()) }
+            },
+        )
+        .await
+    }
+
+    async fn start_with_accept<F, Fut, A, AFut, IO>(
+        listen_address: String,
+        connect_address: String,
+        on_request: F,
+        on_client_connect: Option<Box<dyn Fn(SocketAddr) + Send + Sync>>,
+        on_client_disconnect: Option<Box<dyn Fn() + Send + Sync>>,
+        accept_stream: A,
+    ) -> Proxy<'a>
+    where
+        F: Fn(Request<Incoming>, Arc<Mutex<SendRequest<Full<Bytes>>>>) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
+        A: Fn(TcpStream) -> AFut + Send + Sync + 'static,
+        AFut: Future<Output = IO> + Send + 'static,
+        IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    {
         let on_request = Arc::new(on_request);
+        let accept_stream = Arc::new(accept_stream);
         let on_client_connect: Option<Arc<dyn Fn(SocketAddr) + Send + Sync>> =
             on_client_connect.map(Arc::from);
         let on_client_disconnect: Option<Arc<dyn Fn() + Send + Sync>> =
@@ -101,7 +196,7 @@ impl<'a> Proxy<'a> {
                             }
                             accepted = listener.accept() => {
                                 let (stream, client_address) = accepted.unwrap();
-                                let stream = TokioIo::new(stream);
+                                let stream = accept_stream(stream).await;
 
                                 if let Some(on_client_connect) = &on_client_connect {
                                     on_client_connect(client_address);
@@ -142,35 +237,6 @@ impl<'a> Proxy<'a> {
             task: Box::pin(task),
             listen_address,
         }
-    }
-
-    pub async fn run(self) {
-        self.task.await;
-    }
-
-    pub fn address(&self) -> SocketAddr {
-        self.listen_address
-    }
-
-    async fn bind_listener(address: String) -> (TcpListener, SocketAddr) {
-        let listener = TcpListener::bind(address).await.unwrap();
-        let listen_address = listener.local_addr().unwrap();
-        (listener, listen_address)
-    }
-
-    async fn connect_server(
-        address: String,
-    ) -> (
-        Arc<Mutex<SendRequest<Full<Bytes>>>>,
-        Pin<Box<Fuse<impl Future<Output = Result<(), hyper::Error>>>>>,
-    ) {
-        let stream = TcpStream::connect(address).await.unwrap();
-        let stream = TokioIo::new(stream);
-        let client = hyper_client::Builder::new();
-        let (sender, connection) = client.handshake::<_, Full<Bytes>>(stream).await.unwrap();
-        let sender = Arc::new(Mutex::new(sender));
-
-        (sender, Box::pin(connection.fuse()))
     }
 }
 
