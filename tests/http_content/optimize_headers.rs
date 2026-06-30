@@ -4,24 +4,32 @@
 //! use from outgoing requests. A proxy is used to intercept messages exchanged
 //! between the driver and Alternator.
 //!
-//! There are six test cases:
+//! There are eight test cases:
 //! 1. Without credentials:
 //!    Disable credentials and verify that requests follow this whitelist:
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding"]
 //! 2. Without credentials, with injected auth headers:
 //!    Disable credentials, inject auth headers before header stripping, and
 //!    verify that requests still follow the no-auth whitelist.
-//! 3. With credentials:
+//! 3. With per-request credentials:
+//!    Disable global credentials, provide credentials through a single SDK
+//!    operation override, prefer SigV4 auth, and verify that SigV4 headers are
+//!    preserved.
+//! 4. Without per-request credentials:
+//!    Disable global credentials, prefer SigV4 auth, and verify that a missing
+//!    per-request credentials override fails locally instead of being sent
+//!    unsigned.
+//! 5. With credentials:
 //!    Enable credentials and verify that requests follow this whitelist:
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "authorization", "x-amz-date"]
-//! 4. Whitelist needed:
+//! 6. Whitelist needed:
 //!    Enable credentials, disable header stripping, and verify that
 //!    unnecessary headers are present, confirming that stripping is useful.
-//! 5. Enabled by per-request customization:
+//! 7. Enabled by per-request customization:
 //!    Disable header stripping in the client config, override it for one call,
 //!    and then make another non-customized call to verify that the override
 //!    does not persist.
-//! 6. Disabled by per-request customization:
+//! 8. Disabled by per-request customization:
 //!    Enable header stripping in the client config, override it for one call,
 //!    and then make another non-customized call to verify that the override
 //!    does not persist.
@@ -57,6 +65,10 @@ use aws_sdk_dynamodb::types::{
 };
 
 use alternator_driver::*;
+
+fn request_credentials() -> aws_sdk_dynamodb::config::Credentials {
+    aws_sdk_dynamodb::config::Credentials::new("access-key", "secret-key", None, None, "test")
+}
 
 #[derive(Debug)]
 struct InjectAuthHeadersInterceptor;
@@ -255,6 +267,57 @@ pub async fn test_without_credentials_drops_injected_auth_headers(
     // perform calls to alternator, use proxy to peek and forward requests
     // proxy ensures the injected auth headers are dropped according to the no-auth whitelist
     make_calls(&client, ctx).await;
+}
+
+#[test_context(HttpTestContext<WithCredentialsConfig>)]
+#[tokio::test]
+pub async fn test_per_request_credentials_preserve_signed_headers(
+    ctx: &mut HttpTestContext<WithCredentialsConfig>,
+) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .optimize_headers(true)
+            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
+            .build(),
+    );
+
+    client
+        .list_tables()
+        .customize()
+        .config_override(
+            aws_sdk_dynamodb::Config::builder()
+                .credentials_provider(request_credentials())
+                .region(aws_sdk_dynamodb::config::Region::new("eu-central-1")),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+#[test_context(HttpTestContext<PerRequestCustomizationConfig>)]
+#[tokio::test]
+pub async fn test_missing_per_request_credentials_fails_before_no_auth_fallback(
+    ctx: &mut HttpTestContext<PerRequestCustomizationConfig>,
+) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .optimize_headers(true)
+            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
+            .build(),
+    );
+
+    let result = client.list_tables().send().await;
+
+    assert!(
+        result.is_err(),
+        "missing per-request credentials should fail before sending an unsigned request"
+    );
 }
 
 struct WithCredentialsConfig;

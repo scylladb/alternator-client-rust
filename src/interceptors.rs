@@ -5,6 +5,7 @@ use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::interceptors::context::Input;
 use aws_smithy_runtime_api::client::interceptors::context::{
     BeforeSerializationInterceptorContextMut, BeforeTransmitInterceptorContextMut,
+    BeforeTransmitInterceptorContextRef,
 };
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
@@ -89,6 +90,22 @@ impl Intercept for AlternatorInterceptor {
         // optimize headers
         if optimize_headers {
             strip_headers(context.request_mut(), preserve_auth_headers);
+        }
+
+        Ok(())
+    }
+
+    fn read_after_signing(
+        &self,
+        context: &BeforeTransmitInterceptorContextRef<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let headers = context.request().headers();
+        if headers.contains_key("authorization") && headers.contains_key("x-amz-date") {
+            cfg.interceptor_state().store_put(PreserveAuthHeadersStore {
+                preserve_auth_headers: true,
+            });
         }
 
         Ok(())
