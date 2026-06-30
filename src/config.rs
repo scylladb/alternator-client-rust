@@ -14,7 +14,8 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) response_compression: Option<ResponseCompression>,
     pub(crate) optimize_headers: Option<bool>,
     pub(crate) has_credentials_provider: bool,
-    pub(crate) disable_implicit_no_auth: bool,
+    pub(crate) require_auth: bool,
+    pub(crate) allow_no_auth: bool,
     pub(crate) active_interval: Option<std::time::Duration>,
     pub(crate) idle_interval: Option<std::time::Duration>,
     pub(crate) routing_scope: Option<RoutingScope>,
@@ -25,37 +26,16 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) key_route_affinity: Option<keyrouting::affinity_config::KeyRouteAffinityConfig>,
 }
 
-const UNSUPPORTED_AUTH_API_MESSAGE: &str = "Alternator supports only SigV4 with static credentials or no-auth. Use credentials_provider(...), per-request config_override(...credentials_provider(...)), auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID]) for strict signed requests, or allow_no_auth(). Custom AWS SDK auth schemes and resolvers are not supported.";
+const UNSUPPORTED_AUTH_API_MESSAGE: &str = "Alternator supports only SigV4 with static credentials or no-auth. Use credentials_provider(...), per-request config_override(...credentials_provider(...)) with require_auth() for strict signed requests, or allow_no_auth() for unsigned requests. Custom AWS SDK auth schemes, auth scheme resolvers, and auth scheme preferences are not supported.";
+
+const INCOMPATIBLE_AUTH_OPTIONS_MESSAGE: &str = "require_auth() cannot be combined with allow_no_auth(): require_auth() makes missing credentials fail before sending an unsigned request, while allow_no_auth() explicitly permits unsigned requests.";
 
 fn unsupported_auth_api(api: &str) -> ! {
     panic!("{api} is not supported by alternator-driver: {UNSUPPORTED_AUTH_API_MESSAGE}");
 }
 
-fn is_supported_auth_scheme(
-    scheme_id: &aws_smithy_runtime_api::client::auth::AuthSchemeId,
-) -> bool {
-    scheme_id == &aws_runtime::auth::sigv4::SCHEME_ID
-        || scheme_id == &aws_smithy_runtime::client::auth::no_auth::NO_AUTH_SCHEME_ID
-}
-
-fn normalize_auth_scheme_preference(
-    preference: aws_smithy_runtime_api::client::auth::AuthSchemePreference,
-) -> (
-    Vec<aws_smithy_runtime_api::client::auth::AuthSchemeId>,
-    bool,
-) {
-    let preference: Vec<_> = preference.into_iter().collect();
-    if let Some(scheme_id) = preference.iter().find(|id| !is_supported_auth_scheme(id)) {
-        panic!(
-            "unsupported auth scheme preference {:?}: {UNSUPPORTED_AUTH_API_MESSAGE}",
-            scheme_id.inner()
-        );
-    }
-    let disable_implicit_no_auth = !preference.is_empty()
-        && !preference
-            .iter()
-            .any(|id| id == &aws_smithy_runtime::client::auth::no_auth::NO_AUTH_SCHEME_ID);
-    (preference, disable_implicit_no_auth)
+fn incompatible_auth_options() -> ! {
+    panic!("{INCOMPATIBLE_AUTH_OPTIONS_MESSAGE}");
 }
 
 /// [AlternatorClient]'s config
@@ -137,8 +117,16 @@ impl AlternatorConfig {
         self.alternator_ext.has_credentials_provider
     }
 
-    pub(crate) fn disable_implicit_no_auth(&self) -> bool {
-        self.alternator_ext.disable_implicit_no_auth
+    /// Returns whether this config requires every request to resolve credentials.
+    ///
+    /// When this is enabled, a client built from this config will not add the
+    /// driver's implicit no-auth fallback for missing default credentials.
+    pub fn requires_auth(&self) -> bool {
+        self.alternator_ext.require_auth
+    }
+
+    pub(crate) fn allows_no_auth(&self) -> bool {
+        self.alternator_ext.allow_no_auth
     }
 
     /// Gets the active interval for refreshing the list of known nodes when the client is active.
@@ -613,16 +601,13 @@ impl AlternatorBuilder {
 impl From<&aws_types::sdk_config::SdkConfig> for AlternatorBuilder {
     fn from(sdk_config: &aws_types::sdk_config::SdkConfig) -> Self {
         let has_credentials_provider = sdk_config.credentials_provider().is_some();
-        let disable_implicit_no_auth = sdk_config
-            .auth_scheme_preference()
-            .cloned()
-            .map(|preference| normalize_auth_scheme_preference(preference).1)
-            .unwrap_or(false);
+        if sdk_config.auth_scheme_preference().is_some() {
+            unsupported_auth_api("auth_scheme_preference");
+        }
         AlternatorBuilder {
             dynamodb_builder: aws_sdk_dynamodb::config::Builder::from(sdk_config),
             alternator_ext: AlternatorExtensions {
                 has_credentials_provider,
-                disable_implicit_no_auth,
                 ..Default::default()
             },
         }
@@ -658,12 +643,6 @@ impl AlternatorConfig {
         &self,
     ) -> Option<aws_smithy_runtime_api::client::auth::SharedAuthSchemeOptionResolver> {
         self.dynamodb_config.auth_scheme_resolver()
-    }
-
-    pub fn auth_scheme_preference(
-        &self,
-    ) -> Option<&aws_smithy_runtime_api::client::auth::AuthSchemePreference> {
-        self.dynamodb_config.auth_scheme_preference()
     }
 
     pub fn endpoint_resolver(
@@ -787,41 +766,58 @@ impl AlternatorBuilder {
         unsupported_auth_api("set_auth_scheme_resolver")
     }
 
+    /// Require every request made by a client built from this config to use credentials.
+    ///
+    /// By default, an Alternator client with no default credentials enables the AWS SDK's no-auth
+    /// mode automatically, because many Alternator deployments do not require signing. Use
+    /// `require_auth()` for clients that intentionally have no default credentials but must still
+    /// be signed by per-request credentials supplied with `customize().config_override(...)`.
+    ///
+    /// When this option is set and no credentials are available for an operation, the AWS SDK
+    /// fails auth resolution before the request is sent instead of falling back to an unsigned
+    /// request. This is a client construction option; it cannot remove no-auth from an already
+    /// constructed client as a per-operation override.
+    ///
+    /// Panics if combined with [`allow_no_auth`](Self::allow_no_auth), because that option
+    /// explicitly permits unsigned requests.
+    pub fn require_auth(mut self) -> Self {
+        self.set_require_auth(true);
+        self
+    }
+
+    /// Sets whether this config requires credentials for every request.
+    ///
+    /// See [`require_auth`](Self::require_auth) for the behavior and intended use case.
+    pub fn set_require_auth(&mut self, require_auth: bool) -> &mut Self {
+        if require_auth && self.alternator_ext.allow_no_auth {
+            incompatible_auth_options();
+        }
+        self.alternator_ext.require_auth = require_auth;
+        self
+    }
+
+    /// Explicitly permit unsigned requests.
+    ///
+    /// This mirrors the AWS SDK no-auth escape hatch. It cannot be combined with
+    /// [`require_auth`](Self::require_auth), which intentionally makes missing credentials fail.
     pub fn allow_no_auth(mut self) -> Self {
+        if self.alternator_ext.require_auth {
+            incompatible_auth_options();
+        }
+        self.alternator_ext.allow_no_auth = true;
         self.dynamodb_builder = self.dynamodb_builder.allow_no_auth();
         self
     }
 
+    /// Explicitly permit unsigned requests.
+    ///
+    /// See [`allow_no_auth`](Self::allow_no_auth).
     pub fn set_allow_no_auth(&mut self) -> &mut Self {
-        self.dynamodb_builder.set_allow_no_auth();
-        self
-    }
-
-    pub fn auth_scheme_preference(
-        mut self,
-        preference: impl Into<aws_smithy_runtime_api::client::auth::AuthSchemePreference>,
-    ) -> Self {
-        let (preference, disable_implicit_no_auth) =
-            normalize_auth_scheme_preference(preference.into());
-        self.alternator_ext.disable_implicit_no_auth = disable_implicit_no_auth;
-        self.dynamodb_builder = self.dynamodb_builder.auth_scheme_preference(preference);
-        self
-    }
-
-    pub fn set_auth_scheme_preference(
-        &mut self,
-        preference: Option<aws_smithy_runtime_api::client::auth::AuthSchemePreference>,
-    ) -> &mut Self {
-        let preference = preference.map(|preference| {
-            let (preference, disable_implicit_no_auth) =
-                normalize_auth_scheme_preference(preference);
-            self.alternator_ext.disable_implicit_no_auth = disable_implicit_no_auth;
-            preference.into()
-        });
-        if preference.is_none() {
-            self.alternator_ext.disable_implicit_no_auth = false;
+        if self.alternator_ext.require_auth {
+            incompatible_auth_options();
         }
-        self.dynamodb_builder.set_auth_scheme_preference(preference);
+        self.alternator_ext.allow_no_auth = true;
+        self.dynamodb_builder.set_allow_no_auth();
         self
     }
 
@@ -1217,56 +1213,55 @@ mod test {
     }
 
     #[test]
-    fn shared_sdk_config_auth_scheme_preference_is_remembered() {
+    #[should_panic(expected = "auth_scheme_preference is not supported by alternator-driver")]
+    fn shared_sdk_config_auth_scheme_preference_reports_unsupported_api() {
         let sdk_config = aws_types::SdkConfig::builder()
             .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
             .build();
 
-        let config = AlternatorConfig::from(&sdk_config);
-
-        assert!(config.disable_implicit_no_auth());
+        let _ = AlternatorConfig::from(&sdk_config);
     }
 
     #[test]
-    fn sigv4_auth_scheme_preference_disables_implicit_no_auth() {
+    fn require_auth_requires_credentials() {
         let config = AlternatorConfig::builder()
-            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
+            .require_auth()
             .behavior_version_latest()
             .build();
 
-        assert!(config.disable_implicit_no_auth());
+        assert!(config.requires_auth());
     }
 
     #[test]
-    fn no_auth_scheme_preference_keeps_implicit_no_auth_enabled() {
-        let config = AlternatorConfig::builder()
-            .auth_scheme_preference([aws_smithy_runtime::client::auth::no_auth::NO_AUTH_SCHEME_ID])
-            .behavior_version_latest()
-            .build();
+    fn set_require_auth_false_restores_implicit_no_auth() {
+        let mut builder = AlternatorConfig::builder().require_auth();
 
-        assert!(!config.disable_implicit_no_auth());
-    }
-
-    #[test]
-    fn clearing_auth_scheme_preference_restores_implicit_no_auth() {
-        let mut builder = AlternatorConfig::builder()
-            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID]);
-
-        builder.set_auth_scheme_preference(None);
+        builder.set_require_auth(false);
         let config = builder.behavior_version_latest().build();
 
-        assert!(!config.disable_implicit_no_auth());
+        assert!(!config.requires_auth());
     }
 
     #[test]
-    #[should_panic(expected = "unsupported auth scheme preference")]
-    fn unsupported_auth_scheme_preference_panics() {
-        let _ = AlternatorConfig::builder()
-            .auth_scheme_preference([aws_smithy_runtime_api::client::auth::AuthSchemeId::new(
-                "sigv4a",
-            )])
+    fn allow_no_auth_is_remembered() {
+        let config = AlternatorConfig::builder()
+            .allow_no_auth()
             .behavior_version_latest()
             .build();
+
+        assert!(config.allows_no_auth());
+    }
+
+    #[test]
+    #[should_panic(expected = "require_auth() cannot be combined with allow_no_auth()")]
+    fn require_auth_after_allow_no_auth_panics() {
+        let _ = AlternatorConfig::builder().allow_no_auth().require_auth();
+    }
+
+    #[test]
+    #[should_panic(expected = "require_auth() cannot be combined with allow_no_auth()")]
+    fn allow_no_auth_after_require_auth_panics() {
+        let _ = AlternatorConfig::builder().require_auth().allow_no_auth();
     }
 
     #[test]

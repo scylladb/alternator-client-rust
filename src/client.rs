@@ -41,7 +41,7 @@ impl AlternatorClient {
 
         let mut builder = dynamodb_config.to_builder();
 
-        if !has_credentials_provider && !config.disable_implicit_no_auth() {
+        if !has_credentials_provider && !config.requires_auth() && !config.allows_no_auth() {
             builder = builder.allow_no_auth();
         }
 

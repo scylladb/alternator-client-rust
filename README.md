@@ -48,7 +48,7 @@ tokio = { version = "1.18", features = ["macros", "rt-multi-thread", "sync", "ti
 ```
 > **Note**: This crate is not yet published to crates.io. Depend on it via the GitHub URL.
 
-Because the Alternator Client is designed with an interface identical to the AWS SDK for DynamoDB, developers can seamlessly swap out aws_sdk_dynamodb::Client in their projects, like so:
+Because the Alternator Client follows the AWS SDK for DynamoDB operation builder interface for Alternator-supported features, migration usually starts by replacing `aws_sdk_dynamodb::Client` and its config type, like so:
 
 ```rust
 use alternator_driver::*;              // <-- new import
@@ -65,7 +65,7 @@ async fn main() {
     // Build an AlternatorClient instead of an aws_sdk_dynamodb::Client.
     let client = AlternatorClient::from_conf(config); // <-- was aws_sdk_dynamodb::Client::from_conf
 
-    // From here on, the API is identical to the AWS SDK.
+    // From here on, use the AWS SDK operation builders for Alternator-supported operations.
     client
         .put_item()
         .table_name("ExampleTable")
@@ -77,7 +77,9 @@ async fn main() {
 }
 ```
 
-When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK. Alternator supports only SigV4 with static credentials or no-auth; custom AWS SDK auth schemes and auth scheme resolvers are rejected. Use `auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
+When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK. Alternator supports only SigV4 with static credentials or no-auth; custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are rejected. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
+
+This client targets ScyllaDB Alternator. It does not guarantee that Alternator-specific configuration, no-auth defaults, or request optimizations remain compatible with AWS DynamoDB itself.
 
 ## Load balancing
 
@@ -366,6 +368,6 @@ client
     .unwrap();
 ```
 
-`alternator_config_override` is a direct extension of `config_override`, it also allows the developer to override all DynamoDB settings.
+`alternator_config_override` applies Alternator-specific per-operation settings. Use the AWS SDK's `config_override` separately for supported SDK-level per-operation overrides.
 
 > **Note**: load-balancing and endpoint settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is for settings that apply to individual request processing — compression and header stripping.

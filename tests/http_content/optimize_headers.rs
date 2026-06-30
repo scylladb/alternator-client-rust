@@ -67,7 +67,7 @@ use aws_sdk_dynamodb::types::{
 use alternator_driver::*;
 
 fn request_credentials() -> aws_sdk_dynamodb::config::Credentials {
-    aws_sdk_dynamodb::config::Credentials::new("access-key", "secret-key", None, None, "test")
+    aws_sdk_dynamodb::config::Credentials::for_tests()
 }
 
 #[derive(Debug)]
@@ -96,9 +96,7 @@ async fn cleanup_calls(resources: Vec<String>, alternator_address: &str) {
             .endpoint_url(format!("http://{}", alternator_address))
             .region(aws_sdk_dynamodb::config::Region::new("eu-central-1"))
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .build(),
     );
 
@@ -280,7 +278,7 @@ pub async fn test_per_request_credentials_preserve_signed_headers(
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(true)
-            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
+            .require_auth()
             .build(),
     );
 
@@ -308,7 +306,7 @@ pub async fn test_missing_per_request_credentials_fails_before_no_auth_fallback(
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(true)
-            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
+            .require_auth()
             .build(),
     );
 
@@ -373,9 +371,7 @@ pub async fn test_with_credentials(ctx: &mut HttpTestContext<WithCredentialsConf
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(true)
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .build(),
     );
 
@@ -434,9 +430,7 @@ pub async fn test_whitelist_needed(ctx: &mut HttpTestContext<WhitelistNeededConf
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(false)
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .build(),
     );
 
@@ -544,9 +538,7 @@ pub async fn test_enabled_by_per_request_customization(
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .optimize_headers(false)
             .build(),
     );
@@ -572,9 +564,7 @@ pub async fn test_disabled_by_per_request_customization(
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .optimize_headers(true)
             .build(),
     );

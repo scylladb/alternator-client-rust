@@ -176,6 +176,7 @@ fn test_config() {
     // allow exceptions
     let mut with_exceptions = dynamodb_config_methods;
     with_exceptions.remove(&(None, "credentials_provider".into())); // credentials_provider is deprecated and always returns None
+    with_exceptions.remove(&(None, "auth_scheme_preference".into())); // use AlternatorBuilder::require_auth instead of AWS auth preference hints
 
     let unimplemented = with_exceptions.difference(&alternator_config_methods);
     let all_implemented = unimplemented.clone().next().is_none();
@@ -206,6 +207,8 @@ fn test_builder() {
 
     with_exceptions.remove(&(None, "set_idempotency_token_provider".into())); // not supported as IdempotencyTokenProvider is private
     with_exceptions.remove(&(None, "idempotency_token_provider".into()));
+    with_exceptions.remove(&(None, "auth_scheme_preference".into())); // use require_auth for strict signed requests
+    with_exceptions.remove(&(None, "set_auth_scheme_preference".into()));
 
     let unimplemented = with_exceptions.difference(&alternator_builder_methods);
     let all_implemented = unimplemented.clone().next().is_none();
