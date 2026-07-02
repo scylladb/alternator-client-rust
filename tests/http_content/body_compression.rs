@@ -200,7 +200,7 @@ pub async fn test_request_compression_zlib(ctx: &mut HttpTestContext<Config>) {
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
             .request_compression(RequestCompression::enabled(
-                CompressionAlgorithm::Zlib,
+                CompressionAlgorithm::Deflate,
                 CompressionLevel::default(),
                 0,
             ))

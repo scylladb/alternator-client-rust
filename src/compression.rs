@@ -9,7 +9,7 @@ pub use flate2::Compression as CompressionLevel;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionAlgorithm {
     Gzip,
-    Zlib,
+    Deflate,
 }
 
 /// Represents information on how to compress requests
@@ -227,7 +227,7 @@ pub(crate) fn compress_request(
         // compress body
         let (compressed, http_code) = match algorithm {
             CompressionAlgorithm::Gzip => (compress_gzip(body, level), "gzip"),
-            CompressionAlgorithm::Zlib => (compress_zlib(body, level), "deflate"),
+            CompressionAlgorithm::Deflate => (compress_zlib(body, level), "deflate"),
         };
 
         if let Some(compressed) = compressed {
@@ -299,7 +299,7 @@ mod tests {
 
         compress_request(
             &mut request,
-            CompressionAlgorithm::Zlib,
+            CompressionAlgorithm::Deflate,
             CompressionLevel::default(),
             0,
         );
@@ -563,7 +563,7 @@ mod tests {
         let mut request = example_request();
         compress_request(
             &mut request,
-            CompressionAlgorithm::Zlib,
+            CompressionAlgorithm::Deflate,
             CompressionLevel::default(),
             0,
         );

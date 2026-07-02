@@ -1079,7 +1079,7 @@ mod test {
     fn config_remembers_builder_and_vice_versa() {
         let config = AlternatorConfig::builder()
             .request_compression(RequestCompression::enabled(
-                CompressionAlgorithm::Zlib,
+                CompressionAlgorithm::Deflate,
                 CompressionLevel::default(),
                 0,
             ))
@@ -1093,7 +1093,7 @@ mod test {
                 .request_compression()
                 .expect("request compression is not set"),
             RequestCompression::enabled(
-                CompressionAlgorithm::Zlib,
+                CompressionAlgorithm::Deflate,
                 CompressionLevel::default(),
                 0
             )
@@ -1108,7 +1108,7 @@ mod test {
                 .request_compression()
                 .expect("request compression is not set"),
             RequestCompression::enabled(
-                CompressionAlgorithm::Zlib,
+                CompressionAlgorithm::Deflate,
                 CompressionLevel::default(),
                 0
             )
