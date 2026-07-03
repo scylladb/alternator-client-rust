@@ -4,7 +4,8 @@ use aws_smithy_runtime_api::box_error::BoxError;
 use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::interceptors::context::Input;
 use aws_smithy_runtime_api::client::interceptors::context::{
-    BeforeSerializationInterceptorContextMut, BeforeTransmitInterceptorContextMut,
+    BeforeDeserializationInterceptorContextMut, BeforeSerializationInterceptorContextMut,
+    BeforeTransmitInterceptorContextMut,
 };
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
@@ -28,12 +29,18 @@ use crate::keyrouting::resolver;
 #[derive(Debug)]
 pub(crate) struct AlternatorInterceptor {
     request_compression: RequestCompression,
+    response_compression: ResponseCompression,
     optimize_headers: bool,
 }
 impl AlternatorInterceptor {
-    pub fn new(request_compression: RequestCompression, optimize_headers: bool) -> Self {
+    pub fn new(
+        request_compression: RequestCompression,
+        response_compression: ResponseCompression,
+        optimize_headers: bool,
+    ) -> Self {
         Self {
             request_compression,
+            response_compression,
             optimize_headers,
         }
     }
@@ -59,6 +66,21 @@ impl Intercept for AlternatorInterceptor {
         // message must be compressed before signing, but it's more efficient to do it before retry loop
         if let Some((algorithm, level, threshold)) = request_compression.get() {
             compress_request(context.request_mut(), algorithm, level, threshold);
+        }
+
+        // Insert Accept-Encoding header if response compression is enabled
+        let response_compression = cfg
+            .interceptor_state()
+            .load::<ResponseCompressionStore>()
+            .map(|store| store.response_compression.clone())
+            .unwrap_or(self.response_compression.clone());
+
+        if let Some(algorithms) = response_compression.get() {
+            let value = accept_encoding_header_value(algorithms);
+            context
+                .request_mut()
+                .headers_mut()
+                .insert("accept-encoding", value);
         }
 
         Ok(())
@@ -112,6 +134,54 @@ impl Intercept for AlternatorInterceptor {
 
         Ok(())
     }
+
+    fn modify_before_deserialization(
+        &self,
+        context: &mut BeforeDeserializationInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let response = context.response_mut();
+
+        // Collect all Content-Encoding header values (may be repeated headers
+        // or comma-separated within a single header value).
+        let mut algorithms = Vec::new();
+        for header_value in response.headers().get_all("content-encoding") {
+            for token in header_value.split(',').map(|s| s.trim()) {
+                if token.is_empty() {
+                    continue;
+                }
+                match ResponseCompressionAlgorithm::from_content_encoding(token) {
+                    Some(algo) => algorithms.push(algo),
+                    None => {
+                        return Err(format!(
+                            "unsupported Content-Encoding: '{}'. Supported encodings are: gzip, deflate",
+                            token
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
+        if algorithms.is_empty() {
+            return Ok(());
+        }
+
+        // Take the body and wrap it with decompression
+        let body = std::mem::replace(
+            response.body_mut(),
+            aws_smithy_types::body::SdkBody::empty(),
+        );
+        let decompressed_body = crate::decompression::wrap_decompressed_body(body, algorithms)?;
+        *response.body_mut() = decompressed_body;
+
+        // Strip Content-Encoding and Content-Length headers
+        response.headers_mut().remove("content-encoding");
+        response.headers_mut().remove("content-length");
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +197,14 @@ pub(crate) struct OptimizeHeadersStore {
     optimize_headers: bool,
 }
 impl Storable for OptimizeHeadersStore {
+    type Storer = StoreReplace<Self>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResponseCompressionStore {
+    pub(crate) response_compression: ResponseCompression,
+}
+impl Storable for ResponseCompressionStore {
     type Storer = StoreReplace<Self>;
 }
 
@@ -169,6 +247,15 @@ impl AlternatorOverrideInterceptor<OptimizeHeadersStore> {
     pub(crate) fn for_optimize_headers(optimize_headers: bool) -> Self {
         AlternatorOverrideInterceptor {
             store: OptimizeHeadersStore { optimize_headers },
+        }
+    }
+}
+impl AlternatorOverrideInterceptor<ResponseCompressionStore> {
+    pub(crate) fn for_response_compression(response_compression: ResponseCompression) -> Self {
+        AlternatorOverrideInterceptor {
+            store: ResponseCompressionStore {
+                response_compression,
+            },
         }
     }
 }

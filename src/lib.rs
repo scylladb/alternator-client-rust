@@ -2,6 +2,7 @@ mod client;
 mod compression;
 mod config;
 mod customize;
+mod decompression;
 mod interceptors;
 pub mod keyrouting;
 mod live_nodes;

@@ -59,6 +59,12 @@ impl<T, E, B> AlternatorCustomizableOperation<T, E, B> for CustomizableOperation
             ));
         }
 
+        if let Some(response_compression) = config_override.alternator_ext.response_compression {
+            this = this.interceptor(AlternatorOverrideInterceptor::for_response_compression(
+                response_compression,
+            ));
+        }
+
         this
     }
 }
