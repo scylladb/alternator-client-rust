@@ -5,7 +5,7 @@ use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::interceptors::context::Input;
 use aws_smithy_runtime_api::client::interceptors::context::{
     BeforeDeserializationInterceptorContextMut, BeforeSerializationInterceptorContextMut,
-    BeforeTransmitInterceptorContextMut,
+    BeforeTransmitInterceptorContextMut, BeforeTransmitInterceptorContextRef,
 };
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
@@ -31,17 +31,20 @@ pub(crate) struct AlternatorInterceptor {
     request_compression: RequestCompression,
     response_compression: ResponseCompression,
     optimize_headers: bool,
+    preserve_auth_headers: bool,
 }
 impl AlternatorInterceptor {
     pub fn new(
         request_compression: RequestCompression,
         response_compression: ResponseCompression,
         optimize_headers: bool,
+        preserve_auth_headers: bool,
     ) -> Self {
         Self {
             request_compression,
             response_compression,
             optimize_headers,
+            preserve_auth_headers,
         }
     }
 }
@@ -98,10 +101,31 @@ impl Intercept for AlternatorInterceptor {
             .load::<OptimizeHeadersStore>()
             .map(|store| store.optimize_headers)
             .unwrap_or(self.optimize_headers);
+        let preserve_auth_headers = cfg
+            .interceptor_state()
+            .load::<PreserveAuthHeadersStore>()
+            .map(|store| store.preserve_auth_headers)
+            .unwrap_or(self.preserve_auth_headers);
 
         // optimize headers
         if optimize_headers {
-            strip_headers(context.request_mut());
+            strip_headers(context.request_mut(), preserve_auth_headers);
+        }
+
+        Ok(())
+    }
+
+    fn read_after_signing(
+        &self,
+        context: &BeforeTransmitInterceptorContextRef<'_>,
+        _: &RuntimeComponents,
+        cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let headers = context.request().headers();
+        if headers.contains_key("authorization") && headers.contains_key("x-amz-date") {
+            cfg.interceptor_state().store_put(PreserveAuthHeadersStore {
+                preserve_auth_headers: true,
+            });
         }
 
         Ok(())
@@ -208,6 +232,14 @@ impl Storable for ResponseCompressionStore {
     type Storer = StoreReplace<Self>;
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreserveAuthHeadersStore {
+    preserve_auth_headers: bool,
+}
+impl Storable for PreserveAuthHeadersStore {
+    type Storer = StoreReplace<Self>;
+}
+
 /// An interceptor used to override [AlternatorClient]'s config.
 ///
 /// Adds specified config overrides to [ConfigBag], so that [AlternatorInterceptor] can later look for it.
@@ -255,6 +287,15 @@ impl AlternatorOverrideInterceptor<ResponseCompressionStore> {
         AlternatorOverrideInterceptor {
             store: ResponseCompressionStore {
                 response_compression,
+            },
+        }
+    }
+}
+impl AlternatorOverrideInterceptor<PreserveAuthHeadersStore> {
+    pub(crate) fn for_preserve_auth_headers(preserve_auth_headers: bool) -> Self {
+        AlternatorOverrideInterceptor {
+            store: PreserveAuthHeadersStore {
+                preserve_auth_headers,
             },
         }
     }

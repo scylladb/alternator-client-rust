@@ -65,6 +65,12 @@ impl<T, E, B> AlternatorCustomizableOperation<T, E, B> for CustomizableOperation
             ));
         }
 
+        if config_override.alternator_ext.has_credentials_provider {
+            this = this.interceptor(AlternatorOverrideInterceptor::for_preserve_auth_headers(
+                true,
+            ));
+        }
+
         this
     }
 }

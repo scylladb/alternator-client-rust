@@ -4,21 +4,32 @@
 //! use from outgoing requests. A proxy is used to intercept messages exchanged
 //! between the driver and Alternator.
 //!
-//! There are five test cases:
+//! There are eight test cases:
 //! 1. Without credentials:
 //!    Disable credentials and verify that requests follow this whitelist:
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding"]
-//! 2. With credentials:
+//! 2. Without credentials, with injected auth headers:
+//!    Disable credentials, inject auth headers before header stripping, and
+//!    verify that requests still follow the no-auth whitelist.
+//! 3. With per-request credentials:
+//!    Disable global credentials, provide credentials through a single SDK
+//!    operation override, prefer SigV4 auth, and verify that SigV4 headers are
+//!    preserved.
+//! 4. Without per-request credentials:
+//!    Disable global credentials, prefer SigV4 auth, and verify that a missing
+//!    per-request credentials override fails locally instead of being sent
+//!    unsigned.
+//! 5. With credentials:
 //!    Enable credentials and verify that requests follow this whitelist:
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "authorization", "x-amz-date"]
-//! 3. Whitelist needed:
+//! 6. Whitelist needed:
 //!    Enable credentials, disable header stripping, and verify that
 //!    unnecessary headers are present, confirming that stripping is useful.
-//! 4. Enabled by per-request customization:
+//! 7. Enabled by per-request customization:
 //!    Disable header stripping in the client config, override it for one call,
 //!    and then make another non-customized call to verify that the override
 //!    does not persist.
-//! 5. Disabled by per-request customization:
+//! 8. Disabled by per-request customization:
 //!    Enable header stripping in the client config, override it for one call,
 //!    and then make another non-customized call to verify that the override
 //!    does not persist.
@@ -42,6 +53,11 @@ use test_context::test_context;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
+use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+use aws_smithy_types::config_bag::ConfigBag;
+
 use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType,
@@ -50,15 +66,37 @@ use aws_sdk_dynamodb::types::{
 
 use alternator_driver::*;
 
+fn request_credentials() -> aws_sdk_dynamodb::config::Credentials {
+    aws_sdk_dynamodb::config::Credentials::for_tests()
+}
+
+#[derive(Debug)]
+struct InjectAuthHeadersInterceptor;
+impl aws_sdk_dynamodb::config::Intercept for InjectAuthHeadersInterceptor {
+    fn name(&self) -> &'static str {
+        "InjectAuthHeadersInterceptor"
+    }
+
+    fn modify_before_transmit(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        _: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let headers = context.request_mut().headers_mut();
+        headers.insert("authorization", "AWS4-HMAC-SHA256 fake");
+        headers.insert("x-amz-date", "20260626T120000Z");
+        Ok(())
+    }
+}
+
 async fn cleanup_calls(resources: Vec<String>, alternator_address: &str) {
     let client = aws_sdk_dynamodb::Client::from_conf(
         aws_sdk_dynamodb::Config::builder()
             .endpoint_url(format!("http://{}", alternator_address))
             .region(aws_sdk_dynamodb::config::Region::new("eu-central-1"))
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .build(),
     );
 
@@ -177,6 +215,8 @@ impl HttpTestConfig for WithoutCredentialsConfig {
             rogue.unwrap(),
             whitelist
         );
+        assert!(!parts.headers.contains_key("authorization"));
+        assert!(!parts.headers.contains_key("x-amz-date"));
 
         // forward
         let (parts, body) = collect_received_response(parts, body, sender).await;
@@ -198,13 +238,84 @@ pub async fn test_without_credentials(ctx: &mut HttpTestContext<WithoutCredentia
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(true)
-            .allow_no_auth()
             .build(),
     );
 
     // perform calls to alternator, use proxy to peek and forward requests
     // proxy ensures all requests to have headers stripped according to the whitelist in WithoutCredentialsConfig
     make_calls(&client, ctx).await;
+}
+
+#[test_context(HttpTestContext<WithoutCredentialsConfig>)]
+#[tokio::test]
+pub async fn test_without_credentials_drops_injected_auth_headers(
+    ctx: &mut HttpTestContext<WithoutCredentialsConfig>,
+) {
+    // construct client with credentials disabled
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .optimize_headers(true)
+            .interceptor(InjectAuthHeadersInterceptor)
+            .build(),
+    );
+
+    // perform calls to alternator, use proxy to peek and forward requests
+    // proxy ensures the injected auth headers are dropped according to the no-auth whitelist
+    make_calls(&client, ctx).await;
+}
+
+#[test_context(HttpTestContext<WithCredentialsConfig>)]
+#[tokio::test]
+pub async fn test_per_request_credentials_preserve_signed_headers(
+    ctx: &mut HttpTestContext<WithCredentialsConfig>,
+) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .optimize_headers(true)
+            .require_auth()
+            .build(),
+    );
+
+    client
+        .list_tables()
+        .customize()
+        .config_override(
+            aws_sdk_dynamodb::Config::builder()
+                .credentials_provider(request_credentials())
+                .region(aws_sdk_dynamodb::config::Region::new("eu-central-1")),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+#[test_context(HttpTestContext<PerRequestCustomizationConfig>)]
+#[tokio::test]
+pub async fn test_missing_per_request_credentials_fails_before_no_auth_fallback(
+    ctx: &mut HttpTestContext<PerRequestCustomizationConfig>,
+) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .optimize_headers(true)
+            .require_auth()
+            .build(),
+    );
+
+    let result = client.list_tables().send().await;
+
+    assert!(
+        result.is_err(),
+        "missing per-request credentials should fail before sending an unsigned request"
+    );
 }
 
 struct WithCredentialsConfig;
@@ -237,6 +348,8 @@ impl HttpTestConfig for WithCredentialsConfig {
             rogue.unwrap(),
             whitelist
         );
+        assert!(parts.headers.contains_key("authorization"));
+        assert!(parts.headers.contains_key("x-amz-date"));
 
         // forward
         let (parts, body) = collect_received_response(parts, body, sender).await;
@@ -258,9 +371,7 @@ pub async fn test_with_credentials(ctx: &mut HttpTestContext<WithCredentialsConf
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(true)
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .build(),
     );
 
@@ -319,9 +430,7 @@ pub async fn test_whitelist_needed(ctx: &mut HttpTestContext<WhitelistNeededConf
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .optimize_headers(false)
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .build(),
     );
 
@@ -429,9 +538,7 @@ pub async fn test_enabled_by_per_request_customization(
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .optimize_headers(false)
             .build(),
     );
@@ -457,9 +564,7 @@ pub async fn test_disabled_by_per_request_customization(
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .optimize_headers(true)
             .build(),
     );

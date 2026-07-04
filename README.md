@@ -48,7 +48,7 @@ tokio = { version = "1.18", features = ["macros", "rt-multi-thread", "sync", "ti
 ```
 > **Note**: This crate is not yet published to crates.io. Depend on it via the GitHub URL.
 
-Because the Alternator Client is designed with an interface identical to the AWS SDK for DynamoDB, developers can seamlessly swap out aws_sdk_dynamodb::Client in their projects, like so:
+Because the Alternator Client follows the AWS SDK for DynamoDB operation builder interface for Alternator-supported features, migration usually starts by replacing `aws_sdk_dynamodb::Client` and its config type, like so:
 
 ```rust
 use alternator_driver::*;              // <-- new import
@@ -60,13 +60,12 @@ async fn main() {
     let config = AlternatorConfig::builder() // <-- was aws_sdk_dynamodb::Config::builder()
         .endpoint_url("http://localhost:8000")
         .behavior_version_latest()
-        .allow_no_auth()
         .build();
 
     // Build an AlternatorClient instead of an aws_sdk_dynamodb::Client.
     let client = AlternatorClient::from_conf(config); // <-- was aws_sdk_dynamodb::Client::from_conf
 
-    // From here on, the API is identical to the AWS SDK.
+    // From here on, use the AWS SDK operation builders for Alternator-supported operations.
     client
         .put_item()
         .table_name("ExampleTable")
@@ -77,6 +76,10 @@ async fn main() {
         .unwrap();
 }
 ```
+
+When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK. Alternator supports only SigV4 with static credentials or no-auth; custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are rejected. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
+
+This client targets ScyllaDB Alternator. It does not guarantee that Alternator-specific configuration, no-auth defaults, or request optimizations remain compatible with AWS DynamoDB itself.
 
 ## Load balancing
 
@@ -92,7 +95,6 @@ use alternator_driver::AlternatorConfig;
 let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
     .behavior_version_latest()
-    .allow_no_auth()
     .build();
 ```
 
@@ -112,7 +114,6 @@ let config = AlternatorConfig::builder()
         "10.0.0.3",
     ])
     .behavior_version_latest()
-    .allow_no_auth()
     .build();
 ```
 
@@ -157,7 +158,6 @@ let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
     .routing_scope(scope)
     .behavior_version_latest()
-    .allow_no_auth()
     .build();
 ```
 
@@ -241,7 +241,6 @@ let client = AlternatorClient::from_conf(
         .endpoint_url("http://10.0.0.1:8043")
         .key_route_affinity(KeyRouteAffinityType::Rmw)
         .behavior_version_latest()
-        .allow_no_auth()
         .build(),
 );
 ```
@@ -264,7 +263,6 @@ let client = AlternatorClient::from_conf(
         .endpoint_url("http://10.0.0.1:8043")
         .key_route_affinity(affinity)
         .behavior_version_latest()
-        .allow_no_auth()
         .build(),
 );
 ```
@@ -274,12 +272,14 @@ let client = AlternatorClient::from_conf(
 
 ## Header stripping
 
-By default, the AWS Rust SDK attaches a number of headers to every DynamoDB request — some are required (`Host`, `Authorization`, `X-Amz-Date`, etc.), others are SDK metadata that Alternator doesn't use (`User-Agent` flavors, internal telemetry, retry information). For a small client-side optimization, this crate strips non-essential headers before transmission, keeping only the ones Alternator actually needs:
+By default, the AWS Rust SDK attaches a number of headers to every DynamoDB request — some are required for signed requests (`Host`, `Authorization`, `X-Amz-Date`, etc.), others are SDK metadata that Alternator doesn't use (`User-Agent` flavors, internal telemetry, retry information). For a small client-side optimization, this crate strips non-essential headers before transmission, keeping only the ones Alternator actually needs:
 - `host`
 - `x-amz-target`
 - `content-length`
 - `accept-encoding`
 - `content-encoding`
+
+For signed requests, it also keeps:
 - `authorization`
 - `x-amz-date`
 
@@ -293,7 +293,6 @@ let client = AlternatorClient::from_conf(
         .endpoint_url("http://10.0.0.1:8043")
         .optimize_headers(false)
         .behavior_version_latest()
-        .allow_no_auth()
         .build(),
 );
 ```
@@ -315,7 +314,6 @@ let client = AlternatorClient::from_conf(
             1024, // body-size threshold in bytes
         ))
         .behavior_version_latest()
-        .allow_no_auth()
         .build(),
 );
 ```
@@ -370,6 +368,6 @@ client
     .unwrap();
 ```
 
-`alternator_config_override` is a direct extension of `config_override`, it also allows the developer to override all DynamoDB settings.
+`alternator_config_override` applies Alternator-specific per-operation settings. Use the AWS SDK's `config_override` separately for supported SDK-level per-operation overrides.
 
 > **Note**: load-balancing and endpoint settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is for settings that apply to individual request processing — compression and header stripping.
