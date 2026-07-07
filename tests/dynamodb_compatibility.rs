@@ -154,7 +154,10 @@ fn test_client() {
     let alternator_client_methods = collect_struct_methods(alternator_driver, "AlternatorClient");
     let dynamodb_client_methods = collect_struct_methods(dynamodb, "Client");
 
-    let unimplemented = dynamodb_client_methods.difference(&alternator_client_methods);
+    let mut with_exceptions = dynamodb_client_methods;
+    with_exceptions.remove(&(None, "new".into())); // use AlternatorClient::from_conf with explicit AlternatorConfig
+
+    let unimplemented = with_exceptions.difference(&alternator_client_methods);
     let all_implemented = unimplemented.clone().next().is_none();
     assert!(
         all_implemented,
@@ -175,8 +178,12 @@ fn test_config() {
 
     // allow exceptions
     let mut with_exceptions = dynamodb_config_methods;
+    with_exceptions.remove(&(None, "new".into())); // shared SdkConfig imports hide AWS settings that do not map to Alternator
     with_exceptions.remove(&(None, "credentials_provider".into())); // credentials_provider is deprecated and always returns None
     with_exceptions.remove(&(None, "auth_scheme_preference".into())); // use AlternatorBuilder::require_auth instead of AWS auth preference hints
+    with_exceptions.remove(&(None, "auth_schemes".into())); // custom AWS auth schemes are not supported by Alternator
+    with_exceptions.remove(&(None, "auth_scheme_resolver".into()));
+    with_exceptions.remove(&(None, "endpoint_resolver".into())); // custom endpoint resolution conflicts with client-side routing
 
     let unimplemented = with_exceptions.difference(&alternator_config_methods);
     let all_implemented = unimplemented.clone().next().is_none();
@@ -209,6 +216,17 @@ fn test_builder() {
     with_exceptions.remove(&(None, "idempotency_token_provider".into()));
     with_exceptions.remove(&(None, "auth_scheme_preference".into())); // use require_auth for strict signed requests
     with_exceptions.remove(&(None, "set_auth_scheme_preference".into()));
+    with_exceptions.remove(&(None, "push_auth_scheme".into())); // custom AWS auth schemes are not supported by Alternator
+    with_exceptions.remove(&(None, "auth_scheme_resolver".into()));
+    with_exceptions.remove(&(None, "set_auth_scheme_resolver".into()));
+    with_exceptions.remove(&(None, "endpoint_resolver".into())); // custom endpoint resolution conflicts with client-side routing
+    with_exceptions.remove(&(None, "set_endpoint_resolver".into()));
+    with_exceptions.remove(&(None, "account_id_endpoint_mode".into())); // AWS account/FIPS/dual-stack endpoint modes do not apply to Alternator
+    with_exceptions.remove(&(None, "set_account_id_endpoint_mode".into()));
+    with_exceptions.remove(&(None, "use_dual_stack".into()));
+    with_exceptions.remove(&(None, "set_use_dual_stack".into()));
+    with_exceptions.remove(&(None, "use_fips".into()));
+    with_exceptions.remove(&(None, "set_use_fips".into()));
 
     let unimplemented = with_exceptions.difference(&alternator_builder_methods);
     let all_implemented = unimplemented.clone().next().is_none();

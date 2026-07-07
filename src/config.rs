@@ -26,13 +26,7 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) key_route_affinity: Option<keyrouting::affinity_config::KeyRouteAffinityConfig>,
 }
 
-const UNSUPPORTED_AUTH_API_MESSAGE: &str = "Alternator supports only SigV4 with static credentials or no-auth. Use credentials_provider(...), per-request config_override(...credentials_provider(...)) with require_auth() for strict signed requests, or allow_no_auth() for unsigned requests. Custom AWS SDK auth schemes, auth scheme resolvers, and auth scheme preferences are not supported.";
-
 const INCOMPATIBLE_AUTH_OPTIONS_MESSAGE: &str = "require_auth() cannot be combined with allow_no_auth(): require_auth() makes missing credentials fail before sending an unsigned request, while allow_no_auth() explicitly permits unsigned requests.";
-
-fn unsupported_auth_api(api: &str) -> ! {
-    panic!("{api} is not supported by alternator-driver: {UNSUPPORTED_AUTH_API_MESSAGE}");
-}
 
 fn incompatible_auth_options() -> ! {
     panic!("{INCOMPATIBLE_AUTH_OPTIONS_MESSAGE}");
@@ -40,7 +34,15 @@ fn incompatible_auth_options() -> ! {
 
 /// [AlternatorClient]'s config
 ///
-/// A simple wrapper around [aws_sdk_dynamodb::Config], that also includes alternator-specific optimizations.
+/// Stores the AWS DynamoDB config used internally by the driver plus
+/// Alternator-specific routing, auth, and request/response settings.
+///
+/// Build this explicitly with [`AlternatorConfig::builder()`]. Shared
+/// `aws_types::SdkConfig` values are not imported wholesale because they can
+/// contain AWS auth and endpoint options that Alternator does not support.
+/// There is intentionally no `AlternatorConfig::new(&SdkConfig)` or
+/// `From<&SdkConfig>` conversion; copy only the supported SDK settings you need
+/// onto the builder.
 ///
 /// It is used to construct [AlternatorClient] like so:
 ///
@@ -53,6 +55,13 @@ fn incompatible_auth_options() -> ! {
 ///     .build();
 ///
 /// let client = AlternatorClient::from_conf(config);
+/// ```
+///
+/// Shared SDK config imports are intentionally unsupported:
+///
+/// ```compile_fail
+/// let sdk_config = aws_types::SdkConfig::builder().build();
+/// let _ = alternator_driver::AlternatorConfig::from(&sdk_config);
 /// ```
 #[derive(Clone, Debug)]
 pub struct AlternatorConfig {
@@ -73,10 +82,6 @@ impl AlternatorConfig {
             dynamodb_builder: self.dynamodb_config.to_builder(),
             alternator_ext: self.alternator_ext.clone(),
         }
-    }
-
-    pub fn new(config: &aws_types::sdk_config::SdkConfig) -> Self {
-        AlternatorBuilder::from(config).build()
     }
 
     /// Before sending each request, strip headers that Alternator does not use
@@ -302,7 +307,16 @@ impl AlternatorOperationBuilder {
 
 /// Builder for [AlternatorConfig]
 ///
-/// A simple wrapper around [aws_sdk_dynamodb::config::Builder], that also includes alternator-specific optimizations.
+/// Builder for the supported Alternator configuration surface.
+///
+/// This includes Alternator-specific options plus AWS SDK settings that remain
+/// meaningful for Alternator clients. AWS-specific auth schemes, auth scheme
+/// preferences, custom endpoint resolvers, FIPS endpoints, dual-stack
+/// endpoints, and account ID endpoint mode are intentionally not exposed.
+/// Use [`endpoint_url`](Self::endpoint_url) or the Alternator-specific
+/// [`scheme`](Self::scheme), [`port`](Self::port), and
+/// [`seed_hosts`](Self::seed_hosts) settings for discovery and client-side
+/// routing.
 ///
 /// It is used to construct [AlternatorClient] like so:
 ///
@@ -712,29 +726,7 @@ impl AlternatorBuilder {
     }
 }
 
-impl From<&aws_types::sdk_config::SdkConfig> for AlternatorBuilder {
-    fn from(sdk_config: &aws_types::sdk_config::SdkConfig) -> Self {
-        let has_credentials_provider = sdk_config.credentials_provider().is_some();
-        if sdk_config.auth_scheme_preference().is_some() {
-            unsupported_auth_api("auth_scheme_preference");
-        }
-        AlternatorBuilder {
-            dynamodb_builder: aws_sdk_dynamodb::config::Builder::from(sdk_config),
-            alternator_ext: AlternatorExtensions {
-                has_credentials_provider,
-                ..Default::default()
-            },
-        }
-    }
-}
-
-impl From<&aws_types::sdk_config::SdkConfig> for AlternatorConfig {
-    fn from(sdk_config: &aws_types::sdk_config::SdkConfig) -> Self {
-        AlternatorBuilder::from(sdk_config).build()
-    }
-}
-
-// All implementations below this point should only be simple wrappers around dynamodb methods
+// All implementations below this point are supported AWS SDK passthroughs.
 
 impl AlternatorConfig {
     pub fn stalled_stream_protection(
@@ -745,24 +737,6 @@ impl AlternatorConfig {
 
     pub fn http_client(&self) -> Option<aws_sdk_dynamodb::config::SharedHttpClient> {
         self.dynamodb_config.http_client()
-    }
-
-    pub fn auth_schemes(
-        &self,
-    ) -> impl Iterator<Item = aws_smithy_runtime_api::client::auth::SharedAuthScheme> {
-        self.dynamodb_config.auth_schemes()
-    }
-
-    pub fn auth_scheme_resolver(
-        &self,
-    ) -> Option<aws_smithy_runtime_api::client::auth::SharedAuthSchemeOptionResolver> {
-        self.dynamodb_config.auth_scheme_resolver()
-    }
-
-    pub fn endpoint_resolver(
-        &self,
-    ) -> aws_smithy_runtime_api::client::endpoint::SharedEndpointResolver {
-        self.dynamodb_config.endpoint_resolver()
     }
 
     pub fn retry_config(&self) -> Option<&aws_smithy_types::retry::RetryConfig> {
@@ -859,27 +833,6 @@ impl AlternatorBuilder {
         self
     }
 
-    pub fn push_auth_scheme(
-        self,
-        _auth_scheme: impl aws_smithy_runtime_api::client::auth::AuthScheme + 'static,
-    ) -> Self {
-        unsupported_auth_api("push_auth_scheme")
-    }
-
-    pub fn auth_scheme_resolver(
-        self,
-        _auth_scheme_resolver: impl aws_sdk_dynamodb::config::auth::ResolveAuthScheme + 'static,
-    ) -> Self {
-        unsupported_auth_api("auth_scheme_resolver")
-    }
-
-    pub fn set_auth_scheme_resolver(
-        &mut self,
-        _auth_scheme_resolver: impl aws_sdk_dynamodb::config::auth::ResolveAuthScheme + 'static,
-    ) -> &mut Self {
-        unsupported_auth_api("set_auth_scheme_resolver")
-    }
-
     /// Require every request made by a client built from this config to use credentials.
     ///
     /// By default, an Alternator client with no default credentials enables the AWS SDK's no-auth
@@ -932,23 +885,6 @@ impl AlternatorBuilder {
         }
         self.alternator_ext.allow_no_auth = true;
         self.dynamodb_builder.set_allow_no_auth();
-        self
-    }
-
-    pub fn endpoint_resolver(
-        mut self,
-        endpoint_resolver: impl aws_sdk_dynamodb::config::endpoint::ResolveEndpoint + 'static,
-    ) -> Self {
-        self.dynamodb_builder = self.dynamodb_builder.endpoint_resolver(endpoint_resolver);
-        self
-    }
-
-    pub fn set_endpoint_resolver(
-        &mut self,
-        endpoint_resolver: Option<aws_smithy_runtime_api::client::endpoint::SharedEndpointResolver>,
-    ) -> &mut Self {
-        self.dynamodb_builder
-            .set_endpoint_resolver(endpoint_resolver);
         self
     }
 
@@ -1122,25 +1058,6 @@ impl AlternatorBuilder {
         self
     }
 
-    pub fn account_id_endpoint_mode(
-        mut self,
-        account_id_endpoint_mode: aws_types::endpoint_config::AccountIdEndpointMode,
-    ) -> Self {
-        self.dynamodb_builder = self
-            .dynamodb_builder
-            .account_id_endpoint_mode(account_id_endpoint_mode);
-        self
-    }
-
-    pub fn set_account_id_endpoint_mode(
-        &mut self,
-        account_id_endpoint_mode: Option<aws_types::endpoint_config::AccountIdEndpointMode>,
-    ) -> &mut Self {
-        self.dynamodb_builder
-            .set_account_id_endpoint_mode(account_id_endpoint_mode);
-        self
-    }
-
     pub fn endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
         self.set_endpoint_url(Some(endpoint_url.into()));
         self
@@ -1163,26 +1080,6 @@ impl AlternatorBuilder {
             }
         }
         self.dynamodb_builder.set_endpoint_url(endpoint_url);
-        self
-    }
-
-    pub fn use_dual_stack(mut self, use_dual_stack: impl Into<bool>) -> Self {
-        self.dynamodb_builder = self.dynamodb_builder.use_dual_stack(use_dual_stack);
-        self
-    }
-
-    pub fn set_use_dual_stack(&mut self, use_dual_stack: Option<bool>) -> &mut Self {
-        self.dynamodb_builder.set_use_dual_stack(use_dual_stack);
-        self
-    }
-
-    pub fn use_fips(mut self, use_fips: impl Into<bool>) -> Self {
-        self.dynamodb_builder = self.dynamodb_builder.use_fips(use_fips);
-        self
-    }
-
-    pub fn set_use_fips(&mut self, use_fips: Option<bool>) -> &mut Self {
-        self.dynamodb_builder.set_use_fips(use_fips);
         self
     }
 
@@ -1328,35 +1225,15 @@ mod test {
     }
 
     #[test]
-    fn shared_sdk_config_credentials_provider_is_remembered() {
-        let sdk_config = aws_types::SdkConfig::builder()
-            .credentials_provider(aws_sdk_dynamodb::config::SharedCredentialsProvider::new(
+    fn explicit_builder_credentials_provider_is_remembered() {
+        let config = AlternatorConfig::builder()
+            .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            ))
+            )
+            .behavior_version_latest()
             .build();
-
-        let config = AlternatorConfig::from(&sdk_config);
 
         assert!(config.has_credentials_provider());
-    }
-
-    #[test]
-    fn shared_sdk_config_without_credentials_provider_is_no_auth() {
-        let sdk_config = aws_types::SdkConfig::builder().build();
-
-        let config = AlternatorConfig::from(&sdk_config);
-
-        assert!(!config.has_credentials_provider());
-    }
-
-    #[test]
-    #[should_panic(expected = "auth_scheme_preference is not supported by alternator-driver")]
-    fn shared_sdk_config_auth_scheme_preference_reports_unsupported_api() {
-        let sdk_config = aws_types::SdkConfig::builder()
-            .auth_scheme_preference([aws_runtime::auth::sigv4::SCHEME_ID])
-            .build();
-
-        let _ = AlternatorConfig::from(&sdk_config);
     }
 
     #[test]
@@ -1399,14 +1276,6 @@ mod test {
     #[should_panic(expected = "require_auth() cannot be combined with allow_no_auth()")]
     fn allow_no_auth_after_require_auth_panics() {
         let _ = AlternatorConfig::builder().require_auth().allow_no_auth();
-    }
-
-    #[test]
-    #[should_panic(expected = "Alternator supports only SigV4 with static credentials or no-auth")]
-    fn unsupported_auth_scheme_resolver_panics() {
-        let _ = AlternatorConfig::builder().auth_scheme_resolver(
-            aws_sdk_dynamodb::config::auth::DefaultAuthSchemeResolver::default(),
-        );
     }
 
     #[test]
