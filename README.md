@@ -298,14 +298,67 @@ let client = AlternatorClient::from_conf(
 
 `.key_route_affinity(...)` accepts either a `KeyRouteAffinityType` (for the simple case) or a full `KeyRouteAffinityConfig` (for pre-configured tables). The two forms are interchangeable at the call site — pick whichever matches your needs.
 
+## User-Agent
+
+By default, the client replaces the AWS SDK `User-Agent` header with an Alternator client token:
+
+```text
+scylladb-alternator-client-rust/<version>
+```
+
+You can replace it exactly:
+
+```rust
+use alternator_driver::{AlternatorConfig, AlternatorClient};
+
+let client = AlternatorClient::from_conf(
+    AlternatorConfig::builder()
+        .endpoint_url("http://10.0.0.1:8043")
+        .user_agent("orders-service/1.0")
+        .behavior_version_latest()
+        .build(),
+);
+```
+
+You can derive a value from the default:
+
+```rust
+use alternator_driver::{AlternatorConfig, AlternatorClient, UserAgent};
+
+let client = AlternatorClient::from_conf(
+    AlternatorConfig::builder()
+        .endpoint_url("http://10.0.0.1:8043")
+        .user_agent(UserAgent::transform(|default| {
+            format!("{default} orders-service/1.0")
+        }))
+        .behavior_version_latest()
+        .build(),
+);
+```
+
+Or disable it:
+
+```rust
+use alternator_driver::{AlternatorConfig, AlternatorClient};
+
+let client = AlternatorClient::from_conf(
+    AlternatorConfig::builder()
+        .endpoint_url("http://10.0.0.1:8043")
+        .without_user_agent()
+        .behavior_version_latest()
+        .build(),
+);
+```
+
 ## Header stripping
 
-By default, the AWS Rust SDK attaches a number of headers to every DynamoDB request — some are required for signed requests (`Host`, `Authorization`, `X-Amz-Date`, etc.), others are SDK metadata that Alternator doesn't use (`User-Agent` flavors, internal telemetry, retry information). For a small client-side optimization, this crate strips non-essential headers before transmission, keeping only the ones Alternator actually needs:
+By default, the AWS Rust SDK attaches a number of headers to every DynamoDB request — some are required for signed requests (`Host`, `Authorization`, `X-Amz-Date`, etc.), others are SDK metadata that Alternator doesn't use (`User-Agent` flavors, internal telemetry, retry information). For a small client-side optimization, this crate strips non-essential headers before transmission, then writes the configured final `User-Agent`. Optimized requests keep only:
 - `host`
 - `x-amz-target`
 - `content-length`
 - `accept-encoding`
 - `content-encoding`
+- `user-agent` unless disabled with `without_user_agent()`
 
 For signed requests, it also keeps:
 - `authorization`

@@ -38,6 +38,12 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 ///     .unwrap();
 /// # });
 /// ```
+///
+/// Only request-scoped settings apply here: request compression, response
+/// compression, header optimization, user-agent handling, and per-request credentials. Client
+/// construction settings such as `require_auth()`, `allow_no_auth()`, endpoint
+/// and seed-host settings, refresh intervals, routing scope, live nodes, and
+/// key-route affinity are ignored as per-operation overrides.
 pub trait AlternatorCustomizableOperation<T, E, B> {
     fn alternator_config_override(self, config_override: impl Into<AlternatorBuilder>) -> Self;
 }
@@ -57,6 +63,10 @@ impl<T, E, B> AlternatorCustomizableOperation<T, E, B> for CustomizableOperation
             this = this.interceptor(AlternatorOverrideInterceptor::for_optimize_headers(
                 optimize_headers,
             ));
+        }
+
+        if let Some(user_agent) = config_override.alternator_ext.user_agent {
+            this = this.interceptor(AlternatorOverrideInterceptor::for_user_agent(user_agent));
         }
 
         if let Some(response_compression) = config_override.alternator_ext.response_compression {

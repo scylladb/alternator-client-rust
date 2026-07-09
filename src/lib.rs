@@ -9,6 +9,7 @@ mod live_nodes;
 mod optimize_headers;
 mod query_plan;
 mod routing_scope;
+mod user_agent;
 
 pub use crate::client::*;
 pub use crate::compression::*;
@@ -20,3 +21,4 @@ pub(crate) use crate::live_nodes::*;
 pub(crate) use crate::optimize_headers::*;
 pub(crate) use crate::query_plan::*;
 pub use crate::routing_scope::*;
+pub use crate::user_agent::*;
