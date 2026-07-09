@@ -119,6 +119,34 @@ let config = AlternatorConfig::builder()
 
 For cluster-wide scope, provide at least one working seed host from every datacenter that should receive traffic. If a datacenter has no working seed in the configuration, the client cannot reliably discover and refresh live Alternator nodes from that datacenter.
 
+### AWS SDK region
+
+The AWS Rust SDK keeps a region in the DynamoDB configuration even when
+`endpoint_url` points at Alternator instead of an AWS DynamoDB regional
+endpoint. Alternator does not use this value for routing; this crate discovers
+live nodes through `/localnodes` and rewrites requests to those nodes. The
+region can still appear in SDK diagnostics, traces, metrics, and signing
+metadata.
+
+When no region is supplied, `AlternatorClient::from_conf` sets `us-east-1` as a
+stable placeholder so the AWS SDK does not try to resolve a region from the
+environment and fail before the client is built. If that placeholder is
+misleading for your deployment, set an explicit region on the
+`AlternatorConfig` builder:
+
+```rust
+use aws_sdk_dynamodb::config::Region;
+use alternator_driver::AlternatorConfig;
+
+let config = AlternatorConfig::builder()
+    .endpoint_url("http://10.0.0.1:8043")
+    .region(Region::new("eu-central-1"))
+    .build();
+```
+
+Choose the deployment or Scylla Cloud region that is useful for operators. This
+does not change Alternator node discovery or load balancing.
+
 ### Node discovery
 
 The client maintains a list of live nodes, which it refreshes in the background. The refresh has two cadences:
