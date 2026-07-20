@@ -410,12 +410,39 @@ impl Drop for LiveNodes {
 mod tests {
     use super::*;
     use crate::config::AlternatorConfig;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn test_config() -> AlternatorConfig {
         AlternatorConfig::builder()
             .behavior_version_latest()
             .endpoint_url("http://127.0.0.1:1".to_string())
             .build()
+    }
+
+    async fn start_localnodes_server(body: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            let n = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]);
+            assert!(request.starts_with("GET /localnodes HTTP/1.1"));
+            assert!(
+                request.contains(&format!("host: localhost:{port}"))
+                    || request.contains(&format!("Host: localhost:{port}"))
+            );
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (port, server)
     }
 
     #[test]
@@ -469,5 +496,60 @@ mod tests {
         assert_eq!(nodes.seed_urls[0].host_str(), Some("[::1]"));
         assert_eq!(nodes.seed_urls[0].port(), Some(8000));
         assert_eq!(nodes.seed_urls[0].to_string(), "http://[::1]:8000/");
+    }
+
+    #[tokio::test]
+    async fn dns_entrypoint_discovers_dns_node_records() {
+        let (port, server) = start_localnodes_server(r#"["localhost","node-a.internal"]"#).await;
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(vec!["localhost".to_string()])
+            .active_interval(std::time::Duration::from_millis(10))
+            .idle_interval(std::time::Duration::from_secs(10))
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        nodes.update_live_nodes().await;
+
+        server.await.unwrap();
+        let snapshot = nodes.live_nodes.load();
+        let hosts = snapshot
+            .iter()
+            .map(|url| url.host_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(hosts, vec!["localhost", "node-a.internal"]);
+    }
+
+    #[tokio::test]
+    async fn dns_entrypoint_applies_configured_port_to_dns_node_records() {
+        let (port, server) =
+            start_localnodes_server(r#"["node-a.internal:9000","node-b.internal"]"#).await;
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(vec!["localhost".to_string()])
+            .active_interval(std::time::Duration::from_millis(10))
+            .idle_interval(std::time::Duration::from_secs(10))
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        nodes.update_live_nodes().await;
+
+        server.await.unwrap();
+        let snapshot = nodes.live_nodes.load();
+        let hosts_and_ports = snapshot
+            .iter()
+            .map(|url| (url.host_str().unwrap().to_string(), url.port()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hosts_and_ports,
+            vec![
+                ("node-a.internal".to_string(), Some(port)),
+                ("node-b.internal".to_string(), Some(port)),
+            ]
+        );
     }
 }
