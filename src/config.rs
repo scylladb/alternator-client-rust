@@ -13,6 +13,7 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) request_compression: Option<RequestCompression>,
     pub(crate) response_compression: Option<ResponseCompression>,
     pub(crate) optimize_headers: Option<bool>,
+    pub(crate) user_agent: Option<UserAgent>,
     pub(crate) has_credentials_provider: bool,
     pub(crate) require_auth: bool,
     pub(crate) allow_no_auth: bool,
@@ -86,6 +87,13 @@ impl AlternatorConfig {
     /// Turned on by default.
     pub fn optimize_headers(&self) -> Option<bool> {
         self.alternator_ext.optimize_headers
+    }
+
+    /// Gets the configured final `User-Agent` behavior.
+    ///
+    /// If this is [`None`], the client sends [`DEFAULT_USER_AGENT`].
+    pub fn user_agent(&self) -> Option<&UserAgent> {
+        self.alternator_ext.user_agent.as_ref()
     }
 
     /// Enable / disable request compression.
@@ -273,6 +281,37 @@ impl AlternatorBuilder {
     /// Turned on by default.
     pub fn set_optimize_headers(&mut self, optimize: bool) -> &mut Self {
         self.alternator_ext.optimize_headers = Some(optimize);
+        self
+    }
+
+    /// Configure the final `User-Agent` header sent by the client.
+    ///
+    /// By default, the client sends [`DEFAULT_USER_AGENT`]. Passing a string
+    /// replaces it exactly. Use [`UserAgent::transform`] to derive a custom
+    /// value from the default, or [`UserAgent::disabled`] to send no
+    /// `User-Agent` header.
+    pub fn user_agent(mut self, user_agent: impl Into<UserAgent>) -> Self {
+        self.set_user_agent(Some(user_agent.into()));
+        self
+    }
+
+    /// Configure the final `User-Agent` header sent by the client.
+    ///
+    /// Setting this to [`None`] restores the default behavior.
+    pub fn set_user_agent(&mut self, user_agent: Option<UserAgent>) -> &mut Self {
+        self.alternator_ext.user_agent = user_agent;
+        self
+    }
+
+    /// Disable the final `User-Agent` header sent by the client.
+    pub fn without_user_agent(mut self) -> Self {
+        self.set_without_user_agent();
+        self
+    }
+
+    /// Disable the final `User-Agent` header sent by the client.
+    pub fn set_without_user_agent(&mut self) -> &mut Self {
+        self.alternator_ext.user_agent = Some(UserAgent::disabled());
         self
     }
 
@@ -1142,6 +1181,7 @@ mod test {
                 CompressionLevel::default(),
                 0,
             ))
+            .user_agent("custom-client/1.2.3")
             .behavior_version_latest()
             .build();
 
@@ -1157,6 +1197,10 @@ mod test {
                 0
             )
         );
+        assert!(matches!(
+            config.user_agent().expect("user agent is not set"),
+            UserAgent::Value(value) if value == "custom-client/1.2.3"
+        ));
 
         let config = config.to_builder().build();
 
@@ -1172,6 +1216,10 @@ mod test {
                 0
             )
         );
+        assert!(matches!(
+            config.user_agent().expect("user agent is not set"),
+            UserAgent::Value(value) if value == "custom-client/1.2.3"
+        ));
     }
 
     #[test]

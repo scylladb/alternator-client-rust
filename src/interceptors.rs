@@ -31,6 +31,7 @@ pub(crate) struct AlternatorInterceptor {
     request_compression: RequestCompression,
     response_compression: ResponseCompression,
     optimize_headers: bool,
+    user_agent: UserAgent,
     preserve_auth_headers: bool,
 }
 impl AlternatorInterceptor {
@@ -38,12 +39,14 @@ impl AlternatorInterceptor {
         request_compression: RequestCompression,
         response_compression: ResponseCompression,
         optimize_headers: bool,
+        user_agent: UserAgent,
         preserve_auth_headers: bool,
     ) -> Self {
         Self {
             request_compression,
             response_compression,
             optimize_headers,
+            user_agent,
             preserve_auth_headers,
         }
     }
@@ -106,11 +109,17 @@ impl Intercept for AlternatorInterceptor {
             .load::<PreserveAuthHeadersStore>()
             .map(|store| store.preserve_auth_headers)
             .unwrap_or(self.preserve_auth_headers);
+        let user_agent = cfg
+            .interceptor_state()
+            .load::<UserAgentStore>()
+            .map(|store| &store.user_agent)
+            .unwrap_or(&self.user_agent);
 
         // optimize headers
         if optimize_headers {
             strip_headers(context.request_mut(), preserve_auth_headers);
         }
+        apply_user_agent(context.request_mut(), user_agent)?;
 
         Ok(())
     }
@@ -225,6 +234,14 @@ impl Storable for OptimizeHeadersStore {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct UserAgentStore {
+    user_agent: UserAgent,
+}
+impl Storable for UserAgentStore {
+    type Storer = StoreReplace<Self>;
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ResponseCompressionStore {
     pub(crate) response_compression: ResponseCompression,
 }
@@ -279,6 +296,13 @@ impl AlternatorOverrideInterceptor<OptimizeHeadersStore> {
     pub(crate) fn for_optimize_headers(optimize_headers: bool) -> Self {
         AlternatorOverrideInterceptor {
             store: OptimizeHeadersStore { optimize_headers },
+        }
+    }
+}
+impl AlternatorOverrideInterceptor<UserAgentStore> {
+    pub(crate) fn for_user_agent(user_agent: UserAgent) -> Self {
+        AlternatorOverrideInterceptor {
+            store: UserAgentStore { user_agent },
         }
     }
 }

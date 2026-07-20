@@ -248,6 +248,7 @@ mod tests {
     use crate::{
         AffinityQueryPlanInterceptor, AlternatorClient, AlternatorConfig, AlternatorInterceptor,
         LiveNodes, RequestCompression, ResponseCompression, RoundRobinQueryPlanInterceptor,
+        UserAgent,
     };
     use aws_sdk_dynamodb::config::{BehaviorVersion, Credentials, Region};
     use aws_sdk_dynamodb::types::AttributeValue;
@@ -419,6 +420,7 @@ mod tests {
                 RequestCompression::disabled(),
                 ResponseCompression::disabled(),
                 true,
+                UserAgent::default(),
                 true,
             ));
 

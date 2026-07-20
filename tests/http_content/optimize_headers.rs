@@ -4,10 +4,10 @@
 //! use from outgoing requests. A proxy is used to intercept messages exchanged
 //! between the driver and Alternator.
 //!
-//! There are eight test cases:
+//! There are eleven test cases:
 //! 1. Without credentials:
 //!    Disable credentials and verify that requests follow this whitelist:
-//!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding"]
+//!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "user-agent"]
 //! 2. Without credentials, with injected auth headers:
 //!    Disable credentials, inject auth headers before header stripping, and
 //!    verify that requests still follow the no-auth whitelist.
@@ -21,7 +21,7 @@
 //!    unsigned.
 //! 5. With credentials:
 //!    Enable credentials and verify that requests follow this whitelist:
-//!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "authorization", "x-amz-date"]
+//!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "user-agent", "authorization", "x-amz-date"]
 //! 6. Whitelist needed:
 //!    Enable credentials, disable header stripping, and verify that
 //!    unnecessary headers are present, confirming that stripping is useful.
@@ -33,10 +33,14 @@
 //!    Enable header stripping in the client config, override it for one call,
 //!    and then make another non-customized call to verify that the override
 //!    does not persist.
+//! 9. Custom User-Agent: Replace the default User-Agent and verify the final optimized request.
+//! 10. Disabled User-Agent: Disable User-Agent and verify the final optimized request omits it.
+//! 11. User-Agent by per-request customization:
+//!     Override User-Agent for one call, then verify a plain call uses the
+//!     client default.
 //!
-//! All tests share the same cleanup function. The first three also share the
-//! same set of driver calls, and the last two share another set of driver
-//! calls.
+//! All tests share the same cleanup function. Several tests share helper
+//! functions for common driver calls.
 //!
 use crate::http_content::driver_utils::*;
 use crate::http_content::http_test::*;
@@ -202,6 +206,7 @@ impl HttpTestConfig for WithoutCredentialsConfig {
             "content-length",
             "accept-encoding",
             "content-encoding",
+            "user-agent",
         ];
 
         let rogue = parts
@@ -215,6 +220,7 @@ impl HttpTestConfig for WithoutCredentialsConfig {
             rogue.unwrap(),
             whitelist
         );
+        assert_eq!(parts.headers.get("user-agent").unwrap(), DEFAULT_USER_AGENT);
         assert!(!parts.headers.contains_key("authorization"));
         assert!(!parts.headers.contains_key("x-amz-date"));
 
@@ -226,6 +232,79 @@ impl HttpTestConfig for WithoutCredentialsConfig {
     async fn cleanup(resources: Vec<String>, alternator_address: &str) {
         cleanup_calls(resources, alternator_address).await;
     }
+}
+
+struct CustomUserAgentConfig;
+impl HttpTestConfig for CustomUserAgentConfig {
+    async fn on_request(
+        request: Request<Incoming>,
+        sender: Arc<Mutex<SendRequest<Full<Bytes>>>>,
+    ) -> Response<Full<Bytes>> {
+        let (parts, body) = collect_request(request).await;
+
+        assert_eq!(
+            parts.headers.get("user-agent").unwrap(),
+            "orders-service/1.0"
+        );
+
+        let (parts, body) = collect_received_response(parts, body, sender).await;
+        build_response(parts, body)
+    }
+
+    async fn cleanup(resources: Vec<String>, alternator_address: &str) {
+        cleanup_calls(resources, alternator_address).await;
+    }
+}
+
+#[test_context(HttpTestContext<CustomUserAgentConfig>)]
+#[tokio::test]
+pub async fn test_custom_user_agent(ctx: &mut HttpTestContext<CustomUserAgentConfig>) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .optimize_headers(true)
+            .user_agent("orders-service/1.0")
+            .build(),
+    );
+
+    make_calls(&client, ctx).await;
+}
+
+struct DisabledUserAgentConfig;
+impl HttpTestConfig for DisabledUserAgentConfig {
+    async fn on_request(
+        request: Request<Incoming>,
+        sender: Arc<Mutex<SendRequest<Full<Bytes>>>>,
+    ) -> Response<Full<Bytes>> {
+        let (parts, body) = collect_request(request).await;
+
+        assert!(!parts.headers.contains_key("user-agent"));
+
+        let (parts, body) = collect_received_response(parts, body, sender).await;
+        build_response(parts, body)
+    }
+
+    async fn cleanup(resources: Vec<String>, alternator_address: &str) {
+        cleanup_calls(resources, alternator_address).await;
+    }
+}
+
+#[test_context(HttpTestContext<DisabledUserAgentConfig>)]
+#[tokio::test]
+pub async fn test_without_user_agent(ctx: &mut HttpTestContext<DisabledUserAgentConfig>) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .optimize_headers(true)
+            .without_user_agent()
+            .build(),
+    );
+
+    make_calls(&client, ctx).await;
 }
 
 #[test_context(HttpTestContext<WithoutCredentialsConfig>)]
@@ -335,6 +414,7 @@ impl HttpTestConfig for WithCredentialsConfig {
             "content-encoding",
             "authorization",
             "x-amz-date",
+            "user-agent",
         ];
 
         let rogue = parts
@@ -350,6 +430,7 @@ impl HttpTestConfig for WithCredentialsConfig {
         );
         assert!(parts.headers.contains_key("authorization"));
         assert!(parts.headers.contains_key("x-amz-date"));
+        assert_eq!(parts.headers.get("user-agent").unwrap(), DEFAULT_USER_AGENT);
 
         // forward
         let (parts, body) = collect_received_response(parts, body, sender).await;
@@ -397,6 +478,7 @@ impl HttpTestConfig for WhitelistNeededConfig {
             "content-encoding",
             "authorization",
             "x-amz-date",
+            "user-agent",
         ];
 
         let rogue = parts
@@ -525,6 +607,36 @@ async fn make_customized_calls(
         .send()
         .await
         .unwrap();
+}
+
+#[test_context(HttpTestContext<PerRequestCustomizationConfig>)]
+#[tokio::test]
+pub async fn test_per_request_user_agent_customization_does_not_persist(
+    ctx: &mut HttpTestContext<PerRequestCustomizationConfig>,
+) {
+    let client = AlternatorClient::from_conf(
+        AlternatorConfig::builder()
+            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
+            .seed_hosts(Vec::<String>::new())
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .optimize_headers(true)
+            .build(),
+    );
+
+    ctx.set_on_request(CustomUserAgentConfig::on_request).await;
+
+    client
+        .list_tables()
+        .customize()
+        .alternator_config_override(AlternatorConfig::builder().user_agent("orders-service/1.0"))
+        .send()
+        .await
+        .unwrap();
+
+    ctx.set_on_request(WithoutCredentialsConfig::on_request)
+        .await;
+
+    client.list_tables().send().await.unwrap();
 }
 
 #[test_context(HttpTestContext<PerRequestCustomizationConfig>)]
