@@ -15,6 +15,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCOVERY_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 struct MockResponse {
@@ -50,7 +51,15 @@ impl KeepAliveTestServer {
     }
 
     async fn finish(self) {
-        self.task.await.unwrap();
+        let mut task = self.task;
+        tokio::select! {
+            result = &mut task => result.unwrap(),
+            _ = tokio::time::sleep(REQUEST_TIMEOUT) => {
+                task.abort();
+                let _ = task.await;
+                panic!("timed out waiting for test server shutdown");
+            }
+        }
     }
 }
 
@@ -177,13 +186,13 @@ async fn alternator_discovery_non_success_responses_keep_connection_reusable() {
     )
     .await;
 
-    let _client = AlternatorClient::from_conf(
+    let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .behavior_version_latest()
             .scheme("http")
             .port(server.address.port())
             .seed_hosts(vec![server.address.ip().to_string()])
-            .active_interval(Duration::from_millis(10))
+            .active_interval(DISCOVERY_INTERVAL)
             .idle_interval(Duration::from_secs(10))
             .build(),
     );
@@ -196,6 +205,7 @@ async fn alternator_discovery_non_success_responses_keep_connection_reusable() {
         "discovery connection was not reused after non-success responses"
     );
 
+    drop(client);
     server.finish().await;
 }
 
@@ -249,5 +259,6 @@ async fn dynamodb_non_success_responses_keep_connection_reusable() {
         "DynamoDB connection was not reused after non-success responses"
     );
 
+    drop(client);
     server.finish().await;
 }
