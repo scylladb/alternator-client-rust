@@ -5,9 +5,8 @@ use crate::*;
 /// Each field is an Option, as the user may have not chosen a value.
 ///
 /// It is important to store them separately from Dynamodb's config,
-/// as [AlternatorConfig] is also used in overriding [AlternatorClient]'s config at per-operation level,
-/// when the override includes only settings selected by the user.
-/// (see [AlternatorCustomizableOperation])
+/// because they are consumed by Alternator-specific client construction and
+/// request interceptors.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AlternatorExtensions {
     pub(crate) request_compression: Option<RequestCompression>,
@@ -63,6 +62,10 @@ pub struct AlternatorConfig {
 impl AlternatorConfig {
     pub fn builder() -> AlternatorBuilder {
         AlternatorBuilder::default()
+    }
+
+    pub fn operation_builder() -> AlternatorOperationBuilder {
+        AlternatorOperationBuilder::default()
     }
 
     pub fn to_builder(&self) -> AlternatorBuilder {
@@ -222,6 +225,78 @@ impl AlternatorConfig {
         &self,
     ) -> Option<keyrouting::affinity_config::KeyRouteAffinityConfig> {
         self.alternator_ext.key_route_affinity.clone()
+    }
+}
+
+/// Builder for Alternator compression settings that can be overridden for one operation.
+///
+/// This intentionally exposes only request and response compression. Use
+/// [`AlternatorConfig::builder()`] for client construction settings such as
+/// header stripping, user-agent handling, and routing. Use the AWS SDK's
+/// `config_override(...)` for SDK-level per-operation overrides.
+///
+/// ```no_run
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// use alternator_driver::{
+///     AlternatorClient,
+///     AlternatorConfig,
+///     AlternatorCustomizableOperation,
+///     RequestCompression,
+/// };
+///
+/// let client = AlternatorClient::from_conf(
+///     AlternatorConfig::builder()
+///         .behavior_version_latest()
+///         .build(),
+/// );
+///
+/// client
+///     .list_tables()
+///     .customize()
+///     .alternator_config_override(
+///         AlternatorConfig::operation_builder()
+///             .request_compression(RequestCompression::disabled()),
+///     )
+///     .send()
+///     .await
+///     .unwrap();
+/// # });
+/// ```
+///
+/// Client-level settings are not available here:
+///
+/// ```compile_fail
+/// use alternator_driver::AlternatorConfig;
+///
+/// let _ = AlternatorConfig::operation_builder().user_agent("orders-service/1.0");
+/// ```
+///
+/// ```compile_fail
+/// use alternator_driver::AlternatorConfig;
+///
+/// let _ = AlternatorConfig::operation_builder().optimize_headers(false);
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct AlternatorOperationBuilder {
+    pub(crate) request_compression: Option<RequestCompression>,
+    pub(crate) response_compression: Option<ResponseCompression>,
+}
+
+impl AlternatorOperationBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable / disable request compression for this request.
+    pub fn request_compression(mut self, request_compression: RequestCompression) -> Self {
+        self.request_compression = Some(request_compression);
+        self
+    }
+
+    /// Configure which response encodings this request advertises via `Accept-Encoding`.
+    pub fn response_compression(mut self, response_compression: ResponseCompression) -> Self {
+        self.response_compression = Some(response_compression);
+        self
     }
 }
 
@@ -1236,6 +1311,20 @@ mod test {
                 .expect("does not have length")
                 == 0
         );
+    }
+
+    #[test]
+    fn operation_builder_records_fluent_methods() {
+        let request_compression = RequestCompression::disabled();
+        let response_compression =
+            ResponseCompression::enabled(ResponseCompressionAlgorithm::Deflate);
+
+        let builder = AlternatorConfig::operation_builder()
+            .request_compression(request_compression.clone())
+            .response_compression(response_compression.clone());
+
+        assert_eq!(builder.request_compression, Some(request_compression));
+        assert_eq!(builder.response_compression, Some(response_compression));
     }
 
     #[test]

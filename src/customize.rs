@@ -4,9 +4,9 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 
 /// Extension trait for DynamoDB's [CustomizableOperation].
 ///
-/// Build the client with a full [`AlternatorConfig`], then use a partial
-/// [`AlternatorConfig::builder()`] value to override Alternator settings for a
-/// single operation:
+/// Build the client with a full [`AlternatorConfig`], then use
+/// [`AlternatorConfig::operation_builder()`] to override Alternator compression
+/// settings for a single operation:
 /// ```no_run
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// use alternator_driver::{
@@ -27,11 +27,8 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 ///     // ...
 ///     .customize()
 ///     .alternator_config_override(
-///         // Per-operation overrides take a builder, not a built config.
-///         AlternatorConfig::builder()
-///             .optimize_headers(false)
-///             .request_compression(RequestCompression::disabled())
-///             .behavior_version_latest(),
+///         AlternatorConfig::operation_builder()
+///             .request_compression(RequestCompression::disabled()),
 ///     )
 ///     .send()
 ///     .await
@@ -39,45 +36,54 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 /// # });
 /// ```
 ///
-/// Only request-scoped settings apply here: request compression, response
-/// compression, header optimization, user-agent handling, and per-request credentials. Client
-/// construction settings such as `require_auth()`, `allow_no_auth()`, endpoint
-/// and seed-host settings, refresh intervals, routing scope, live nodes, and
-/// key-route affinity are ignored as per-operation overrides.
+/// Only request and response compression are supported here. Use the AWS SDK's
+/// `config_override(...)` separately for supported SDK-level per-operation
+/// overrides.
+///
+/// A full client config builder is rejected:
+///
+/// ```compile_fail
+/// use alternator_driver::{
+///     AlternatorClient,
+///     AlternatorConfig,
+///     AlternatorCustomizableOperation,
+/// };
+///
+/// let client = AlternatorClient::from_conf(
+///     AlternatorConfig::builder()
+///         .behavior_version_latest()
+///         .build(),
+/// );
+///
+/// let _ = client
+///     .list_tables()
+///     .customize()
+///     .alternator_config_override(AlternatorConfig::builder());
+/// ```
 pub trait AlternatorCustomizableOperation<T, E, B> {
-    fn alternator_config_override(self, config_override: impl Into<AlternatorBuilder>) -> Self;
+    fn alternator_config_override(
+        self,
+        config_override: impl Into<AlternatorOperationBuilder>,
+    ) -> Self;
 }
 
 impl<T, E, B> AlternatorCustomizableOperation<T, E, B> for CustomizableOperation<T, E, B> {
-    fn alternator_config_override(self, config_override: impl Into<AlternatorBuilder>) -> Self {
-        let config_override: AlternatorBuilder = config_override.into();
-        let mut this = self.config_override(config_override.dynamodb_builder);
+    fn alternator_config_override(
+        self,
+        config_override: impl Into<AlternatorOperationBuilder>,
+    ) -> Self {
+        let config_override: AlternatorOperationBuilder = config_override.into();
+        let mut this = self;
 
-        if let Some(request_compression) = config_override.alternator_ext.request_compression {
+        if let Some(request_compression) = config_override.request_compression {
             this = this.interceptor(AlternatorOverrideInterceptor::for_request_compression(
                 request_compression,
             ));
         }
 
-        if let Some(optimize_headers) = config_override.alternator_ext.optimize_headers {
-            this = this.interceptor(AlternatorOverrideInterceptor::for_optimize_headers(
-                optimize_headers,
-            ));
-        }
-
-        if let Some(user_agent) = config_override.alternator_ext.user_agent {
-            this = this.interceptor(AlternatorOverrideInterceptor::for_user_agent(user_agent));
-        }
-
-        if let Some(response_compression) = config_override.alternator_ext.response_compression {
+        if let Some(response_compression) = config_override.response_compression {
             this = this.interceptor(AlternatorOverrideInterceptor::for_response_compression(
                 response_compression,
-            ));
-        }
-
-        if config_override.alternator_ext.has_credentials_provider {
-            this = this.interceptor(AlternatorOverrideInterceptor::for_preserve_auth_headers(
-                true,
             ));
         }
 

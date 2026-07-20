@@ -23,9 +23,13 @@ use crate::keyrouting::resolver;
 ///
 /// Is added by [AlternatorClient] to its inner Dynamodb client on construction.
 ///
-/// Uses [strip_headers] and [compress_request].
+/// Handles request compression, response compression negotiation and
+/// decompression, header stripping, final user-agent handling, and request URI
+/// selection from query plans.
 ///
-/// Also checks [ConfigBag] for config overrides that could have been left by [AlternatorOverrideInterceptor].
+/// Also checks [ConfigBag] for per-operation compression overrides left by
+/// [AlternatorOverrideInterceptor] and for signing state used to preserve SigV4
+/// headers when header stripping is enabled.
 #[derive(Debug)]
 pub(crate) struct AlternatorInterceptor {
     request_compression: RequestCompression,
@@ -98,28 +102,16 @@ impl Intercept for AlternatorInterceptor {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
-        // check for overrides
-        let optimize_headers = cfg
-            .interceptor_state()
-            .load::<OptimizeHeadersStore>()
-            .map(|store| store.optimize_headers)
-            .unwrap_or(self.optimize_headers);
         let preserve_auth_headers = cfg
             .interceptor_state()
             .load::<PreserveAuthHeadersStore>()
             .map(|store| store.preserve_auth_headers)
             .unwrap_or(self.preserve_auth_headers);
-        let user_agent = cfg
-            .interceptor_state()
-            .load::<UserAgentStore>()
-            .map(|store| &store.user_agent)
-            .unwrap_or(&self.user_agent);
-
         // optimize headers
-        if optimize_headers {
+        if self.optimize_headers {
             strip_headers(context.request_mut(), preserve_auth_headers);
         }
-        apply_user_agent(context.request_mut(), user_agent)?;
+        apply_user_agent(context.request_mut(), &self.user_agent)?;
 
         Ok(())
     }
@@ -226,22 +218,6 @@ impl Storable for RequestCompressionStore {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct OptimizeHeadersStore {
-    optimize_headers: bool,
-}
-impl Storable for OptimizeHeadersStore {
-    type Storer = StoreReplace<Self>;
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct UserAgentStore {
-    user_agent: UserAgent,
-}
-impl Storable for UserAgentStore {
-    type Storer = StoreReplace<Self>;
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct ResponseCompressionStore {
     pub(crate) response_compression: ResponseCompression,
 }
@@ -257,11 +233,13 @@ impl Storable for PreserveAuthHeadersStore {
     type Storer = StoreReplace<Self>;
 }
 
-/// An interceptor used to override [AlternatorClient]'s config.
+/// An interceptor used to carry one per-operation Alternator override.
 ///
-/// Adds specified config overrides to [ConfigBag], so that [AlternatorInterceptor] can later look for it.
+/// Adds the specified override value to [ConfigBag], so that
+/// [AlternatorInterceptor] can apply it later in the request lifecycle.
 ///
-/// Is used by [AlternatorCustomizableOperation] to allow per-operation customization.
+/// Is used by [AlternatorCustomizableOperation] for per-operation compression
+/// customization.
 #[derive(Debug)]
 pub(crate) struct AlternatorOverrideInterceptor<T: Storable<Storer = StoreReplace<T>> + Clone> {
     store: T,
@@ -292,20 +270,6 @@ impl AlternatorOverrideInterceptor<RequestCompressionStore> {
         }
     }
 }
-impl AlternatorOverrideInterceptor<OptimizeHeadersStore> {
-    pub(crate) fn for_optimize_headers(optimize_headers: bool) -> Self {
-        AlternatorOverrideInterceptor {
-            store: OptimizeHeadersStore { optimize_headers },
-        }
-    }
-}
-impl AlternatorOverrideInterceptor<UserAgentStore> {
-    pub(crate) fn for_user_agent(user_agent: UserAgent) -> Self {
-        AlternatorOverrideInterceptor {
-            store: UserAgentStore { user_agent },
-        }
-    }
-}
 impl AlternatorOverrideInterceptor<ResponseCompressionStore> {
     pub(crate) fn for_response_compression(response_compression: ResponseCompression) -> Self {
         AlternatorOverrideInterceptor {
@@ -315,16 +279,6 @@ impl AlternatorOverrideInterceptor<ResponseCompressionStore> {
         }
     }
 }
-impl AlternatorOverrideInterceptor<PreserveAuthHeadersStore> {
-    pub(crate) fn for_preserve_auth_headers(preserve_auth_headers: bool) -> Self {
-        AlternatorOverrideInterceptor {
-            store: PreserveAuthHeadersStore {
-                preserve_auth_headers,
-            },
-        }
-    }
-}
-
 /// An interceptor that adds a round-robin [QueryPlan] to the config bag before request serialization,
 /// so that [AlternatorInterceptor] can later use it to determine which node to send the request to.
 #[derive(Debug)]

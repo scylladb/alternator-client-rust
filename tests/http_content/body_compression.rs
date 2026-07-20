@@ -1,22 +1,20 @@
-//! Body Compression Tests
-//! In this module we assert that the driver is able to compress requests.
-//! We use a proxy to intercept messages sent between driver and alternator.
+//! Body compression tests.
 //!
-//! There are 4 test cases:
-//! 1. Gzip request compression
-//!    Enable gzip compression in client, assert request is correctly compressed
+//! This module verifies request compression, response decompression, response
+//! compression negotiation via `Accept-Encoding`, and per-operation compression
+//! overrides. A proxy intercepts messages sent between the driver and
+//! Alternator so tests can inspect request and response headers and bodies.
 //!
-//! 2. Zlib request compression
-//!    Enable zlib compression in client, assert request is correctly compressed
+//! Request compression coverage includes:
+//! 1. Gzip request compression.
+//! 2. Deflate request compression.
+//! 3. Enabling request compression for one operation.
+//! 4. Disabling request compression for one operation.
 //!
-//! 3. Enabled by per-request customization
-//!    Disable compression in client, then assert request is not compressed,
-//!    then customize a call to enable compression and assert it is correctly compressed,
-//!    then perform an uncustomized call to assert the customization doesn't last
-//!
-//! 4. Disabled by per-request customization
-//!    Enable compression in client, then customize a call to disable the compression,
-//!    then assert the request was not compressed
+//! Response compression coverage includes transparent decompression,
+//! unsupported encoding errors, unexpected compressed responses, negotiated
+//! `Accept-Encoding`, per-operation response compression overrides, and
+//! interaction with header stripping.
 //!
 use crate::http_content::driver_utils::*;
 use crate::http_content::http_test::*;
@@ -99,7 +97,7 @@ async fn assert_correct_gzip_on_request(
     build_response(parts, body)
 }
 
-async fn assert_correct_zlib_on_request(
+async fn assert_correct_deflate_on_request(
     request: Request<Incoming>,
     sender: Arc<Mutex<SendRequest<Full<Bytes>>>>,
 ) -> Response<Full<Bytes>> {
@@ -189,8 +187,8 @@ pub async fn test_request_compression_gzip(ctx: &mut HttpTestContext<Config>) {
 
 #[test_context(HttpTestContext<Config>)]
 #[tokio::test]
-pub async fn test_request_compression_zlib(ctx: &mut HttpTestContext<Config>) {
-    // construct client with zlib request compression enabled
+pub async fn test_request_compression_deflate(ctx: &mut HttpTestContext<Config>) {
+    // construct client with deflate request compression enabled
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
@@ -208,7 +206,7 @@ pub async fn test_request_compression_zlib(ctx: &mut HttpTestContext<Config>) {
     );
 
     // set the proxy to assert that driver has sent a correctly compressed request
-    ctx.set_on_request(assert_correct_zlib_on_request).await;
+    ctx.set_on_request(assert_correct_deflate_on_request).await;
 
     // perform a call, alongside the proxy, register the table for later cleanup
     let table_name = format!("table_{}", Uuid::new_v4());
@@ -255,7 +253,7 @@ async fn assert_not_compressed_on_request(
 
     assert!(cant_decompress);
 
-    // check zlib decompression
+    // check deflate decompression
     let mut decoder = ZlibDecoder::new(body.as_ref());
     let cant_decompress = decoder.read_to_end(&mut decoded).is_err();
 
@@ -338,7 +336,7 @@ pub async fn test_enabled_by_per_request_customization(ctx: &mut HttpTestContext
         )
         .billing_mode(BillingMode::PayPerRequest)
         .customize()
-        .alternator_config_override(AlternatorConfig::builder().request_compression(
+        .alternator_config_override(AlternatorConfig::operation_builder().request_compression(
             RequestCompression::enabled(CompressionAlgorithm::Gzip, CompressionLevel::default(), 0),
         ))
         .send()
@@ -424,7 +422,8 @@ pub async fn test_disabled_by_per_request_customization(ctx: &mut HttpTestContex
         .billing_mode(BillingMode::PayPerRequest)
         .customize()
         .alternator_config_override(
-            AlternatorConfig::builder().request_compression(RequestCompression::disabled()),
+            AlternatorConfig::operation_builder()
+                .request_compression(RequestCompression::disabled()),
         )
         .send()
         .await
@@ -901,7 +900,7 @@ pub async fn test_response_compression_enabled_by_per_request_customization(
         )
         .billing_mode(BillingMode::PayPerRequest)
         .customize()
-        .alternator_config_override(AlternatorConfig::builder().response_compression(
+        .alternator_config_override(AlternatorConfig::operation_builder().response_compression(
             ResponseCompression::enabled(ResponseCompressionAlgorithm::Gzip),
         ))
         .send()
@@ -954,7 +953,8 @@ pub async fn test_response_compression_disabled_by_per_request_customization(
         .billing_mode(BillingMode::PayPerRequest)
         .customize()
         .alternator_config_override(
-            AlternatorConfig::builder().response_compression(ResponseCompression::disabled()),
+            AlternatorConfig::operation_builder()
+                .response_compression(ResponseCompression::disabled()),
         )
         .send()
         .await

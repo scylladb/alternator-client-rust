@@ -4,7 +4,7 @@
 //! use from outgoing requests. A proxy is used to intercept messages exchanged
 //! between the driver and Alternator.
 //!
-//! There are eleven test cases:
+//! There are eight test cases:
 //! 1. Without credentials:
 //!    Disable credentials and verify that requests follow this whitelist:
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "user-agent"]
@@ -25,19 +25,8 @@
 //! 6. Whitelist needed:
 //!    Enable credentials, disable header stripping, and verify that
 //!    unnecessary headers are present, confirming that stripping is useful.
-//! 7. Enabled by per-request customization:
-//!    Disable header stripping in the client config, override it for one call,
-//!    and then make another non-customized call to verify that the override
-//!    does not persist.
-//! 8. Disabled by per-request customization:
-//!    Enable header stripping in the client config, override it for one call,
-//!    and then make another non-customized call to verify that the override
-//!    does not persist.
-//! 9. Custom User-Agent: Replace the default User-Agent and verify the final optimized request.
-//! 10. Disabled User-Agent: Disable User-Agent and verify the final optimized request omits it.
-//! 11. User-Agent by per-request customization:
-//!     Override User-Agent for one call, then verify a plain call uses the
-//!     client default.
+//! 7. Custom User-Agent: Replace the default User-Agent and verify the final optimized request.
+//! 8. Disabled User-Agent: Disable User-Agent and verify the final optimized request omits it.
 //!
 //! All tests share the same cleanup function. Several tests share helper
 //! functions for common driver calls.
@@ -526,168 +515,4 @@ impl HttpTestConfig for PerRequestCustomizationConfig {
     async fn cleanup(resources: Vec<String>, alternator_address: &str) {
         cleanup_calls(resources, alternator_address).await;
     }
-}
-
-async fn make_customized_calls(
-    client: &AlternatorClient,
-    ctx: &mut HttpTestContext<PerRequestCustomizationConfig>,
-) {
-    let client_strips_headers = client
-        .config()
-        .optimize_headers()
-        .expect("optimize_headers not set while constructing client");
-
-    // in the first call we assert that we can customize an operation to override client's config
-    // proxy ensures that a whitelist is used (WithCredentialsConfig) or it isn't (WhitelistNeededConfig)
-    // depending on client's value
-    if client_strips_headers {
-        ctx.set_on_request(WhitelistNeededConfig::on_request).await;
-    } else {
-        ctx.set_on_request(WithCredentialsConfig::on_request).await;
-    }
-
-    let table_name = format!("table_{}", Uuid::new_v4());
-    ctx.register_resource(table_name.clone());
-
-    client
-        .create_table()
-        .table_name(&table_name)
-        .attribute_definitions(
-            AttributeDefinition::builder()
-                .attribute_name("ExampleKey")
-                .attribute_type(ScalarAttributeType::S)
-                .build()
-                .unwrap(),
-        )
-        .key_schema(
-            KeySchemaElement::builder()
-                .attribute_name("ExampleKey")
-                .key_type(KeyType::Hash)
-                .build()
-                .unwrap(),
-        )
-        .billing_mode(BillingMode::PayPerRequest)
-        .customize()
-        .alternator_config_override(
-            AlternatorConfig::builder().optimize_headers(!client_strips_headers),
-        )
-        .send()
-        .await
-        .unwrap();
-
-    // in the second call, we assert that previous customization doesn't last
-    if client_strips_headers {
-        ctx.set_on_request(WithCredentialsConfig::on_request).await;
-    } else {
-        ctx.set_on_request(WhitelistNeededConfig::on_request).await;
-    }
-
-    let table_name = format!("table_{}", Uuid::new_v4());
-    ctx.register_resource(table_name.clone());
-
-    client
-        .create_table()
-        .table_name(&table_name)
-        .attribute_definitions(
-            AttributeDefinition::builder()
-                .attribute_name("ExampleKey")
-                .attribute_type(ScalarAttributeType::S)
-                .build()
-                .unwrap(),
-        )
-        .key_schema(
-            KeySchemaElement::builder()
-                .attribute_name("ExampleKey")
-                .key_type(KeyType::Hash)
-                .build()
-                .unwrap(),
-        )
-        .billing_mode(BillingMode::PayPerRequest)
-        .customize()
-        .send()
-        .await
-        .unwrap();
-}
-
-#[test_context(HttpTestContext<PerRequestCustomizationConfig>)]
-#[tokio::test]
-pub async fn test_per_request_user_agent_customization_does_not_persist(
-    ctx: &mut HttpTestContext<PerRequestCustomizationConfig>,
-) {
-    let client = AlternatorClient::from_conf(
-        AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .optimize_headers(true)
-            .build(),
-    );
-
-    ctx.set_on_request(CustomUserAgentConfig::on_request).await;
-
-    client
-        .list_tables()
-        .customize()
-        .alternator_config_override(AlternatorConfig::builder().user_agent("orders-service/1.0"))
-        .send()
-        .await
-        .unwrap();
-
-    ctx.set_on_request(WithoutCredentialsConfig::on_request)
-        .await;
-
-    client.list_tables().send().await.unwrap();
-}
-
-#[test_context(HttpTestContext<PerRequestCustomizationConfig>)]
-#[tokio::test]
-pub async fn test_enabled_by_per_request_customization(
-    ctx: &mut HttpTestContext<PerRequestCustomizationConfig>,
-) {
-    // construct client with header stripping disabled
-    let client = AlternatorClient::from_conf(
-        AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
-            .optimize_headers(false)
-            .build(),
-    );
-
-    // perform 2 calls to alternator, use proxy to peek and forward requests
-    //
-    // first call overrides config's optimize_headers setting,
-    // then proxy checks if it is stripped according to WithCredentialsConfig whitelist
-    //
-    // second call does not override the config
-    // then proxy checks if it has not been stripped
-    // (regular call to assert that customization does not last after operation)
-    make_customized_calls(&client, ctx).await;
-}
-#[test_context(HttpTestContext<PerRequestCustomizationConfig>)]
-#[tokio::test]
-pub async fn test_disabled_by_per_request_customization(
-    ctx: &mut HttpTestContext<PerRequestCustomizationConfig>,
-) {
-    // construct client with header stripping enabled
-    let client = AlternatorClient::from_conf(
-        AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
-            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
-            .optimize_headers(true)
-            .build(),
-    );
-
-    // perform 2 calls to alternator, use proxy to peek and forward requests
-    //
-    // first call overrides config's optimize_headers setting,
-    // then proxy checks if request has not been stripped
-    //
-    // second call does not override the config
-    // then proxy checks if it is stripped according to WithCredentialsConfig whitelist
-    // (regular call to assert that customization does not last after operation)
-    make_customized_calls(&client, ctx).await;
 }
