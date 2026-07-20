@@ -1,6 +1,7 @@
 use crate::ccm_wrapper::ccm::*;
 use crate::ccm_wrapper::cluster::*;
 use crate::load_balancing::cluster_utils::*;
+use crate::load_balancing::proxy;
 use crate::load_balancing::scope_utils;
 
 use alternator_driver::AlternatorClient;
@@ -628,6 +629,58 @@ async fn calls_correct_cluster_scope_test() {
     make_n_calls(&client, live_node_ips.len()).await;
 
     assert_round_robin_counts(&request_counter, &live_node_ips, "cluster scope");
+}
+
+#[tokio::test]
+#[cfg_attr(not(ccm_tests), ignore)]
+async fn dns_entrypoint_discovers_live_cluster_nodes_test() {
+    let mut guard = get_cluster().await;
+    let cluster = &mut *guard;
+    let request_counter = RequestCounter::from_cluster(cluster);
+    let target_ip = cluster
+        .nodes()
+        .into_iter()
+        .find(|node| node.is_up)
+        .unwrap()
+        .ip
+        .clone();
+    let dns_entrypoint_proxy = proxy::Proxy::start(
+        "localhost:0".to_string(),
+        format!("{target_ip}:{ALTERNATOR_PORT}"),
+        |request, send| async move { proxy::forward_on_request(request, send).await },
+        None,
+        None,
+    )
+    .await;
+    let proxy_port = dns_entrypoint_proxy.address().port();
+    tokio::spawn(async move {
+        dns_entrypoint_proxy.run().await;
+    });
+    start_proxies(cluster, proxy_port, &request_counter).await;
+
+    let client = AlternatorClient::from_conf(
+        minimal_builder()
+            .scheme("http")
+            .port(proxy_port)
+            .seed_hosts(vec!["localhost".to_string()])
+            .routing_scope(RoutingScope::from_cluster())
+            .build(),
+    );
+    let live_nodes = client.config().live_nodes().unwrap().clone();
+
+    live_nodes.update_live_nodes().await;
+
+    let discovered = live_nodes.get_live_nodes();
+    let hosts: Vec<&str> = discovered.iter().filter_map(|url| url.host_str()).collect();
+    assert!(!hosts.is_empty(), "DNS entrypoint should discover nodes");
+    assert!(
+        hosts.iter().all(|host| *host != "localhost"),
+        "DNS entrypoint should be replaced by live cluster node records, got {hosts:?}"
+    );
+
+    request_counter.reset();
+    make_n_calls(&client, hosts.len()).await;
+    assert_round_robin_counts(&request_counter, &hosts, "DNS entrypoint cluster scope");
 }
 
 #[tokio::test]

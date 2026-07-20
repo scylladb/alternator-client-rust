@@ -54,7 +54,7 @@ impl Node {
     }
 
     pub(crate) fn address(&self) -> String {
-        format!("http://{}:{}", &self.ip, &self.alternator_port)
+        format!("http://{}:{}", self.ip, self.alternator_port)
     }
 }
 
