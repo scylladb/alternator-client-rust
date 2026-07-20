@@ -398,7 +398,7 @@ let client = AlternatorClient::from_conf(
         .build(),
 );
 ```
-or by using `.customize().alternator_config_override()` to enable it for a specific driver call.
+or by using `.customize().alternator_config_override(...)` with `AlternatorConfig::operation_builder()` to override it for a specific driver call.
 
 Currently, the driver supports two algorithms: Gzip and Deflate. For either one, you can specify a compression level (default: 6). Compression is applied to requests whose body size exceeds the configured threshold; if the threshold is 0, every request is compressed.
 
@@ -421,7 +421,7 @@ let client = AlternatorClient::from_conf(
 );
 ```
 
-or by using `.customize().alternator_config_override()` to enable it for a specific driver call.
+or by using `.customize().alternator_config_override(...)` with `AlternatorConfig::operation_builder()` to override it for a specific driver call.
 
 The default is `disabled()`; use `enabled()`, `enabled_many()`, or `enabled_all()` to advertise the desired encodings.
 
@@ -441,7 +441,7 @@ client
 
     .customize()
     .alternator_config_override(    // <-- Instead of config_override
-        AlternatorConfig::builder() // <-- Instead of aws_sdk_dynamodb::Config
+        AlternatorConfig::operation_builder()
             .request_compression(RequestCompression::disabled())
     )
     .send()
@@ -449,6 +449,6 @@ client
     .unwrap();
 ```
 
-`alternator_config_override` applies Alternator-specific per-operation settings. Use the AWS SDK's `config_override` separately for supported SDK-level per-operation overrides.
+`alternator_config_override` currently applies only Alternator-specific compression settings: request compression and response compression. Use the AWS SDK's `config_override` separately for supported SDK-level per-operation overrides.
 
-> **Note**: load-balancing and endpoint settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is for settings that apply to individual request processing — compression and header stripping.
+> **Note**: load-balancing, endpoint, and header stripping settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is limited to request/response compression settings.
