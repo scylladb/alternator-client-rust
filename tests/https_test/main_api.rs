@@ -18,7 +18,7 @@ use crate::https_test::https_test_context::*;
 
 use alternator_driver::AlternatorClient;
 use alternator_driver::AlternatorConfig;
-use aws_sdk_dynamodb::config::{BehaviorVersion, Credentials};
+use aws_sdk_dynamodb::config::Credentials;
 use serial_test::serial;
 use test_context::test_context;
 
@@ -31,7 +31,6 @@ async fn test_https_main_api(ctx: &mut HttpsTestContext) {
         AlternatorConfig::builder()
             .endpoint_url(format!("https://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(BehaviorVersion::latest())
             .credentials_provider(Credentials::for_tests_with_session_token())
             .build(),
     );

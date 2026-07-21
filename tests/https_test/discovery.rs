@@ -19,7 +19,7 @@ use crate::https_test::proxy::forward_on_request;
 
 use alternator_driver::AlternatorClient;
 use alternator_driver::AlternatorConfig;
-use aws_sdk_dynamodb::config::{BehaviorVersion, Credentials};
+use aws_sdk_dynamodb::config::Credentials;
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1::SendRequest;
@@ -70,7 +70,6 @@ async fn test_https_discovery(ctx: &mut HttpsTestContext) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
             .endpoint_url(format!("https://{}", ctx.get_proxy_address()))
-            .behavior_version(BehaviorVersion::latest())
             .credentials_provider(Credentials::for_tests_with_session_token())
             .build(),
     );

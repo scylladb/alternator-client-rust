@@ -17,17 +17,27 @@ name = "alternator-driver"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+rust-version = "1.94.1"
+description = "Rust DynamoDB client wrapper for ScyllaDB Alternator with client-side load balancing."
+readme = "README.md"
+repository = "https://github.com/scylladb/alternator-client-rust"
+keywords = ["scylladb", "alternator", "dynamodb", "aws-sdk"]
+categories = ["database", "api-bindings", "asynchronous"]
 
 [dependencies]
-aws-sdk-dynamodb = { version = "=1.124.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-smithy-async = "=1.3.0"
-aws-smithy-http-client = { version = "=1.4.0", default-features = false, features = ["rustls-aws-lc"] }
-aws-smithy-runtime = "=1.14.0"
-aws-smithy-runtime-api = "=1.16.0"
-aws-types = "=1.6.0"
-aws-runtime = "=1.9.2"
+# Deliberately without "behavior-version-latest": Cargo unifies features, so
+# enabling it here would also remove the SDK's "pick a behavior version"
+# guard from every other crate in the dependency graph. The driver pins its
+# own version instead, see ALTERNATOR_BEHAVIOR_VERSION.
+aws-sdk-dynamodb = { version = "1.124.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-smithy-async = "1.3.0"
+aws-smithy-http-client = { version = "1.4.0", default-features = false, features = ["rustls-aws-lc"] }
+aws-smithy-runtime = "1.14.0"
+aws-smithy-runtime-api = "1.16.0"
+aws-types = "1.6.0"
+aws-runtime = "1.9.2"
 tokio = { version = "1.49", features = ["full"] }
-aws-smithy-types = { version = "=1.6.3", features = ["http-body-1-x"] }
+aws-smithy-types = { version = "1.6.3", features = ["http-body-1-x"] }
 flate2 = "1.1.5"
 http-body-util = "0.1.3"
 itertools = "0.14.0"
@@ -46,8 +56,8 @@ bytes = "1.11.1"
 
 [dev-dependencies]
 anyhow = "1.0.103"
-aws-credential-types = { version = "=1.3.0", features = ["test-util"] }
-aws-smithy-types = "=1.6.3"
+aws-credential-types = { version = "1.3.0", features = ["test-util"] }
+aws-smithy-types = "1.6.3"
 uuid = { version = "1.22.0", features = ["v4"] }
 hyper = { version = "1.8", features = ["client", "server", "http1"] }
 http = "1.3.1"

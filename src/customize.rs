@@ -31,7 +31,6 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 /// };
 ///
 /// let config = AlternatorConfig::builder()
-///     .behavior_version_latest()
 ///     .endpoint_url("http://127.0.0.1:8000")
 ///     .build();
 ///
@@ -66,7 +65,6 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 ///
 /// let client = AlternatorClient::from_conf(
 ///     AlternatorConfig::builder()
-///         .behavior_version_latest()
 ///         .endpoint_url("http://127.0.0.1:8000")
 ///         .build(),
 /// );

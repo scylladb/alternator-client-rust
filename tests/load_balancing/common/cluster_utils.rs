@@ -319,7 +319,6 @@ pub(crate) fn minimal_builder() -> AlternatorBuilder {
     AlternatorConfig::builder()
         .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token())
         .region(aws_sdk_dynamodb::config::Region::new("eu-central-1"))
-        .behavior_version_latest()
 }
 
 // Create a basic client with scope.
