@@ -2,6 +2,12 @@
 name = "alternator-driver"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Rust DynamoDB client wrapper for ScyllaDB Alternator with client-side load balancing."
+readme = "README.md"
+repository = "https://github.com/scylladb/alternator-client-rust"
+keywords = ["scylladb", "alternator", "dynamodb", "aws-sdk"]
+categories = ["database", "api-bindings", "asynchronous"]
 
 [dependencies]
 aws-sdk-dynamodb = "1.103.0"

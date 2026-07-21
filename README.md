@@ -33,33 +33,43 @@ On Scylla Cloud in regular setup it represents cloud provider availability zone 
 ## Introduction
 
 This crate is a thin wrapper for the AWS Rust SDK that builds DynamoDB clients which load-balance across Alternator nodes.
-Includes optimizations for Lightweight Transactions (LWTs), request compression, and header stripping.
+It adds client-side discovery and load balancing, routing-scope controls, optional key-route affinity for LWT-heavy workloads, request/response compression, header stripping, and no-auth defaults for Alternator deployments.
 
 ## Using the crate
-
 
 Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-alternator-driver = { git = "https://github.com/scylladb/alternator-client-rust" }
+alternator-driver = "0.1"
 aws-sdk-dynamodb = "1"
-tokio = { version = "1.18", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
-> **Note**: This crate is not yet published to crates.io. Depend on it via the GitHub URL.
+
+For unreleased development versions, depend on the GitHub repository instead:
+
+```toml
+alternator-driver = { git = "https://github.com/scylladb/alternator-client-rust" }
+```
+
+The direct `aws-sdk-dynamodb` dependency should stay on the same major version as the driver. Cargo will normally resolve one compatible `aws-sdk-dynamodb` 1.x and one compatible Tokio 1.x version for both your application and this crate.
+
+This crate uses Rust 2024 edition and requires Rust 1.85 or newer. Your application can use a different Rust edition, but the toolchain must be new enough to compile this crate.
+
+The examples pin the AWS SDK behavior version with `BehaviorVersion::v2026_01_12()` so SDK retry, timeout, and transport defaults are explicit. Choose the behavior version you have validated for your application.
 
 Because the Alternator Client follows the AWS SDK for DynamoDB operation builder interface for Alternator-supported features, migration usually starts by replacing `aws_sdk_dynamodb::Client` and its config type, like so:
 
 ```rust
 use alternator_driver::*;              // <-- new import
-use aws_sdk_dynamodb::types::*;
+use aws_sdk_dynamodb::{config::BehaviorVersion, types::*};
 
 #[tokio::main]
 async fn main() {
     // Build an AlternatorConfig instead of an aws_sdk_dynamodb::Config.
     let config = AlternatorConfig::builder() // <-- was aws_sdk_dynamodb::Config::builder()
         .endpoint_url("http://localhost:8000")
-        .behavior_version_latest()
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .build();
 
     // Build an AlternatorClient instead of an aws_sdk_dynamodb::Client.
@@ -77,7 +87,9 @@ async fn main() {
 }
 ```
 
-When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK. Alternator supports no-auth and SigV4 signing through configured or per-request credentials; custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are not exposed. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
+When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK.
+
+Alternator supports no-auth and SigV4 signing through configured or per-request credentials. Custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are not exposed. Use `allow_no_auth()` when you want to make unsigned access explicit. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
 
 This client targets ScyllaDB Alternator. It does not guarantee that Alternator-specific configuration, no-auth defaults, or request optimizations remain compatible with AWS DynamoDB itself.
 
@@ -92,7 +104,7 @@ Supported auth modes are:
 - SigV4 with a credentials provider configured through `credentials_provider(...)`
 - SigV4 with per-request credentials, usually with a client built using `require_auth()`
 
-The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, or custom endpoint resolvers. These APIs are intentionally absent rather than accepted and ignored. Use `endpoint_url(...)` or the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing.
+The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, custom endpoint resolvers, or AWS SDK framework metadata. These APIs are intentionally absent rather than accepted and ignored. Use `endpoint_url(...)` or the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing. Use `user_agent(...)` for Alternator client identification.
 
 Advanced SDK knobs such as retry settings, timeout settings, HTTP clients, identity cache, and interceptors remain available as escape hatches. Interceptors run alongside the driver's routing, compression, decompression, and header optimization interceptors, so keep ordering effects in mind when using them.
 
@@ -108,19 +120,21 @@ The simplest way to construct a client is with `endpoint_url`, the same field th
 
 ```rust
 use alternator_driver::AlternatorConfig;
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
-    .behavior_version_latest()
+    .behavior_version(BehaviorVersion::v2026_01_12())
     .build();
 ```
 
-The host in the URL is treated as a *seed*. For datacenter and rack scopes, the client calls `/localnodes` with the configured scope parameters. For the default cluster-wide scope, the client calls bare `/localnodes` on configured seed hosts and already-known live nodes, then unions the returned node lists. The endpoint URL is never used for actual data-plane traffic after discovery completes.
+The host in the URL is treated as a *seed*. For datacenter and rack scopes, the client calls `/localnodes` with the configured scope parameters. For the default cluster-wide scope, the client calls bare `/localnodes` on configured seed hosts and already-known live nodes, then unions the returned node lists. With discovery enabled, data-plane requests are rewritten to discovered live nodes after a routing target is selected.
 
 To give the client multiple candidates for initial discovery, or for deployments where a seed node might be down at startup time, pass multiple seed addresses directly along with the Alternator scheme and port:
 
 ```rust
 use alternator_driver::AlternatorConfig;
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let config = AlternatorConfig::builder()
     .scheme("http")
@@ -130,11 +144,26 @@ let config = AlternatorConfig::builder()
         "10.0.0.2",
         "10.0.0.3",
     ])
-    .behavior_version_latest()
+    .behavior_version(BehaviorVersion::v2026_01_12())
     .build();
 ```
 
 For cluster-wide scope, provide at least one working seed host from every datacenter that should receive traffic. If a datacenter has no working seed in the configuration, the client cannot reliably discover and refresh live Alternator nodes from that datacenter.
+
+To disable client-side discovery and load balancing, for example when sending through a proxy or an external load balancer, clear the seed hosts after setting `endpoint_url`:
+
+```rust
+use alternator_driver::AlternatorConfig;
+use aws_sdk_dynamodb::config::BehaviorVersion;
+
+let config = AlternatorConfig::builder()
+    .endpoint_url("http://load-balancer.example.com:8043")
+    .seed_hosts(Vec::<String>::new())
+    .behavior_version(BehaviorVersion::v2026_01_12())
+    .build();
+```
+
+In this mode, requests use the configured AWS SDK endpoint directly.
 
 ### AWS SDK region
 
@@ -152,12 +181,13 @@ misleading for your deployment, set an explicit region on the
 `AlternatorConfig` builder:
 
 ```rust
-use aws_sdk_dynamodb::config::Region;
 use alternator_driver::AlternatorConfig;
+use aws_sdk_dynamodb::config::{BehaviorVersion, Region};
 
 let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
     .region(Region::new("eu-central-1"))
+    .behavior_version(BehaviorVersion::v2026_01_12())
     .build();
 ```
 
@@ -174,12 +204,41 @@ The client maintains a list of live nodes, which it refreshes in the background.
 Both intervals are configurable:
 
 ```rust
+use alternator_driver::AlternatorConfig;
+use aws_sdk_dynamodb::config::BehaviorVersion;
+use std::time::Duration;
 
-.active_interval(std::time::Duration::from_millis(500))
-.idle_interval(std::time::Duration::from_secs(30))
+let config = AlternatorConfig::builder()
+    .endpoint_url("http://10.0.0.1:8043")
+    .active_interval(Duration::from_millis(500))
+    .idle_interval(Duration::from_secs(30))
+    .behavior_version(BehaviorVersion::v2026_01_12())
+    .build();
 ```
 
 The refresh task runs in the background for the lifetime of the client. It terminates automatically when the client is dropped.
+
+If several clients should share the same discovery state, construct a `LiveNodes` instance once and pass it to each client:
+
+```rust
+use alternator_driver::{AlternatorClient, AlternatorConfig, LiveNodes};
+use aws_sdk_dynamodb::config::BehaviorVersion;
+
+let discovery_config = AlternatorConfig::builder()
+    .scheme("http")
+    .port(8043)
+    .seed_hosts(["10.0.0.1", "10.0.0.2"])
+    .behavior_version(BehaviorVersion::v2026_01_12())
+    .build();
+
+let live_nodes = LiveNodes::new(&discovery_config).expect("seed hosts are required");
+
+let client_a =
+    AlternatorClient::from_conf_with_live_nodes(discovery_config.clone(), live_nodes.clone());
+let client_b = AlternatorClient::from_conf_with_live_nodes(discovery_config, live_nodes);
+```
+
+The shared `LiveNodes` keeps its own discovery settings. Client configs that reuse it do not change its routing scope, seed hosts, scheme, port, active interval, or idle interval.
 
 ### Routing scope
 
@@ -189,6 +248,7 @@ This is configured via `RoutingScope`:
 
 ```rust
 use alternator_driver::{AlternatorConfig, RoutingScope};
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 // Restrict to a single datacenter:
 let scope = RoutingScope::from_datacenter("dc1".to_string());
@@ -202,7 +262,7 @@ let scope = RoutingScope::from_cluster();
 let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
     .routing_scope(scope)
-    .behavior_version_latest()
+    .behavior_version(BehaviorVersion::v2026_01_12())
     .build();
 ```
 
@@ -280,12 +340,13 @@ The simplest case: pass an affinity mode directly to the client builder.
 
 ```rust
 use alternator_driver::{AlternatorConfig, AlternatorClient, KeyRouteAffinityType};
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .key_route_affinity(KeyRouteAffinityType::Rmw)
-        .behavior_version_latest()
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .build(),
 );
 ```
@@ -296,6 +357,7 @@ To pre-configure the partition key names for specific tables and skip the initia
 
 ```rust
 use alternator_driver::{AlternatorConfig, AlternatorClient, KeyRouteAffinityConfig, KeyRouteAffinityType};
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let affinity = KeyRouteAffinityConfig::builder()
     .with_type(KeyRouteAffinityType::Rmw)
@@ -307,7 +369,7 @@ let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .key_route_affinity(affinity)
-        .behavior_version_latest()
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .build(),
 );
 ```
@@ -327,12 +389,13 @@ You can replace it exactly:
 
 ```rust
 use alternator_driver::{AlternatorConfig, AlternatorClient};
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .user_agent("orders-service/1.0")
-        .behavior_version_latest()
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .build(),
 );
 ```
@@ -341,6 +404,7 @@ You can derive a value from the default:
 
 ```rust
 use alternator_driver::{AlternatorConfig, AlternatorClient, UserAgent};
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
@@ -348,7 +412,7 @@ let client = AlternatorClient::from_conf(
         .user_agent(UserAgent::transform(|default| {
             format!("{default} orders-service/1.0")
         }))
-        .behavior_version_latest()
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .build(),
 );
 ```
@@ -357,12 +421,13 @@ Or disable it:
 
 ```rust
 use alternator_driver::{AlternatorConfig, AlternatorClient};
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .without_user_agent()
-        .behavior_version_latest()
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .build(),
 );
 ```
@@ -385,12 +450,13 @@ This is on by default, you can disable it if needed:
 
 ```rust
 use alternator_driver::{AlternatorConfig, AlternatorClient};
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .optimize_headers(false)
-        .behavior_version_latest()
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .build(),
 );
 ```
@@ -400,8 +466,16 @@ let client = AlternatorClient::from_conf(
 Alternator accepts compressed requests to reduce bandwidth for write-heavy workloads (such as BatchWriteItem and large PutItem payloads).
 
 You can enable compression in `AlternatorConfig`, like so:
+
 ```rust
-use alternator_driver::{AlternatorConfig, AlternatorClient, RequestCompression, CompressionAlgorithm, CompressionLevel};
+use alternator_driver::{
+    AlternatorClient,
+    AlternatorConfig,
+    CompressionAlgorithm,
+    CompressionLevel,
+    RequestCompression,
+};
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
@@ -411,7 +485,7 @@ let client = AlternatorClient::from_conf(
             CompressionLevel::default(),
             1024, // body-size threshold in bytes
         ))
-        .behavior_version_latest()
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .build(),
 );
 ```
@@ -424,7 +498,13 @@ Currently, the driver supports two algorithms: Gzip and Deflate. For either one,
 The driver transparently decompresses gzip and deflate responses based on the `Content-Encoding` header. To request compressed responses, configure response compression in `AlternatorConfig`:
 
 ```rust
-use alternator_driver::{AlternatorConfig, AlternatorClient, ResponseCompression, ResponseCompressionAlgorithm};
+use alternator_driver::{
+    AlternatorClient,
+    AlternatorConfig,
+    ResponseCompression,
+    ResponseCompressionAlgorithm,
+};
+use aws_sdk_dynamodb::config::BehaviorVersion;
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
@@ -432,8 +512,7 @@ let client = AlternatorClient::from_conf(
         .response_compression(ResponseCompression::enabled(
             ResponseCompressionAlgorithm::Gzip,
         ))
-        .behavior_version_latest()
-        .allow_no_auth()
+        .behavior_version(BehaviorVersion::v2026_01_12())
         .build(),
 );
 ```
@@ -444,10 +523,10 @@ The default is `disabled()`; use `enabled()`, `enabled_many()`, or `enabled_all(
 
 ## Per-operation override
 
-In case an Alternator-specific setting is to be overridden for a specified driver call, you can use the same `.customize()` pattern that DynamoDB uses.
+To override an Alternator-specific setting for one request, use the same `.customize()` pattern that DynamoDB uses.
 
 ```rust
-use alternator_driver::*; // Include AlternatorCustomizableOperation - trait responsible for customization
+use alternator_driver::*; // Includes AlternatorCustomizableOperation.
 use aws_sdk_dynamodb::types::*;
 // ...
 client
@@ -457,7 +536,7 @@ client
     .item("ExampleAttribute", AttributeValue::S("ExampleItem".into()))
 
     .customize()
-    .alternator_config_override(    // <-- Instead of config_override
+    .alternator_config_override(
         AlternatorConfig::operation_builder()
             .request_compression(RequestCompression::disabled())
     )
@@ -469,3 +548,35 @@ client
 `alternator_config_override` currently applies only Alternator-specific compression settings: request compression and response compression. Use the AWS SDK's `config_override` separately for supported SDK-level per-operation overrides.
 
 > **Note**: load-balancing, endpoint, and header stripping settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is limited to request/response compression settings.
+
+## Development
+
+Run local static checks with:
+
+```sh
+make static
+```
+
+Run the regular test suite with:
+
+```sh
+make test
+```
+
+`make test` starts the `docker-compose.yml` ScyllaDB service and leaves it running for reuse. Stop it with:
+
+```sh
+make down
+```
+
+The CCM-backed topology and load-balancing tests require `scylla-ccm` to be installed and available on `PATH`:
+
+```sh
+make ccm-tests
+```
+
+Before publishing a release, run:
+
+```sh
+cargo publish --dry-run
+```
