@@ -184,6 +184,7 @@ fn test_config() {
     with_exceptions.remove(&(None, "auth_schemes".into())); // custom AWS auth schemes are not supported by Alternator
     with_exceptions.remove(&(None, "auth_scheme_resolver".into()));
     with_exceptions.remove(&(None, "endpoint_resolver".into())); // custom endpoint resolution conflicts with client-side routing
+    with_exceptions.remove(&(None, "framework_metadata".into())); // AWS SDK framework metadata feeds SDK user-agent telemetry; use AlternatorBuilder::user_agent instead
 
     let unimplemented = with_exceptions.difference(&alternator_config_methods);
     let all_implemented = unimplemented.clone().next().is_none();
@@ -227,6 +228,8 @@ fn test_builder() {
     with_exceptions.remove(&(None, "set_use_dual_stack".into()));
     with_exceptions.remove(&(None, "use_fips".into()));
     with_exceptions.remove(&(None, "set_use_fips".into()));
+    with_exceptions.remove(&(None, "framework_metadata".into())); // AWS SDK framework metadata feeds SDK user-agent telemetry; use user_agent instead
+    with_exceptions.remove(&(None, "push_framework_metadata".into()));
 
     let unimplemented = with_exceptions.difference(&alternator_builder_methods);
     let all_implemented = unimplemented.clone().next().is_none();

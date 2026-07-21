@@ -48,9 +48,11 @@ fn incompatible_auth_options() -> ! {
 ///
 /// ```
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
+/// use aws_sdk_dynamodb::config::BehaviorVersion;
+///
 /// let config =
 ///     AlternatorConfig::builder()
-///     .behavior_version_latest()
+///     .behavior_version(BehaviorVersion::v2026_01_12())
 ///     // ...
 ///     .build();
 ///
@@ -248,10 +250,11 @@ impl AlternatorConfig {
 ///     AlternatorCustomizableOperation,
 ///     RequestCompression,
 /// };
+/// use aws_sdk_dynamodb::config::BehaviorVersion;
 ///
 /// let client = AlternatorClient::from_conf(
 ///     AlternatorConfig::builder()
-///         .behavior_version_latest()
+///         .behavior_version(BehaviorVersion::v2026_01_12())
 ///         .build(),
 /// );
 ///
@@ -322,9 +325,11 @@ impl AlternatorOperationBuilder {
 ///
 /// ```
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
+/// use aws_sdk_dynamodb::config::BehaviorVersion;
+///
 /// let config =
 ///     AlternatorConfig::builder()
-///    .behavior_version_latest()
+///     .behavior_version(BehaviorVersion::v2026_01_12())
 ///     // ...
 ///     .build();
 ///

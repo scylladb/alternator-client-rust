@@ -48,8 +48,10 @@ pub enum KeyRouteAffinityType {
 /// Or when passing it directly to `AlternatorConfig::builder()`:
 /// ```
 /// use alternator_driver::{AlternatorClient, AlternatorConfig, KeyRouteAffinityType};
+/// use aws_sdk_dynamodb::config::BehaviorVersion;
+///
 /// let config = AlternatorConfig::builder()
-///     .behavior_version_latest()
+///     .behavior_version(BehaviorVersion::v2026_01_12())
 ///     .key_route_affinity(KeyRouteAffinityType::Rmw)
 ///     .build();
 /// let client = AlternatorClient::from_conf(config);

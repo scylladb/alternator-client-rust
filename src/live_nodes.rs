@@ -92,6 +92,13 @@ use url::Url;
 const DEFAULT_ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Shared state for Alternator node discovery and client-side routing.
+///
+/// Most clients should let [`AlternatorClient::from_conf`] construct this
+/// automatically. Construct and share a [`LiveNodes`] instance explicitly only
+/// when multiple clients should reuse one background discovery task.
+///
+/// [`AlternatorClient::from_conf`]: crate::client::AlternatorClient::from_conf
 #[derive(Debug)]
 pub struct LiveNodes {
     routing_scope: RoutingScope,
@@ -306,7 +313,7 @@ impl LiveNodes {
     }
 
     /// Returns the first live node not in `used_nodes` starting with the next node in round-robin order.
-    /// Used by [`crate::QueryPlan`] round-robin strategy.
+    /// Used by the internal round-robin query plan.
     pub fn get_next_node_round_robin(
         self: &Arc<Self>,
         used_nodes: &std::collections::HashSet<Arc<Url>>,

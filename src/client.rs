@@ -14,9 +14,11 @@ use crate::*;
 /// Can be built with [AlternatorConfig] like so:
 /// ```
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
+/// use aws_sdk_dynamodb::config::BehaviorVersion;
+///
 /// let config =
 ///     AlternatorConfig::builder()
-///    .behavior_version_latest()
+///     .behavior_version(BehaviorVersion::v2026_01_12())
 ///     // ...
 ///     .build();
 ///

@@ -15,9 +15,10 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 ///     AlternatorCustomizableOperation,
 ///     RequestCompression,
 /// };
+/// use aws_sdk_dynamodb::config::BehaviorVersion;
 ///
 /// let config = AlternatorConfig::builder()
-///     .behavior_version_latest()
+///     .behavior_version(BehaviorVersion::v2026_01_12())
 ///     .build();
 ///
 /// let client = AlternatorClient::from_conf(config);
@@ -48,10 +49,11 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 ///     AlternatorConfig,
 ///     AlternatorCustomizableOperation,
 /// };
+/// use aws_sdk_dynamodb::config::BehaviorVersion;
 ///
 /// let client = AlternatorClient::from_conf(
 ///     AlternatorConfig::builder()
-///         .behavior_version_latest()
+///         .behavior_version(BehaviorVersion::v2026_01_12())
 ///         .build(),
 /// );
 ///
