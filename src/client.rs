@@ -2,7 +2,8 @@ use crate::*;
 
 /// Alternator driver's client
 ///
-/// A simple wrapper around [aws_sdk_dynamodb::Client], that adds hooks with alternator-specific optimizations.
+/// A client wrapper around [aws_sdk_dynamodb::Client] that adds Alternator
+/// routing, auth defaults, and request/response optimizations.
 ///
 /// By default:
 /// - enables round-robin load balancing
@@ -20,6 +21,14 @@ use crate::*;
 ///     .build();
 ///
 /// let client = AlternatorClient::from_conf(config);
+/// ```
+///
+/// Shared `aws_types::SdkConfig` imports are intentionally unsupported. Build
+/// an [`AlternatorConfig`] explicitly and pass it to [`from_conf`](Self::from_conf).
+///
+/// ```compile_fail
+/// let sdk_config = aws_types::SdkConfig::builder().build();
+/// let _ = alternator_driver::AlternatorClient::new(&sdk_config);
 /// ```
 #[derive(Clone, Debug)]
 pub struct AlternatorClient {
@@ -124,10 +133,6 @@ impl AlternatorClient {
         live_nodes: std::sync::Arc<LiveNodes>,
     ) -> Self {
         Self::from_conf(config.to_builder().live_nodes(live_nodes).build())
-    }
-
-    pub fn new(sdk_config: &aws_types::sdk_config::SdkConfig) -> Self {
-        Self::from_conf(AlternatorConfig::from(sdk_config))
     }
 
     pub fn config(&self) -> &AlternatorConfig {

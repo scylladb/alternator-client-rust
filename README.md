@@ -77,9 +77,26 @@ async fn main() {
 }
 ```
 
-When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK. Alternator supports only SigV4 with static credentials or no-auth; custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are rejected. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
+When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK. Alternator supports no-auth and SigV4 signing through configured or per-request credentials; custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are not exposed. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
 
 This client targets ScyllaDB Alternator. It does not guarantee that Alternator-specific configuration, no-auth defaults, or request optimizations remain compatible with AWS DynamoDB itself.
+
+### Supported configuration surface
+
+Build clients with `AlternatorConfig::builder()` and set Alternator behavior explicitly. The driver intentionally does not import shared `aws_types::SdkConfig` values, because shared SDK config can contain AWS-specific auth and endpoint settings that do not map cleanly to Alternator.
+
+There is no `AlternatorClient::new(&SdkConfig)`, `AlternatorConfig::new(&SdkConfig)`, or `AlternatorConfig::from(&SdkConfig)` shortcut. Start from `AlternatorConfig::builder()` and copy only the supported SDK settings your client needs, such as `region(...)`, `credentials_provider(...)`, `retry_config(...)`, `timeout_config(...)`, `http_client(...)`, `app_name(...)`, or `interceptor(...)`.
+
+Supported auth modes are:
+- no-auth, enabled automatically when no credentials provider is configured, or explicitly with `allow_no_auth()`
+- SigV4 with a credentials provider configured through `credentials_provider(...)`
+- SigV4 with per-request credentials, usually with a client built using `require_auth()`
+
+The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, or custom endpoint resolvers. These APIs are intentionally absent rather than accepted and ignored. Use `endpoint_url(...)` or the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing.
+
+Advanced SDK knobs such as retry settings, timeout settings, HTTP clients, identity cache, and interceptors remain available as escape hatches. Interceptors run alongside the driver's routing, compression, decompression, and header optimization interceptors, so keep ordering effects in mind when using them.
+
+Operation builders are DynamoDB SDK passthroughs for source compatibility, but Alternator support is server-dependent. AWS-only surfaces such as backup/PITR/export/import, global tables, Kinesis streaming destinations, contributor insights, resource policies, tagging, `describe_endpoints`, `describe_limits`, PartiQL, and replica auto-scaling may fail against Alternator unless the server explicitly supports them.
 
 ## Load balancing
 
