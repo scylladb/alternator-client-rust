@@ -780,6 +780,10 @@ impl AlternatorConfig {
         self.dynamodb_config.app_name()
     }
 
+    pub fn framework_metadata(&self) -> Vec<&aws_sdk_dynamodb::config::FrameworkMetadata> {
+        self.dynamodb_config.framework_metadata()
+    }
+
     pub fn invocation_id_generator(
         &self,
     ) -> Option<aws_runtime::invocation_id::SharedInvocationIdGenerator> {
@@ -1039,6 +1043,23 @@ impl AlternatorBuilder {
 
     pub fn set_app_name(&mut self, app_name: Option<aws_types::app_name::AppName>) -> &mut Self {
         self.dynamodb_builder.set_app_name(app_name);
+        self
+    }
+
+    pub fn framework_metadata(
+        mut self,
+        framework_metadata: aws_sdk_dynamodb::config::FrameworkMetadata,
+    ) -> Self {
+        self.dynamodb_builder = self.dynamodb_builder.framework_metadata(framework_metadata);
+        self
+    }
+
+    pub fn push_framework_metadata(
+        &mut self,
+        framework_metadata: aws_sdk_dynamodb::config::FrameworkMetadata,
+    ) -> &mut Self {
+        self.dynamodb_builder
+            .push_framework_metadata(framework_metadata);
         self
     }
 
