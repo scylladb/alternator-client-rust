@@ -46,6 +46,7 @@ impl AlternatorClient {
         let response_compression = extensions.response_compression.unwrap_or_default();
         let optimize_headers = extensions.optimize_headers.unwrap_or(true);
         let user_agent = extensions.user_agent.unwrap_or_default();
+        let preserve_float32_vectors = extensions.preserve_float32_vectors.unwrap_or(false);
         let has_credentials_provider = config.has_credentials_provider();
         let has_region = dynamodb_config.region().is_some();
 
@@ -61,6 +62,7 @@ impl AlternatorClient {
             optimize_headers,
             user_agent,
             has_credentials_provider,
+            preserve_float32_vectors,
         ));
 
         // If live nodes are not in config - create new config with live nodes.

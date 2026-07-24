@@ -68,6 +68,24 @@ impl Ccm {
         alternator_port: u16,
         scylla_version: String,
     ) -> anyhow::Result<Cluster> {
+        Self::create_cluster_with_node_config(
+            cluster_name,
+            topology,
+            ip_prefix,
+            alternator_port,
+            scylla_version,
+            &[],
+        )
+    }
+
+    pub(crate) fn create_cluster_with_node_config(
+        cluster_name: String,
+        topology: &TopologySpec,
+        ip_prefix: IpPrefix,
+        alternator_port: u16,
+        scylla_version: String,
+        node_config: &[String],
+    ) -> anyhow::Result<Cluster> {
         // String of form nodes_in_dc1_RAC1:nodes_in_dc2_RAC1:nodes_in_dc3_RAC1...
         let first_rack_nodes_per_dc = topology.datacenters.iter().map(|dc| dc.racks[0]).join(":");
 
@@ -84,6 +102,7 @@ impl Ccm {
             topology,
             scylla_version,
             alternator_port,
+            node_config,
         ) {
             Ok(cluster) => Ok(cluster),
             Err(e) => {
@@ -105,6 +124,7 @@ impl Ccm {
         topology: &TopologySpec,
         scylla_version: String,
         alternator_port: u16,
+        node_config: &[String],
     ) -> anyhow::Result<Cluster> {
         let mut cluster = Cluster::new(cluster_name, ip_prefix, scylla_version);
 
@@ -150,7 +170,7 @@ impl Ccm {
                             CcmCommandRunner::add_node(&node_name, &ip, &dc_name, &rack_name)?;
                         }
                         let node = Node::new(node_name, ip, alternator_port);
-                        let child = Self::add_alternator_to_node(&node)?;
+                        let child = Self::add_alternator_to_node(&node, node_config)?;
                         pending_updateconfs.push(node.name.clone(), child);
                         rack.add_node(node);
                     }
@@ -206,13 +226,20 @@ impl Ccm {
         Ok(())
     }
 
-    fn add_alternator_to_node(node: &Node) -> anyhow::Result<std::process::Child> {
+    fn add_alternator_to_node(
+        node: &Node,
+        node_config: &[String],
+    ) -> anyhow::Result<std::process::Child> {
         let address = format!("alternator_address:{}", node.ip);
         let port = format!("alternator_port:{}", node.alternator_port);
-        CcmCommandRunner::spawn_update_node_conf(
-            &node.name,
-            &[&address, &port, "alternator_write_isolation:always"],
-        )
+        let mut config = vec![
+            address,
+            port,
+            "alternator_write_isolation:always".to_string(),
+        ];
+        config.extend_from_slice(node_config);
+        let config_refs: Vec<&str> = config.iter().map(String::as_str).collect();
+        CcmCommandRunner::spawn_update_node_conf(&node.name, &config_refs)
     }
 }
 
@@ -236,12 +263,15 @@ impl CcmCommandRunner {
             .output()
             .with_context(|| format!("Failed to run {}", command_str))?;
 
-        // ccm outputs errors on stdout.
+        // ccm outputs errors on stdout, but tracebacks/underlying tool
+        // output (e.g. Docker, download errors) frequently land on stderr;
+        // include both so failures are diagnosable.
         anyhow::ensure!(
             output.status.success(),
-            "\nCommand failed: {}\nccm error message: {}",
+            "\nCommand failed: {}\nccm stdout: {}\nccm stderr: {}",
             command_str,
             String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
 
         Ok(())

@@ -26,7 +26,7 @@ clippy:
 test: up
 	cargo test
 
-.PHONY: ccm-wrapper-tests load-balancing-tests ccm-tests
+.PHONY: ccm-wrapper-tests load-balancing-tests ccm-tests vector-store-e2e
 ccm-wrapper-tests:
 	RUSTFLAGS="--cfg ccm_tests" cargo test --test ccm_wrapper_tests -- --nocapture
 
@@ -34,6 +34,14 @@ load-balancing-tests:
 	RUSTFLAGS="--cfg ccm_tests" cargo test --test load_balancing_tests -- --nocapture
 
 ccm-tests: ccm-wrapper-tests load-balancing-tests
+
+# Opt-in Vector Store E2E test. Requires Docker (for Vector Store only) plus
+# SCYLLA_VECTOR_STORE_IMAGE, SCYLLA_VECTOR_STORE_PORT,
+# SCYLLA_VECTOR_STORE_SCYLLA_VERSION, and SCYLLA_VECTOR_STORE_SCYLLA_CONFIG.
+# Not part of `ccm-tests`/CI: no default Vector Store environment contract is
+# provided.
+vector-store-e2e:
+	RUSTFLAGS="--cfg ccm_tests" cargo test --test vector_store_e2e -- --nocapture
 
 .PHONY: up
 up:

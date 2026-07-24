@@ -36,7 +36,8 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 /// # });
 /// ```
 ///
-/// Only request and response compression are supported here. Use the AWS SDK's
+/// Only request compression, response compression, and
+/// `preserve_float32_vectors` are supported here. Use the AWS SDK's
 /// `config_override(...)` separately for supported SDK-level per-operation
 /// overrides.
 ///
@@ -84,6 +85,12 @@ impl<T, E, B> AlternatorCustomizableOperation<T, E, B> for CustomizableOperation
         if let Some(response_compression) = config_override.response_compression {
             this = this.interceptor(AlternatorOverrideInterceptor::for_response_compression(
                 response_compression,
+            ));
+        }
+
+        if let Some(preserve_float32_vectors) = config_override.preserve_float32_vectors {
+            this = this.interceptor(AlternatorOverrideInterceptor::for_preserve_float32_vectors(
+                preserve_float32_vectors,
             ));
         }
 

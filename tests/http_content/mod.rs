@@ -10,3 +10,4 @@ mod driver_utils;
 pub mod body_compression;
 pub mod correct_line;
 pub mod optimize_headers;
+pub mod vector_search;

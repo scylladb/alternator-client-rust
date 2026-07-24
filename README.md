@@ -466,6 +466,318 @@ client
     .unwrap();
 ```
 
-`alternator_config_override` currently applies only Alternator-specific compression settings: request compression and response compression. Use the AWS SDK's `config_override` separately for supported SDK-level per-operation overrides.
+`alternator_config_override` currently applies only Alternator-specific settings: request compression, response compression, and `preserve_float32_vectors`. Use the AWS SDK's `config_override` separately for supported SDK-level per-operation overrides.
 
-> **Note**: load-balancing, endpoint, and header stripping settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is limited to request/response compression settings.
+> **Note**: load-balancing, endpoint, and header stripping settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is limited to request/response compression and `preserve_float32_vectors` settings.
+
+## Vector search
+
+Alternator's vector-search extensions (`VectorIndexes`, `VectorIndexUpdates`, `VectorSearch`, `Scores`, `FLOAT32VECTOR`) are exposed through extension traits (`CreateTableVectorExt`, `UpdateTableVectorExt`, `QueryVectorExt`, `DescribeTableVectorExt`) implemented directly on the ordinary AWS SDK fluent builders, without forking or patching `aws-sdk-dynamodb`. `FLOAT32VECTOR` response conversion applies to every successful operation performed through [`AlternatorClient`], regardless of whether a vector extension is used. The extension methods are needed only to inject Alternator-specific request fields (`VectorIndexes`, `VectorIndexUpdates`, `VectorSearch`) or to obtain non-SDK response metadata (`Scores`, parsed `VectorIndexes`).
+
+Ordinary AWS SDK request setters (`.table_name(...)`, `.key_condition_expression(...)`, etc.) must precede the vector extension method call: the extension is the boundary after which normal generated builder configuration ends. After that point, `.send()` returns a small response-aware wrapper for `CreateTable`, `Query`, and `DescribeTable` (`UpdateTable` has no extended response and keeps returning the generated `UpdateTableOutput`).
+
+### Creating and describing a table with vector indexes
+
+```rust
+use alternator_driver::*;
+use aws_sdk_dynamodb::types::{AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType};
+
+# async fn example(client: AlternatorClient) -> Result<(), Box<dyn std::error::Error>> {
+let vector_attribute = VectorAttribute::builder()
+    .attribute_name("embedding")
+    .dimensions(128)
+    .build()?;
+
+let index = VectorIndex::builder()
+    .index_name("embedding_idx")
+    .vector_attribute(vector_attribute)
+    .similarity_function(SimilarityFunction::Cosine)
+    .build()?;
+
+let created = client
+    .create_table()
+    .table_name("Documents")
+    .attribute_definitions(
+        AttributeDefinition::builder()
+            .attribute_name("pk")
+            .attribute_type(ScalarAttributeType::S)
+            .build()?,
+    )
+    .key_schema(
+        KeySchemaElement::builder()
+            .attribute_name("pk")
+            .key_type(KeyType::Hash)
+            .build()?,
+    )
+    .billing_mode(BillingMode::PayPerRequest)
+    .vector_indexes(vec![index])   // <-- vector extension boundary
+    .send()
+    .await?;
+
+println!("created indexes: {:?}", created.vector_indexes);
+
+let described = client
+    .describe_table()
+    .table_name("Documents")
+    .with_vector_indexes()
+    .send()
+    .await?;
+for index in &described.vector_indexes {
+    println!("{}: status={:?}", index.index_name, index.index_status);
+}
+# Ok(())
+# }
+```
+
+A `VectorIndex` with no `.projection(...)` configured omits the `Projection` field entirely, so the server applies its own default; this is distinct from explicitly requesting `Projection::keys_only()`.
+
+### Adding or deleting indexes with UpdateTable
+
+`UpdateTable.VectorIndexUpdates` must contain exactly one update per request; an empty list or more than one update fails locally before a request is sent. Vector-index updates also cannot be combined with generated `GlobalSecondaryIndexUpdates` in the same request (and should not be combined with Alternator Streams changes, though the driver cannot always detect that combination locally; the server enforces it). Issue a separate `UpdateTable` call for each index change:
+
+```rust
+use alternator_driver::*;
+
+# async fn example(client: AlternatorClient) -> Result<(), Box<dyn std::error::Error>> {
+let new_index = VectorIndex::builder()
+    .index_name("summary_idx")
+    .vector_attribute(
+        VectorAttribute::builder()
+            .attribute_name("summary_embedding")
+            .dimensions(64)
+            .build()?,
+    )
+    .build()?;
+
+client
+    .update_table()
+    .table_name("Documents")
+    .vector_index_updates(vec![VectorIndexUpdate::Create(new_index)])
+    .send()
+    .await?;
+
+client
+    .update_table()
+    .table_name("Documents")
+    .vector_index_updates(vec![VectorIndexUpdate::Delete { index_name: "old_idx".to_string() }])
+    .send()
+    .await?;
+# Ok(())
+# }
+```
+
+Wait for a newly created index's `index_status` to become `IndexStatus::Active` (via `.describe_table().with_vector_indexes()`) before querying it; the driver does not wait for this automatically.
+
+### Querying by vector similarity
+
+```rust
+use alternator_driver::*;
+
+# async fn example(client: AlternatorClient) -> Result<(), Box<dyn std::error::Error>> {
+let search = VectorSearch::new(vec![0.1, 0.2, 0.3, /* ... */])?
+    .with_return_scores(ReturnScores::Similarity);
+
+let result = client
+    .query()
+    .table_name("Documents")
+    .index_name("embedding_idx")
+    .limit(10)
+    .vector_search(search)
+    .send()
+    .await?;
+
+if let Some(scores) = &result.scores {
+    println!("scores: {:?}", scores);
+}
+for item in result.as_inner().items() {
+    println!("{:?}", item);
+}
+
+// Extended output types do not convert implicitly to their generated
+// counterparts; use `.as_inner()`/`.into_inner()` (or `.into()`, where
+// `From` is implemented) to obtain the plain generated type explicitly.
+let plain_output: aws_sdk_dynamodb::operation::query::QueryOutput = result.into_inner();
+# let _ = plain_output;
+# Ok(())
+# }
+```
+
+`VectorQueryOutput` always contains the normal `QueryOutput` plus `scores: Option<Vec<f64>>`; there is no separate overload for score/no-score queries. `client.query().send()`, without `.vector_search(...)`, is unaffected and continues to return the AWS SDK's own `QueryOutput`.
+
+On the wire, the query vector is nested under `VectorSearch.QueryVector`, alongside `ReturnScores` when requested:
+
+```json
+{ "VectorSearch": { "QueryVector": { "FLOAT32VECTOR": [0.1, 0.2, 0.3] }, "ReturnScores": "SIMILARITY" } }
+```
+
+`VectorSearch::new` builds the compact `FLOAT32VECTOR` form shown above. To send a standard DynamoDB list query vector (`{"L": [{"N": "..."}, ...]}`) instead, use `VectorSearch::from_query_vector` with `AttributeValue::N` values:
+
+```rust
+use alternator_driver::*;
+use aws_sdk_dynamodb::types::AttributeValue;
+
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
+let search = VectorSearch::from_query_vector(vec![
+    AttributeValue::N("0.1".to_string()),
+    AttributeValue::N("0.2".to_string()),
+    AttributeValue::N("0.3".to_string()),
+])?;
+# let _ = search;
+# Ok(())
+# }
+```
+
+A vector-search query is validated locally before it is ever sent, and fails with a local error (no request reaches the server) when:
+
+- `IndexName` is missing.
+- `Limit` is missing, `0`, or greater than `1000` (vector-search queries always require an explicit `Limit` in `1..=1000`).
+- `ConsistentRead(true)` is set.
+- `ExclusiveStartKey` is set.
+- `ScanIndexForward` is set.
+- The legacy `QueryFilter` is set.
+- `ReturnScores::Similarity` is combined with `Select::Count`.
+
+Schema-dependent validation, such as whether the named index actually exists or query-vector dimensionality matches the index, remains server-owned: the driver only rejects combinations it can determine are invalid without contacting the server. `Projection = INCLUDE` and `KeyConditionExpression` support (as a projected-attribute pre-filter) are server-version-dependent; consult your Alternator/Vector Store version's capabilities.
+
+The driver never waits for an index to become ready on your behalf: after `CreateTable`/`UpdateTable`, poll `.describe_table().with_vector_indexes()` yourself until `index_status` is `IndexStatus::Active` before querying it.
+
+### Per-request configuration with `.customize()`
+
+The direct form shown above is equivalent to calling `.customize()` first. Use the `.customize()` form only when you also need a per-operation override, such as `alternator_config_override(...)`:
+
+```rust
+use alternator_driver::*;
+
+# async fn example(client: AlternatorClient) -> Result<(), Box<dyn std::error::Error>> {
+let search = VectorSearch::new(vec![0.1, 0.2, 0.3])?;
+
+let result = client
+    .query()
+    .table_name("Documents")
+    .customize()
+    .vector_search(search)
+    .alternator_config_override(
+        AlternatorConfig::operation_builder().preserve_float32_vectors(true),
+    )
+    .send()
+    .await?;
+# let _ = result;
+# Ok(())
+# }
+```
+
+`preserve_float32_vectors` is set through the general `alternator_config_override(...)` mechanism (see [Per-operation override](#per-operation-override)) rather than a vector-specific setter, and the response-aware wrappers (`VectorQueryOperation`, `VectorCreateTableOperation`, `VectorDescribeTableOperation`) expose it too, so it composes with the direct form:
+
+```rust
+use alternator_driver::*;
+
+# async fn example(client: AlternatorClient) -> Result<(), Box<dyn std::error::Error>> {
+let search = VectorSearch::new(vec![0.1, 0.2, 0.3])?;
+
+let result = client
+    .query()
+    .table_name("Documents")
+    .vector_search(search)
+    .alternator_config_override(
+        AlternatorConfig::operation_builder().preserve_float32_vectors(true),
+    )
+    .send()
+    .await?;
+# let _ = result;
+# Ok(())
+# }
+```
+
+### Writing and reading `FLOAT32VECTOR` attributes
+
+Write compact vectors with `Float32Vector::to_attribute_value`, which produces an ordinary `AttributeValue::B` that the driver recognizes and rewrites to `FLOAT32VECTOR` on the wire. It returns an error if any value is not finite (NaN or infinity), since Alternator serializes vector elements as JSON numbers:
+
+```rust
+use alternator_driver::*;
+use aws_sdk_dynamodb::types::AttributeValue;
+
+# async fn example(client: AlternatorClient) -> Result<(), Box<dyn std::error::Error>> {
+client
+    .put_item()
+    .table_name("Documents")
+    .item("pk", AttributeValue::S("doc-1".into()))
+    .item(
+        "embedding",
+        Float32Vector::to_attribute_value(vec![0.1, 0.2, 0.3])?,
+    )
+    .send()
+    .await?;
+# Ok(())
+# }
+```
+
+By default, reading a `FLOAT32VECTOR` attribute back gives you an ordinary `AttributeValue::L` of `AttributeValue::N` values, matching the Java driver's default and requiring no Alternator-specific types. This conversion applies to every successful operation through `AlternatorClient`, whether or not a vector extension was used to build the request:
+
+```rust
+use alternator_driver::*;
+use aws_sdk_dynamodb::types::AttributeValue;
+
+# async fn example(client: AlternatorClient) -> Result<(), Box<dyn std::error::Error>> {
+let output = client
+    .get_item()
+    .table_name("Documents")
+    .key("pk", AttributeValue::S("doc-1".into()))
+    .send()
+    .await?;
+
+// `embedding` is AttributeValue::L([N("0.1"), N("0.2"), N("0.3")])
+let embedding = output.item().unwrap().get("embedding").unwrap();
+# let _ = embedding;
+# Ok(())
+# }
+```
+
+Ordinary DynamoDB `L` lists of `N` values are never inferred to be vectors: a caller who inserts a plain decimal list gets ordinary DynamoDB list behavior back, never a `FLOAT32VECTOR` conversion.
+
+### Preserving compact storage for read-modify-write
+
+If your application understands optimized vectors and needs a lossless read-modify-write round trip, enable `preserve_float32_vectors`:
+
+```rust
+use alternator_driver::{AlternatorClient, AlternatorConfig};
+
+let client = AlternatorClient::from_conf(
+    AlternatorConfig::builder()
+        .endpoint_url("http://10.0.0.1:8043")
+        .preserve_float32_vectors(true)
+        .behavior_version_latest()
+        .build(),
+);
+```
+
+With this enabled, `FLOAT32VECTOR` responses are decoded into a marker `AttributeValue::B` instead of `L`/`N`. Read it with the `Float32VectorExt` extension trait:
+
+```rust
+use alternator_driver::*;
+use aws_sdk_dynamodb::types::AttributeValue;
+
+# fn example(embedding: &AttributeValue) -> Result<(), Box<dyn std::error::Error>> {
+if embedding.is_float32_vector() {
+    let values: Vec<f32> = embedding.float32_vector()?;
+    println!("{:?}", values);
+}
+# Ok(())
+# }
+```
+
+An item fetched this way can be written back unchanged (e.g. via `PutItem`, `UpdateItem`, or `BatchWriteItem`) and will retain compact `FLOAT32VECTOR` storage, because the marker binary round-trips through the same rewrite the driver applies to values built with `Float32Vector::to_attribute_value`. Without `preserve_float32_vectors`, the default `L`/`N` conversion is not reversible into compact storage: writing back a converted list stores an ordinary DynamoDB list, not a vector.
+
+### Index and vector limits
+
+`VectorAttribute::builder().dimensions(...)` accepts `1..=16000`; values above `16000` are rejected locally when the index is built, before any request is sent.
+
+### Real Vector Store end-to-end tests
+
+`tests/vector_store_e2e.rs` exercises vector search against a real Vector Store instance provisioned through CCM. It is gated behind `--cfg ccm_tests` and is not part of the default `make test`/CI run: it requires Docker (Vector Store itself runs in a container with `--network host`) plus the environment variables `SCYLLA_VECTOR_STORE_IMAGE`, `SCYLLA_VECTOR_STORE_PORT`, `SCYLLA_VECTOR_STORE_SCYLLA_VERSION` (a CCM-resolvable Scylla version with native Vector/Scores support, e.g. `unstable/master:latest`; standard `release:*` versions do not have it yet), and `SCYLLA_VECTOR_STORE_SCYLLA_CONFIG`. Run it with:
+
+```bash
+make vector-store-e2e
+```
+
+See the module doc comment at the top of `tests/vector_store_e2e.rs` for full setup details.
+

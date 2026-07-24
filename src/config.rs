@@ -24,6 +24,7 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) seed_hosts: Option<Vec<String>>,
     pub(crate) live_nodes: Option<std::sync::Arc<LiveNodes>>,
     pub(crate) key_route_affinity: Option<keyrouting::affinity_config::KeyRouteAffinityConfig>,
+    pub(crate) preserve_float32_vectors: Option<bool>,
 }
 
 const INCOMPATIBLE_AUTH_OPTIONS_MESSAGE: &str = "require_auth() cannot be combined with allow_no_auth(): require_auth() makes missing credentials fail before sending an unsigned request, while allow_no_auth() explicitly permits unsigned requests.";
@@ -95,6 +96,15 @@ impl AlternatorConfig {
     /// Turned on by default.
     pub fn optimize_headers(&self) -> Option<bool> {
         self.alternator_ext.optimize_headers
+    }
+
+    /// Whether `FLOAT32VECTOR` response attributes are preserved as compact
+    /// marker binary values instead of the default DynamoDB `L`/`N`
+    /// conversion.
+    ///
+    /// Defaults to `false` when unset.
+    pub fn preserve_float32_vectors(&self) -> Option<bool> {
+        self.alternator_ext.preserve_float32_vectors
     }
 
     /// Gets the configured final `User-Agent` behavior.
@@ -285,6 +295,7 @@ impl AlternatorConfig {
 pub struct AlternatorOperationBuilder {
     pub(crate) request_compression: Option<RequestCompression>,
     pub(crate) response_compression: Option<ResponseCompression>,
+    pub(crate) preserve_float32_vectors: Option<bool>,
 }
 
 impl AlternatorOperationBuilder {
@@ -301,6 +312,16 @@ impl AlternatorOperationBuilder {
     /// Configure which response encodings this request advertises via `Accept-Encoding`.
     pub fn response_compression(mut self, response_compression: ResponseCompression) -> Self {
         self.response_compression = Some(response_compression);
+        self
+    }
+
+    /// Override whether `FLOAT32VECTOR` response attributes are preserved as
+    /// compact marker binary values for this request only.
+    ///
+    /// Takes precedence over the client-level
+    /// [`AlternatorBuilder::preserve_float32_vectors`] setting.
+    pub fn preserve_float32_vectors(mut self, preserve: bool) -> Self {
+        self.preserve_float32_vectors = Some(preserve);
         self
     }
 }
@@ -370,6 +391,26 @@ impl AlternatorBuilder {
     /// Turned on by default.
     pub fn set_optimize_headers(&mut self, optimize: bool) -> &mut Self {
         self.alternator_ext.optimize_headers = Some(optimize);
+        self
+    }
+
+    /// Whether `FLOAT32VECTOR` response attributes should be preserved as
+    /// compact marker binary values (readable via
+    /// [`Float32VectorExt`](crate::Float32VectorExt)) instead of the
+    /// default DynamoDB `L`/`N` conversion.
+    ///
+    /// Defaults to `false`: responses convert `FLOAT32VECTOR` attributes to
+    /// ordinary `AttributeValue::L` lists of `AttributeValue::N`, matching
+    /// the Java driver's default and requiring no Alternator-specific types
+    /// to read vector data.
+    pub fn preserve_float32_vectors(mut self, preserve: bool) -> Self {
+        self.set_preserve_float32_vectors(preserve);
+        self
+    }
+
+    /// Same as [`Self::preserve_float32_vectors`], but by mutable reference.
+    pub fn set_preserve_float32_vectors(&mut self, preserve: bool) -> &mut Self {
+        self.alternator_ext.preserve_float32_vectors = Some(preserve);
         self
     }
 
