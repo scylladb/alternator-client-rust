@@ -43,10 +43,14 @@ Add the crate to your `Cargo.toml`:
 ```toml
 [dependencies]
 alternator-driver = { git = "https://github.com/scylladb/alternator-client-rust" }
-aws-sdk-dynamodb = "1"
-tokio = { version = "1.18", features = ["macros", "rt-multi-thread", "sync", "time"] }
+aws-sdk-dynamodb = { version = "=1.118.0", default-features = false }
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
 ```
 > **Note**: This crate is not yet published to crates.io. Depend on it via the GitHub URL.
+
+Keep the direct `aws-sdk-dynamodb` version aligned with the driver and disable
+its default features. The driver enables the current AWS SDK HTTPS client;
+enabling the SDK's legacy `rustls` feature adds an obsolete transport stack.
 
 Because the Alternator Client follows the AWS SDK for DynamoDB operation builder interface for Alternator-supported features, migration usually starts by replacing `aws_sdk_dynamodb::Client` and its config type, like so:
 

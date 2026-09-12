@@ -63,18 +63,21 @@
 //!
 //! # Start-up
 //!
-//! The task is launched via [`tokio::spawn`], which requires an active Tokio runtime on the calling thread or else it panics.
+//! The task is launched on the current Tokio runtime, which requires an active
+//! runtime on the calling thread.
 //! The client's [`from_conf`] constructor, however, is synchronous and can be called from anywhere.
 //! It is handled by funneling start-up through a single idempotent entry point:
 //! [`ensure_discovery_started`]. It does three things, in order:
 //!
-//! 1. If discovery is already running, return immediately (an atomic load, essentially free).
-//! 2. Runtime check: if no Tokio runtime is available on the current thread, return without spawning.
+//! 1. If discovery is already running on the caller's runtime, return through
+//!    a lock-free fast path. If another runtime owns it, retain that owner while
+//!    a lightweight probe shows the runtime still accepts work.
+//! 2. If no Tokio runtime is available on the current thread, return without spawning.
 //!    The task will be started lazily on the first [`get_next_node_round_robin`] or [`get_live_nodes`] call,
 //!    which is typically invoked from within the request pipeline and therefore from within a runtime.
-//! 3. A `compare_exchange` on `discovery_started` ensures that
-//!    exactly one caller wins the right to spawn the task, even under
-//!    concurrent first-access from multiple threads.
+//! 3. An atomic registration plus a mutex on the cold start or confirmed
+//!    shutdown path ensures that exactly one caller starts the task. A
+//!    task-owned guard clears only its registration when it exits.
 //!
 //! [`AlternatorConfig`]: crate::config::AlternatorConfig
 //! [`RoutingScope`]: crate::routing_scope::RoutingScope
@@ -94,17 +97,151 @@
 //! [`from_conf`]: crate::client::AlternatorClient::from_conf
 
 use crate::routing_scope::RoutingScope;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use futures_util::FutureExt;
 use rand::seq::SliceRandom;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use url::Url;
 
 const DEFAULT_ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// An error encountered while constructing live-node discovery state.
+#[derive(Debug)]
+pub(crate) enum LiveNodesBuildError {
+    MissingRoutingTarget,
+    InvalidSeedHost {
+        seed_host: String,
+        source: url::ParseError,
+    },
+    InvalidScheme(String),
+    TlsConfiguration(String),
+    HttpClient(reqwest::Error),
+}
+
+impl std::fmt::Display for LiveNodesBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingRoutingTarget => formatter.write_str(
+                "no Alternator routing target configured; set endpoint_url or non-empty seed_hosts",
+            ),
+            Self::InvalidSeedHost { seed_host, source } => {
+                write!(formatter, "invalid seed host {seed_host:?}: {source}")
+            }
+            Self::InvalidScheme(scheme) => write!(
+                formatter,
+                "invalid Alternator transport scheme {scheme:?}: expected http or https"
+            ),
+            Self::TlsConfiguration(message) => {
+                write!(formatter, "failed to configure discovery TLS: {message}")
+            }
+            Self::HttpClient(source) => {
+                write!(
+                    formatter,
+                    "failed to build the HTTP client for live-node discovery: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LiveNodesBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MissingRoutingTarget | Self::InvalidScheme(_) => None,
+            Self::InvalidSeedHost { source, .. } => Some(source),
+            Self::TlsConfiguration(_) => None,
+            Self::HttpClient(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(test)]
+fn discovery_http_client_builder(
+    scheme: &str,
+) -> Result<reqwest::ClientBuilder, LiveNodesBuildError> {
+    discovery_http_client_builder_with_root_status(scheme).map(|(builder, _)| builder)
+}
+
+fn discovery_http_client_builder_with_root_status(
+    scheme: &str,
+) -> Result<(reqwest::ClientBuilder, bool), LiveNodesBuildError> {
+    let (roots, errors) = load_native_root_store();
+    let native_roots_usable = !roots.is_empty();
+    if scheme.eq_ignore_ascii_case("https") && !native_roots_usable {
+        return Err(LiveNodesBuildError::TlsConfiguration(
+            unusable_native_roots_message(errors),
+        ));
+    }
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| LiveNodesBuildError::TlsConfiguration(error.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    Ok((
+        reqwest::Client::builder().use_preconfigured_tls(tls_config),
+        native_roots_usable,
+    ))
+}
+
+fn load_native_root_store() -> (rustls::RootCertStore, Vec<String>) {
+    let load_results = rustls_native_certs::load_native_certs();
+    let mut roots = rustls::RootCertStore::empty();
+    let mut errors = load_results
+        .errors
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+
+    for certificate in load_results.certs {
+        if let Err(error) = roots.add(certificate) {
+            errors.push(error.to_string());
+        }
+    }
+
+    (roots, errors)
+}
+
+pub(crate) fn native_roots_are_usable() -> bool {
+    let (roots, _) = load_native_root_store();
+    !roots.is_empty()
+}
+
+pub(crate) fn ensure_native_roots_are_usable() -> Result<(), String> {
+    let (roots, errors) = load_native_root_store();
+    if roots.is_empty() {
+        Err(unusable_native_roots_message(errors))
+    } else {
+        Ok(())
+    }
+}
+
+fn unusable_native_roots_message(errors: Vec<String>) -> String {
+    if errors.is_empty() {
+        "no usable native CA certificates were found".to_string()
+    } else {
+        errors.join("; ")
+    }
+}
+
+fn build_discovery_http_client(
+    scheme: &str,
+) -> Result<(reqwest::Client, bool), LiveNodesBuildError> {
+    let (builder, native_roots_usable) = discovery_http_client_builder_with_root_status(scheme)?;
+    let client = builder
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .map_err(LiveNodesBuildError::HttpClient)?;
+    Ok((client, native_roots_usable))
+}
 
 #[derive(Debug)]
 pub struct LiveNodes {
@@ -117,14 +254,71 @@ pub struct LiveNodes {
     alternator_scheme: String,
     port: Option<u16>,
     client: reqwest::Client,
+    native_roots_usable: bool,
     last_activity: Arc<Mutex<Instant>>,
     notify: Arc<tokio::sync::Notify>,
     bg_task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
-    discovery_started: AtomicBool,
+    discovery_runtime: ArcSwapOption<DiscoveryRuntime>,
+}
+
+#[derive(Debug)]
+struct DiscoveryRuntime {
+    id: tokio::runtime::Id,
+    handle: Handle,
+}
+
+impl DiscoveryRuntime {
+    fn is_shutdown(&self) -> bool {
+        // A live blocking pool either runs this closure or leaves it pending.
+        // Once runtime shutdown starts, spawn_blocking rejects it synchronously
+        // with a cancelled JoinError. Unlike an async probe, this still works
+        // while an async worker cannot drop the discovery task's guard.
+        matches!(
+            self.handle.spawn_blocking(|| ()).now_or_never(),
+            Some(Err(error)) if error.is_cancelled()
+        )
+    }
+}
+
+struct DiscoveryTaskGuard {
+    live_nodes: Weak<LiveNodes>,
+    runtime: Arc<DiscoveryRuntime>,
+}
+
+impl Drop for DiscoveryTaskGuard {
+    fn drop(&mut self) {
+        if let Some(live_nodes) = self.live_nodes.upgrade() {
+            // Clear only this task's exact registration so cleanup can never
+            // erase a newer registration.
+            drop(
+                live_nodes
+                    .discovery_runtime
+                    .compare_and_swap(&self.runtime, None),
+            );
+        }
+    }
 }
 
 impl LiveNodes {
+    /// Creates discovery state from the configured seed hosts.
+    ///
+    /// Returns [`None`] when an SDK endpoint URL is configured and discovery is
+    /// explicitly disabled with an empty seed-host list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if routing configuration is missing or invalid, or if the
+    /// discovery HTTP client cannot be constructed. Invalid routing
+    /// configuration fails closed instead of falling back to an unrelated SDK
+    /// endpoint.
     pub fn new(config: &crate::config::AlternatorConfig) -> Option<Arc<Self>> {
+        Self::try_new(config)
+            .unwrap_or_else(|error| panic!("failed to construct LiveNodes: {error}"))
+    }
+
+    pub(crate) fn try_new(
+        config: &crate::config::AlternatorConfig,
+    ) -> Result<Option<Arc<Self>>, LiveNodesBuildError> {
         let active_interval = config
             .active_interval()
             .unwrap_or(DEFAULT_ACTIVE_REFRESH_INTERVAL);
@@ -136,28 +330,49 @@ impl LiveNodes {
             .unwrap_or(RoutingScope::from_cluster());
         let alternator_scheme = config.scheme().unwrap_or("http".to_string());
         let port = config.port();
-        let seed_nodes = config.seed_hosts().unwrap_or_default();
+        let Some(seed_nodes) = config.seed_hosts() else {
+            return Err(LiveNodesBuildError::MissingRoutingTarget);
+        };
+
+        if seed_nodes.is_empty() {
+            let Some(endpoint_url) = config.endpoint_url() else {
+                return Err(LiveNodesBuildError::MissingRoutingTarget);
+            };
+            if config.http_client().is_none() {
+                let endpoint = Url::parse(endpoint_url)
+                    .map_err(|_| LiveNodesBuildError::MissingRoutingTarget)?;
+                if !endpoint.scheme().eq_ignore_ascii_case("http")
+                    && !endpoint.scheme().eq_ignore_ascii_case("https")
+                {
+                    return Err(LiveNodesBuildError::InvalidScheme(
+                        endpoint.scheme().to_string(),
+                    ));
+                }
+            }
+            return Ok(None);
+        }
+
+        if !alternator_scheme.eq_ignore_ascii_case("http")
+            && !alternator_scheme.eq_ignore_ascii_case("https")
+        {
+            return Err(LiveNodesBuildError::InvalidScheme(alternator_scheme));
+        }
 
         let mut seed_urls = seed_nodes
             .iter()
-            .filter_map(|addr| {
-                build_node_url(&alternator_scheme, addr, port)
-                    .ok()
+            .map(|seed_host| {
+                build_seed_url(&alternator_scheme, seed_host, port)
                     .map(Arc::new)
+                    .map_err(|source| LiveNodesBuildError::InvalidSeedHost {
+                        seed_host: seed_host.clone(),
+                        source,
+                    })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         seed_urls.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-        if seed_urls.is_empty() {
-            return None;
-        }
+        let (client, native_roots_usable) = build_discovery_http_client(seed_urls[0].scheme())?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(2))
-            .build()
-            .ok()?;
-
-        Some(Arc::new(Self {
+        Ok(Some(Arc::new(Self {
             routing_scope,
             active_interval,
             idle_interval,
@@ -167,11 +382,20 @@ impl LiveNodes {
             alternator_scheme,
             port,
             client,
+            native_roots_usable,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             notify: Arc::new(tokio::sync::Notify::new()),
             bg_task: std::sync::Mutex::new(None),
-            discovery_started: AtomicBool::new(false),
-        }))
+            discovery_runtime: ArcSwapOption::empty(),
+        })))
+    }
+
+    pub(crate) fn scheme(&self) -> &str {
+        self.seed_urls[0].scheme()
+    }
+
+    pub(crate) fn has_usable_native_roots(&self) -> bool {
+        self.native_roots_usable
     }
 
     fn host_to_uri(&self, addr: &str) -> Result<Url, url::ParseError> {
@@ -242,31 +466,58 @@ impl LiveNodes {
     /// Ensures the background discovery task is running.
     ///
     /// Idempotent and safe to call from any context: returns immediately if
-    /// discovery is already started, or if no Tokio runtime is available.
+    /// discovery is already running on a live Tokio runtime, or if no runtime
+    /// is available. A caller on another runtime keeps a healthy owner stable,
+    /// but takes ownership when a probe confirms that the old runtime has shut
+    /// down.
     pub fn ensure_discovery_started(self: &Arc<Self>) {
-        if self.discovery_started.load(Ordering::Acquire) {
+        let Ok(handle) = Handle::try_current() else {
             return;
-        }
-
-        if Handle::try_current().is_err() {
-            return;
-        }
-
+        };
+        let runtime_id = handle.id();
+        // Requests on the owning runtime never take the start/transfer mutex.
+        // A caller on another runtime transfers only after a probe spawned on
+        // the owner is synchronously rejected because its scheduler is closed.
         if self
-            .discovery_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .discovery_runtime
+            .load()
+            .as_ref()
+            .is_some_and(|active| active.id == runtime_id || !active.is_shutdown())
         {
-            Arc::clone(self).start();
+            return;
         }
-    }
 
-    fn start(self: Arc<Self>) {
-        let weak_self = Arc::downgrade(&self);
+        let mut bg_task = self.bg_task.lock().unwrap_or_else(|err| err.into_inner());
+        // Another caller may have completed the cold start or transfer while
+        // this caller waited for the mutex.
+        if self
+            .discovery_runtime
+            .load()
+            .as_ref()
+            .is_some_and(|active| active.id == runtime_id || !active.is_shutdown())
+        {
+            return;
+        }
+
+        if let Some(old_task) = bg_task.take() {
+            old_task.abort();
+        }
+
+        let runtime = Arc::new(DiscoveryRuntime {
+            id: runtime_id,
+            handle: handle.clone(),
+        });
+        self.discovery_runtime.store(Some(runtime.clone()));
+        let weak_self = Arc::downgrade(self);
         let notify = self.notify.clone();
+        let task_guard = DiscoveryTaskGuard {
+            live_nodes: weak_self.clone(),
+            runtime: runtime.clone(),
+        };
 
         self.mark_activity();
-        let handle = tokio::spawn(async move {
+        let task = handle.spawn(async move {
+            let _task_guard = task_guard;
             loop {
                 let (idle_interval, active_interval, is_idle) = {
                     let Some(strong_self) = weak_self.upgrade() else {
@@ -293,10 +544,7 @@ impl LiveNodes {
                 }
             }
         });
-
-        if let Ok(mut guard) = self.bg_task.lock() {
-            *guard = Some(handle.abort_handle());
-        }
+        *bg_task = Some(task.abort_handle());
     }
 
     fn mark_activity(&self) {
@@ -400,6 +648,17 @@ impl LiveNodes {
     }
 }
 
+fn build_seed_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, url::ParseError> {
+    let unbracketed = addr
+        .strip_prefix('[')
+        .and_then(|addr| addr.strip_suffix(']'))
+        .unwrap_or(addr);
+    if unbracketed.parse::<std::net::Ipv6Addr>().is_err() {
+        url::Host::parse(addr)?;
+    }
+    build_node_url(scheme, unbracketed, port)
+}
+
 fn build_node_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, url::ParseError> {
     let authority = if addr.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{addr}]")
@@ -436,6 +695,10 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn discovery_is_running(nodes: &LiveNodes) -> bool {
+        nodes.discovery_runtime.load().is_some()
+    }
 
     fn test_config() -> AlternatorConfig {
         AlternatorConfig::builder()
@@ -478,44 +741,359 @@ mod tests {
         (port, server)
     }
 
+    fn start_runtime_restart_server() -> (u16, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = request_count.clone();
+        let server = std::thread::spawn(move || {
+            for body in [r#"["127.0.0.1"]"#, r#"["127.0.0.2"]"#] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = Vec::new();
+                while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut chunk = [0; 512];
+                    let length = stream.read(&mut chunk).unwrap();
+                    assert!(length > 0, "request ended before its headers");
+                    buffer.extend_from_slice(&chunk[..length]);
+                }
+                let request = String::from_utf8_lossy(&buffer);
+                assert!(request.starts_with("GET /localnodes HTTP/1.1"));
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                server_request_count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        (port, request_count, server)
+    }
+
     #[test]
     fn start_without_runtime_does_not_panic() {
         let nodes = LiveNodes::new(&test_config()).unwrap();
         LiveNodes::ensure_discovery_started(&nodes);
-        assert!(!nodes.discovery_started.load(Ordering::Acquire));
+        assert!(!discovery_is_running(&nodes));
     }
 
     #[tokio::test]
     async fn start_with_runtime_starts_correctly() {
         let nodes = LiveNodes::new(&test_config()).unwrap();
         LiveNodes::ensure_discovery_started(&nodes);
-        assert!(nodes.discovery_started.load(Ordering::Acquire));
+        assert!(discovery_is_running(&nodes));
     }
 
     #[test]
     fn start_on_first_access_round_robin() {
         let nodes = LiveNodes::new(&test_config()).unwrap();
         LiveNodes::ensure_discovery_started(&nodes);
-        assert!(!nodes.discovery_started.load(Ordering::Acquire));
+        assert!(!discovery_is_running(&nodes));
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let _ = nodes.get_next_node_round_robin(&std::collections::HashSet::new());
         });
-        assert!(nodes.discovery_started.load(Ordering::Acquire));
+        assert!(discovery_is_running(&nodes));
     }
 
     #[test]
     fn start_on_first_access() {
         let nodes = LiveNodes::new(&test_config()).unwrap();
         LiveNodes::ensure_discovery_started(&nodes);
-        assert!(!nodes.discovery_started.load(Ordering::Acquire));
+        assert!(!discovery_is_running(&nodes));
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let _ = nodes.get_live_nodes();
         });
-        assert!(nodes.discovery_started.load(Ordering::Acquire));
+        assert!(discovery_is_running(&nodes));
+    }
+
+    #[test]
+    fn discovery_restarts_after_its_runtime_is_dropped() {
+        let (port, request_count, server) = start_runtime_restart_server();
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url(format!("http://127.0.0.1:{port}"))
+            .active_interval(Duration::from_secs(60 * 60))
+            .idle_interval(Duration::from_secs(60 * 60))
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                nodes.ensure_discovery_started();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while request_count.load(Ordering::SeqCst) < 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("first runtime did not perform discovery");
+            });
+            drop(runtime);
+        }
+
+        {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                nodes.ensure_discovery_started();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let current_nodes = nodes.get_live_nodes();
+                        if request_count.load(Ordering::SeqCst) >= 2
+                            && current_nodes[0].host_str() == Some("127.0.0.2")
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("second runtime did not restart discovery");
+            });
+            drop(runtime);
+        }
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn healthy_discovery_owner_is_stable_across_runtimes() {
+        let nodes = LiveNodes::new(&test_config()).unwrap();
+        let first_runtime = tokio::runtime::Runtime::new().unwrap();
+        let second_runtime = tokio::runtime::Runtime::new().unwrap();
+
+        first_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let original_registration = nodes.discovery_runtime.load_full().unwrap();
+
+        second_runtime.block_on(async {
+            for _ in 0..10 {
+                let _ = nodes.get_live_nodes();
+            }
+        });
+
+        let current_registration = nodes.discovery_runtime.load_full().unwrap();
+        assert!(Arc::ptr_eq(&original_registration, &current_registration));
+    }
+
+    #[test]
+    fn first_access_hands_discovery_off_after_background_runtime_shutdown() {
+        let (port, request_count, server) = start_runtime_restart_server();
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url(format!("http://127.0.0.1:{port}"))
+            .active_interval(Duration::from_secs(60 * 60))
+            .idle_interval(Duration::from_secs(60 * 60))
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        let first_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        first_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while request_count.load(Ordering::SeqCst) < 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("first runtime did not perform discovery");
+        });
+
+        // Keep the only worker occupied so shutdown_background returns before
+        // it can drop the discovery future and run its task guard.
+        let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(0);
+        first_runtime.spawn(async move {
+            blocker_started_tx.send(()).unwrap();
+            release_blocker_rx.recv().unwrap();
+        });
+        blocker_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime worker was not blocked");
+
+        let second_runtime = tokio::runtime::Runtime::new().unwrap();
+        first_runtime.shutdown_background();
+        second_runtime.block_on(async {
+            // This one access must be enough to transfer to the replacement
+            // runtime even though the old task guard cannot run yet.
+            let _ = nodes.get_live_nodes();
+        });
+
+        let restarted = second_runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while request_count.load(Ordering::SeqCst) < 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        });
+        release_blocker_tx.send(()).unwrap();
+        restarted.expect("discovery was not handed off to the replacement runtime");
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stale_task_guard_does_not_clear_replacement_registration() {
+        let nodes = LiveNodes::new(&test_config()).unwrap();
+        let first_runtime = tokio::runtime::Runtime::new().unwrap();
+        let second_runtime = tokio::runtime::Runtime::new().unwrap();
+        let first = Arc::new(DiscoveryRuntime {
+            id: first_runtime.handle().id(),
+            handle: first_runtime.handle().clone(),
+        });
+        let second = Arc::new(DiscoveryRuntime {
+            id: second_runtime.handle().id(),
+            handle: second_runtime.handle().clone(),
+        });
+
+        nodes.discovery_runtime.store(Some(first.clone()));
+        let stale_guard = DiscoveryTaskGuard {
+            live_nodes: Arc::downgrade(&nodes),
+            runtime: first,
+        };
+        nodes.discovery_runtime.store(Some(second.clone()));
+
+        drop(stale_guard);
+
+        let active = nodes.discovery_runtime.load_full().unwrap();
+        assert!(Arc::ptr_eq(&active, &second));
+
+        drop(DiscoveryTaskGuard {
+            live_nodes: Arc::downgrade(&nodes),
+            runtime: second,
+        });
+        assert!(nodes.discovery_runtime.load().is_none());
+    }
+
+    #[test]
+    fn empty_seed_hosts_with_an_endpoint_disable_discovery() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("http://127.0.0.1:8000")
+            .seed_hosts(Vec::<String>::new())
+            .build();
+
+        assert!(LiveNodes::try_new(&config).unwrap().is_none());
+        assert!(crate::AlternatorClient::try_from_conf(config).is_ok());
+    }
+
+    #[test]
+    fn direct_endpoint_validation_uses_the_endpoint_scheme() {
+        for (endpoint, discovery_scheme, expected_scheme) in
+            [("ftp://host", "http", "ftp"), ("ws://host", "https", "ws")]
+        {
+            let config = AlternatorConfig::builder()
+                .behavior_version_latest()
+                .endpoint_url(endpoint)
+                .seed_hosts(Vec::<String>::new())
+                .scheme(discovery_scheme)
+                .build();
+
+            assert!(matches!(
+                LiveNodes::try_new(&config),
+                Err(LiveNodesBuildError::InvalidScheme(scheme))
+                    if scheme == expected_scheme
+            ));
+            assert!(crate::AlternatorClient::try_from_conf(config).is_err());
+        }
+
+        let direct_http = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("http://host")
+            .seed_hosts(Vec::<String>::new())
+            .scheme("ftp")
+            .build();
+        assert!(LiveNodes::try_new(&direct_http).unwrap().is_none());
+        assert!(crate::AlternatorClient::try_from_conf(direct_http).is_ok());
+    }
+
+    #[test]
+    fn custom_http_client_defers_direct_scheme_validation() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("custom://host")
+            .seed_hosts(Vec::<String>::new())
+            .http_client(aws_smithy_http_client::Builder::new().build_http())
+            .build();
+
+        assert!(LiveNodes::try_new(&config).unwrap().is_none());
+        assert!(crate::AlternatorClient::try_from_conf(config).is_ok());
+    }
+
+    #[test]
+    fn missing_seed_hosts_and_endpoint_are_rejected() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .build();
+
+        assert!(matches!(
+            LiveNodes::try_new(&config),
+            Err(LiveNodesBuildError::MissingRoutingTarget)
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid seed host")]
+    fn malformed_seed_host_fails_closed_even_when_another_seed_is_valid() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .seed_hosts(["127.0.0.1", "127.0.0.1:invalid"])
+            .build();
+
+        let _ = LiveNodes::new(&config);
+    }
+
+    #[test]
+    fn seed_hosts_reject_url_components_and_ports() {
+        for seed_host in [
+            "127.0.0.1@dynamodb.us-east-1.amazonaws.com",
+            "example.com/path",
+            "example.com?query",
+            "example.com#fragment",
+            "example.com:8000",
+        ] {
+            let config = AlternatorConfig::builder()
+                .behavior_version_latest()
+                .scheme("http")
+                .seed_hosts([seed_host])
+                .build();
+
+            assert!(matches!(
+                LiveNodes::try_new(&config),
+                Err(LiveNodesBuildError::InvalidSeedHost { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_unsupported_and_url_shaped_schemes() {
+        for scheme in ["ftp", "https://dynamodb.us-east-1.amazonaws.com/x"] {
+            let config = AlternatorConfig::builder()
+                .behavior_version_latest()
+                .scheme(scheme)
+                .seed_hosts(["127.0.0.1"])
+                .build();
+
+            assert!(matches!(
+                LiveNodes::try_new(&config),
+                Err(LiveNodesBuildError::InvalidScheme(invalid)) if invalid == scheme
+            ));
+        }
     }
 
     #[test]
@@ -663,7 +1241,8 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
             ],
         );
-        Arc::get_mut(&mut nodes).unwrap().client = reqwest::Client::builder()
+        Arc::get_mut(&mut nodes).unwrap().client = discovery_http_client_builder("http")
+            .unwrap()
             .timeout(Duration::from_millis(200))
             .connect_timeout(Duration::from_millis(100))
             .resolve_to_addrs(
@@ -760,7 +1339,8 @@ mod tests {
             .iter()
             .map(|ip| SocketAddr::new(*ip, port))
             .collect::<Vec<_>>();
-        Arc::get_mut(&mut nodes).unwrap().client = reqwest::Client::builder()
+        Arc::get_mut(&mut nodes).unwrap().client = discovery_http_client_builder("http")
+            .unwrap()
             .timeout(Duration::from_secs(1))
             .connect_timeout(Duration::from_millis(500))
             .resolve_to_addrs("dual.test", &addresses)

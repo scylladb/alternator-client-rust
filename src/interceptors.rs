@@ -153,9 +153,10 @@ impl Intercept for AlternatorInterceptor {
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         // Take the next node from the query plan and override the request URI.
-        if let Some(query_plan) = cfg.interceptor_state().load::<QueryPlan>()
-            && let Some(next_node) = query_plan.next_node()
-        {
+        if let Some(query_plan) = cfg.interceptor_state().load::<QueryPlan>() {
+            let next_node = query_plan.next_node().ok_or(
+                "query plan exhausted before the request could be routed to an Alternator node",
+            )?;
             let request = context.request_mut();
             let mut current = url::Url::parse(request.uri())?;
             current
@@ -477,6 +478,9 @@ mod tests {
     use aws_sdk_dynamodb::config::{BehaviorVersion, Region};
     use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemInput;
     use aws_sdk_dynamodb::types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest};
+    use aws_smithy_runtime_api::client::interceptors::context::InterceptorContext;
+    use aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder;
+    use aws_smithy_runtime_api::http::Request;
     use std::collections::HashMap;
 
     fn s(value: &str) -> AttributeValue {
@@ -603,6 +607,39 @@ mod tests {
             }
         }
         expected
+    }
+
+    #[test]
+    fn exhausted_query_plan_rejects_unrouted_sdk_endpoint() {
+        const SDK_ENDPOINT: &str = "https://dynamodb.us-east-1.amazonaws.com/";
+
+        let query_plan = QueryPlan::new_basic(make_live_nodes());
+        while query_plan.next_node().is_some() {}
+
+        let mut cfg = ConfigBag::base();
+        cfg.interceptor_state().store_put(query_plan);
+
+        let mut inner_context = InterceptorContext::new(Input::erase(()));
+        inner_context.enter_serialization_phase();
+        inner_context.take_input();
+        inner_context.set_request(Request::get(SDK_ENDPOINT).unwrap());
+        inner_context.enter_before_transmit_phase();
+        let mut context = BeforeTransmitInterceptorContextMut::from(&mut inner_context);
+        let runtime_components = RuntimeComponentsBuilder::for_tests().build().unwrap();
+        let interceptor = AlternatorInterceptor::new(
+            RequestCompression::disabled(),
+            ResponseCompression::disabled(),
+            false,
+            UserAgent::disabled(),
+            false,
+        );
+
+        let error = interceptor
+            .modify_before_signing(&mut context, &runtime_components, &mut cfg)
+            .expect_err("an exhausted query plan must fail closed");
+
+        assert!(error.to_string().contains("query plan exhausted"));
+        assert_eq!(context.request().uri(), SDK_ENDPOINT);
     }
 
     fn preferred_node_for_key(live_nodes: &Arc<LiveNodes>, key: &str) -> String {

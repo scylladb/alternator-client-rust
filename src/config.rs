@@ -30,14 +30,38 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) has_credentials_provider: bool,
     pub(crate) require_auth: bool,
     pub(crate) allow_no_auth: bool,
+    pub(crate) behavior_version: Option<aws_sdk_dynamodb::config::BehaviorVersion>,
     pub(crate) active_interval: Option<std::time::Duration>,
     pub(crate) idle_interval: Option<std::time::Duration>,
     pub(crate) routing_scope: Option<RoutingScope>,
     pub(crate) scheme: Option<String>,
     pub(crate) port: Option<u16>,
     pub(crate) seed_hosts: Option<Vec<String>>,
-    pub(crate) live_nodes: Option<std::sync::Arc<LiveNodes>>,
+    pub(crate) endpoint_url: Option<String>,
+    pub(crate) live_nodes: Option<ConfiguredLiveNodes>,
     pub(crate) key_route_affinity: Option<keyrouting::affinity_config::KeyRouteAffinityConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ConfiguredLiveNodes {
+    AutoCreated(std::sync::Arc<LiveNodes>),
+    ExplicitlyShared(std::sync::Arc<LiveNodes>),
+}
+
+impl ConfiguredLiveNodes {
+    fn nodes(&self) -> std::sync::Arc<LiveNodes> {
+        match self {
+            Self::AutoCreated(nodes) | Self::ExplicitlyShared(nodes) => nodes.clone(),
+        }
+    }
+}
+
+impl AlternatorExtensions {
+    fn invalidate_auto_live_nodes(&mut self) {
+        if matches!(self.live_nodes, Some(ConfiguredLiveNodes::AutoCreated(_))) {
+            self.live_nodes = None;
+        }
+    }
 }
 
 const INCOMPATIBLE_AUTH_OPTIONS_MESSAGE: &str = "require_auth() cannot be combined with allow_no_auth(): require_auth() makes missing credentials fail before sending an unsigned request, while allow_no_auth() explicitly permits unsigned requests.";
@@ -65,6 +89,7 @@ fn incompatible_auth_options() -> ! {
 /// let config =
 ///     AlternatorConfig::builder()
 ///     .behavior_version_latest()
+///     .endpoint_url("http://127.0.0.1:8000")
 ///     // ...
 ///     .build();
 ///
@@ -218,23 +243,42 @@ impl AlternatorConfig {
     ///
     /// The seed hosts are the initial endpoints (IP addresses or hostnames) used to discover the full cluster topology.
     /// Use with [`AlternatorBuilder::scheme`] and [`AlternatorBuilder::port`] to construct the endpoint URIs.
+    /// An explicitly empty list disables discovery and requires an SDK endpoint
+    /// URL to be configured.
     pub fn seed_hosts(&self) -> Option<Vec<String>> {
         self.alternator_ext.seed_hosts.clone()
+    }
+
+    pub(crate) fn endpoint_url(&self) -> Option<&str> {
+        self.alternator_ext.endpoint_url.as_deref()
+    }
+
+    pub(crate) fn behavior_version(&self) -> Option<aws_sdk_dynamodb::config::BehaviorVersion> {
+        self.alternator_ext.behavior_version
     }
 
     /// The [`LiveNodes`] instance shared into this config, if any.
     ///
     /// On a config you have built but not yet used, this is [`None`] unless you
     /// set it via [`live_nodes`], and [`None`] means a client built from it will
-    /// construct its own. On the config a client stores ([`config()`]), this is
-    /// populated: the constructor sets the instance it created so the stored config
-    /// reflects what the client actually uses. It is [`None`] there only if
-    /// constructing [`LiveNodes`] failed.
+    /// construct its own discovery state. On the config a client stores
+    /// ([`config()`]), this is populated with that automatically created state
+    /// unless discovery was explicitly disabled with an empty seed-host list.
+    ///
+    /// Rebuilding a client-stored config preserves automatically created state
+    /// while changing unrelated settings. Changing a discovery setting (seed
+    /// hosts, endpoint, scheme, port, routing scope, or refresh intervals)
+    /// invalidates automatically created state so the next client constructs a
+    /// matching instance. A [`LiveNodes`] value supplied explicitly through
+    /// [`live_nodes`] remains shared and keeps its own discovery settings.
     ///
     /// [`live_nodes`]: Self::live_nodes
     /// [`config()`]: AlternatorClient::config
     pub fn live_nodes(&self) -> Option<std::sync::Arc<LiveNodes>> {
-        self.alternator_ext.live_nodes.clone()
+        self.alternator_ext
+            .live_nodes
+            .as_ref()
+            .map(ConfiguredLiveNodes::nodes)
     }
 
     /// Gets the key route affinity configuration.
@@ -266,6 +310,7 @@ impl AlternatorConfig {
 /// let client = AlternatorClient::from_conf(
 ///     AlternatorConfig::builder()
 ///         .behavior_version_latest()
+///         .endpoint_url("http://127.0.0.1:8000")
 ///         .build(),
 /// );
 ///
@@ -339,6 +384,7 @@ impl AlternatorOperationBuilder {
 /// let config =
 ///     AlternatorConfig::builder()
 ///    .behavior_version_latest()
+///    .endpoint_url("http://127.0.0.1:8000")
 ///     // ...
 ///     .build();
 ///
@@ -500,6 +546,7 @@ impl AlternatorBuilder {
     ///
     /// The default value is 1 second.
     pub fn set_active_interval(&mut self, active_interval: std::time::Duration) -> &mut Self {
+        self.alternator_ext.invalidate_auto_live_nodes();
         self.alternator_ext.active_interval = Some(active_interval);
         self
     }
@@ -528,6 +575,7 @@ impl AlternatorBuilder {
     ///
     /// The default value is 1 minute.
     pub fn set_idle_interval(&mut self, idle_interval: std::time::Duration) -> &mut Self {
+        self.alternator_ext.invalidate_auto_live_nodes();
         self.alternator_ext.idle_interval = Some(idle_interval);
         self
     }
@@ -570,6 +618,7 @@ impl AlternatorBuilder {
     /// Making a fallback narrower, e.g., (datacenter -> rack) or (cluster -> datacenter),
     /// may be redundant if the set of nodes in the next scope is a subset of the previous one.
     pub fn set_routing_scope(&mut self, routing_scope: RoutingScope) -> &mut Self {
+        self.alternator_ext.invalidate_auto_live_nodes();
         self.alternator_ext.routing_scope = Some(routing_scope);
         self
     }
@@ -577,6 +626,7 @@ impl AlternatorBuilder {
     /// Sets the URI scheme (http or https).
     ///
     /// Accepts for example "http", "http:", "http://" — stores just "http", same with "https".
+    /// Other values are rejected when constructing an [`AlternatorClient`].
     pub fn scheme(mut self, scheme: impl Into<String>) -> Self {
         self.set_scheme(scheme);
         self
@@ -585,7 +635,9 @@ impl AlternatorBuilder {
     /// Sets the URI scheme (http or https).
     ///
     /// Accepts for example "http", "http:", "http://" — stores just "http", same with "https".
+    /// Other values are rejected when constructing an [`AlternatorClient`].
     pub fn set_scheme(&mut self, scheme: impl Into<String>) -> &mut Self {
+        self.alternator_ext.invalidate_auto_live_nodes();
         let s = scheme.into();
 
         let normalized = s.trim_end_matches('/').trim_end_matches(':').to_string();
@@ -601,6 +653,7 @@ impl AlternatorBuilder {
 
     /// Port number for alternator connections
     pub fn set_port(&mut self, port: u16) -> &mut Self {
+        self.alternator_ext.invalidate_auto_live_nodes();
         self.alternator_ext.port = Some(port);
         self
     }
@@ -609,6 +662,8 @@ impl AlternatorBuilder {
     ///
     /// The seed hosts are the initial endpoints (IP addresses or hostnames) used to discover the full cluster topology.
     /// Use with [`AlternatorBuilder::scheme`] and [`AlternatorBuilder::port`] to construct the endpoint URIs.
+    /// An explicitly empty list disables discovery and requires an SDK endpoint
+    /// URL to be configured.
     pub fn seed_hosts<I, S>(mut self, seed_hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -622,7 +677,10 @@ impl AlternatorBuilder {
     ///
     /// The seed hosts are the initial endpoints (IP addresses or hostnames) used to discover the full cluster topology.
     /// Use with [`AlternatorBuilder::scheme`] and [`AlternatorBuilder::port`] to construct the endpoint URIs.
+    /// An explicitly empty list disables discovery and requires an SDK endpoint
+    /// URL to be configured.
     pub fn set_seed_hosts(&mut self, seed_hosts: Vec<String>) -> &mut Self {
+        self.alternator_ext.invalidate_auto_live_nodes();
         self.alternator_ext.seed_hosts = Some(seed_hosts);
         self
     }
@@ -697,7 +755,12 @@ impl AlternatorBuilder {
     ///
     /// [`Arc`]: std::sync::Arc
     pub fn set_live_nodes(&mut self, live_nodes: std::sync::Arc<LiveNodes>) -> &mut Self {
-        self.alternator_ext.live_nodes = Some(live_nodes);
+        self.alternator_ext.live_nodes = Some(ConfiguredLiveNodes::ExplicitlyShared(live_nodes));
+        self
+    }
+
+    pub(crate) fn auto_created_live_nodes(mut self, live_nodes: std::sync::Arc<LiveNodes>) -> Self {
+        self.alternator_ext.live_nodes = Some(ConfiguredLiveNodes::AutoCreated(live_nodes));
         self
     }
 
@@ -1099,6 +1162,8 @@ impl AlternatorBuilder {
     }
 
     pub fn set_endpoint_url(&mut self, endpoint_url: Option<String>) -> &mut Self {
+        self.alternator_ext.invalidate_auto_live_nodes();
+        self.alternator_ext.endpoint_url = None;
         // Reset everything upfront to avoid stale fields.
         self.alternator_ext.seed_hosts = None;
         self.alternator_ext.scheme = None;
@@ -1108,6 +1173,7 @@ impl AlternatorBuilder {
             && let Ok(url) = url::Url::parse(url_str)
             && let Some(host) = url.host_str()
         {
+            self.alternator_ext.endpoint_url = Some(url_str.to_string());
             self.set_seed_hosts(vec![host.to_string()]);
             self.set_scheme(url.scheme());
             if let Some(port) = url.port() {
@@ -1155,7 +1221,7 @@ impl AlternatorBuilder {
         mut self,
         behavior_version: aws_sdk_dynamodb::config::BehaviorVersion,
     ) -> Self {
-        self.dynamodb_builder = self.dynamodb_builder.behavior_version(behavior_version);
+        self.set_behavior_version(Some(behavior_version));
         self
     }
 
@@ -1163,11 +1229,14 @@ impl AlternatorBuilder {
         &mut self,
         behavior_version: Option<aws_sdk_dynamodb::config::BehaviorVersion>,
     ) -> &mut Self {
+        self.alternator_ext.behavior_version = behavior_version;
         self.dynamodb_builder.set_behavior_version(behavior_version);
         self
     }
 
     pub fn behavior_version_latest(mut self) -> Self {
+        self.alternator_ext.behavior_version =
+            Some(aws_sdk_dynamodb::config::BehaviorVersion::latest());
         self.dynamodb_builder = self.dynamodb_builder.behavior_version_latest();
         self
     }
@@ -1317,6 +1386,7 @@ mod test {
     fn from_conf_does_not_panic_without_runtime() {
         let config = AlternatorConfig::builder()
             .behavior_version_latest()
+            .endpoint_url("http://127.0.0.1:8000")
             .build();
         let _ = AlternatorClient::from_conf(config);
     }
@@ -1330,6 +1400,7 @@ mod test {
         assert_eq!(config.seed_hosts(), Some(vec!["127.0.0.1".to_string()]));
         assert_eq!(config.scheme(), Some("http".to_string()));
         assert_eq!(config.port(), Some(8000));
+        assert_eq!(config.endpoint_url(), Some("http://127.0.0.1:8000"));
 
         let mut new_builder = config.to_builder();
         new_builder.set_endpoint_url(None);
@@ -1338,6 +1409,7 @@ mod test {
         assert_eq!(new_config.seed_hosts(), None);
         assert_eq!(new_config.scheme(), None);
         assert_eq!(new_config.port(), None);
+        assert_eq!(new_config.endpoint_url(), None);
     }
 
     #[test]
@@ -1388,6 +1460,116 @@ mod test {
         assert!(std::sync::Arc::ptr_eq(
             &client1.config().live_nodes().unwrap(),
             &client2.config().live_nodes().unwrap()
+        ));
+    }
+
+    #[test]
+    fn discovery_setters_invalidate_auto_created_live_nodes() {
+        let client = AlternatorClient::from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:8000")
+                .build(),
+        );
+        let original = client.config().live_nodes().unwrap();
+
+        let rebuilt_configs = [
+            client
+                .config()
+                .to_builder()
+                .active_interval(std::time::Duration::from_secs(2))
+                .build(),
+            client
+                .config()
+                .to_builder()
+                .idle_interval(std::time::Duration::from_secs(120))
+                .build(),
+            client
+                .config()
+                .to_builder()
+                .routing_scope(RoutingScope::from_datacenter("dc1".to_string()))
+                .build(),
+            client.config().to_builder().scheme("https").build(),
+            client.config().to_builder().port(9000).build(),
+            client
+                .config()
+                .to_builder()
+                .seed_hosts(["127.0.0.2"])
+                .build(),
+            client
+                .config()
+                .to_builder()
+                .endpoint_url("http://127.0.0.2:9000")
+                .build(),
+        ];
+
+        for rebuilt_config in rebuilt_configs {
+            assert!(rebuilt_config.live_nodes().is_none());
+            let rebuilt_client = AlternatorClient::from_conf(rebuilt_config);
+            let rebuilt = rebuilt_client.config().live_nodes().unwrap();
+            assert!(!std::sync::Arc::ptr_eq(&original, &rebuilt));
+        }
+    }
+
+    #[test]
+    fn client_derived_config_retargets_or_disables_discovery() {
+        let client = AlternatorClient::from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:8000")
+                .build(),
+        );
+
+        let retargeted = AlternatorClient::from_conf(
+            client
+                .config()
+                .to_builder()
+                .endpoint_url("http://127.0.0.2:9000")
+                .build(),
+        );
+        let retargeted_nodes = retargeted.config().live_nodes().unwrap().get_live_nodes();
+        assert_eq!(retargeted_nodes[0].as_str(), "http://127.0.0.2:9000/");
+
+        let direct = AlternatorClient::from_conf(
+            client
+                .config()
+                .to_builder()
+                .endpoint_url("http://load-balancer.example.com:8043")
+                .seed_hosts(Vec::<String>::new())
+                .build(),
+        );
+        assert!(direct.config().live_nodes().is_none());
+    }
+
+    #[test]
+    fn discovery_setters_preserve_explicitly_shared_live_nodes() {
+        let discovery_config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("http://127.0.0.1:8000")
+            .build();
+        let shared = LiveNodes::new(&discovery_config).unwrap();
+        let client = AlternatorClient::from_conf_with_live_nodes(discovery_config, shared.clone());
+
+        let rebuilt_config = client
+            .config()
+            .to_builder()
+            .active_interval(std::time::Duration::from_secs(2))
+            .idle_interval(std::time::Duration::from_secs(120))
+            .routing_scope(RoutingScope::from_datacenter("dc1".to_string()))
+            .scheme("https")
+            .port(9000)
+            .seed_hosts(["127.0.0.2"])
+            .endpoint_url("http://127.0.0.2:9000")
+            .build();
+
+        assert!(std::sync::Arc::ptr_eq(
+            &shared,
+            &rebuilt_config.live_nodes().unwrap()
+        ));
+        let rebuilt_client = AlternatorClient::from_conf(rebuilt_config);
+        assert!(std::sync::Arc::ptr_eq(
+            &shared,
+            &rebuilt_client.config().live_nodes().unwrap()
         ));
     }
 

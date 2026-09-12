@@ -146,6 +146,11 @@ async fn check_if_correct_nodes_are_up(
 // It allows running simpler tests, ones that do not need a special cluster setup to be run without involving ccm.
 #[cfg_attr(not(ccm_tests), ignore)]
 async fn ccm_wrapper_test_cluster() -> Result<(), Box<dyn std::error::Error>> {
+    // The driver's reqwest dependency intentionally leaves rustls provider
+    // selection to each client. These standalone HTTP helpers use reqwest's
+    // default client, so install the same AWS-LC provider first.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let topology = TopologySpecBuilder::new()
         .datacenter(DatacenterSpec::new().rack(1))
         .datacenter(DatacenterSpec::new().rack(1).rack(2))
