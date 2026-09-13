@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::live_nodes::{
+    LiveNodesBuildError, ensure_native_roots_are_usable, native_roots_are_usable,
+};
 use crate::*;
 
 /// Alternator driver's client
@@ -31,6 +34,7 @@ use crate::*;
 /// let config =
 ///     AlternatorConfig::builder()
 ///    .behavior_version_latest()
+///    .endpoint_url("http://127.0.0.1:8000")
 ///     // ...
 ///     .build();
 ///
@@ -49,8 +53,112 @@ pub struct AlternatorClient {
     dynamodb_client: aws_sdk_dynamodb::Client,
     config: AlternatorConfig,
 }
+
+/// Error returned when an [`AlternatorClient`] cannot be constructed safely.
+#[derive(Debug)]
+pub struct AlternatorClientBuildError {
+    kind: AlternatorClientBuildErrorKind,
+}
+
+#[derive(Debug)]
+enum AlternatorClientBuildErrorKind {
+    TlsConfiguration(String),
+    LiveNodes(LiveNodesBuildError),
+}
+
+impl std::fmt::Display for AlternatorClientBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            AlternatorClientBuildErrorKind::TlsConfiguration(message) => {
+                write!(formatter, "failed to configure SDK TLS: {message}")
+            }
+            AlternatorClientBuildErrorKind::LiveNodes(source) => {
+                write!(
+                    formatter,
+                    "failed to configure Alternator routing: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AlternatorClientBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            AlternatorClientBuildErrorKind::TlsConfiguration(_) => None,
+            AlternatorClientBuildErrorKind::LiveNodes(source) => Some(source),
+        }
+    }
+}
+
+impl From<LiveNodesBuildError> for AlternatorClientBuildError {
+    fn from(source: LiveNodesBuildError) -> Self {
+        Self {
+            kind: AlternatorClientBuildErrorKind::LiveNodes(source),
+        }
+    }
+}
+
+fn sdk_http_client(
+    behavior_version: aws_sdk_dynamodb::config::BehaviorVersion,
+    use_tls: bool,
+) -> aws_sdk_dynamodb::config::SharedHttpClient {
+    aws_smithy_http_client::Builder::new().build_with_connector_fn(
+        move |settings, runtime_components| {
+            let mut connector = aws_smithy_http_client::ConnectorBuilder::default();
+            connector.set_connector_settings(settings.cloned());
+            if let Some(components) = runtime_components {
+                connector.set_sleep_impl(components.sleep_impl());
+            }
+
+            #[allow(deprecated)]
+            let proxy_config = if behavior_version
+                .is_at_least(aws_sdk_dynamodb::config::BehaviorVersion::v2025_08_07())
+            {
+                aws_smithy_http_client::proxy::ProxyConfig::from_env()
+            } else {
+                aws_smithy_http_client::proxy::ProxyConfig::disabled()
+            };
+            connector.set_proxy_config(Some(proxy_config));
+
+            if use_tls {
+                connector
+                    .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                        aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+                    ))
+                    .build()
+            } else {
+                connector.build_http()
+            }
+        },
+    )
+}
+
 impl AlternatorClient {
+    /// Constructs a client, panicking if its routing configuration is invalid.
+    ///
+    /// Use [`Self::try_from_conf`] when configuration comes from a fallible or
+    /// externally supplied source.
+    ///
+    /// # Panics
+    ///
+    /// Panics when routing configuration is missing or invalid, or when
+    /// required HTTP or TLS resources cannot be built.
     pub fn from_conf(config: AlternatorConfig) -> Self {
+        Self::try_from_conf(config)
+            .unwrap_or_else(|error| panic!("failed to construct AlternatorClient: {error}"))
+    }
+
+    /// Tries to construct a client after validating required SDK and routing
+    /// configuration.
+    pub fn try_from_conf(config: AlternatorConfig) -> Result<Self, AlternatorClientBuildError> {
+        // The SDK's behavior-version-latest feature supplies this default
+        // during client construction. Mirror it here for transport selection,
+        // while preserving any explicitly configured older version.
+        let behavior_version = config
+            .behavior_version()
+            .unwrap_or_else(aws_sdk_dynamodb::config::BehaviorVersion::latest);
+
         let dynamodb_config = config.dynamodb_config.clone();
         let extensions = config.alternator_ext.clone();
 
@@ -80,12 +188,59 @@ impl AlternatorClient {
         // If live nodes are not in config - create new config with live nodes.
         let (config, live_nodes) = if let Some(nodes) = config.live_nodes() {
             (config, Some(nodes))
-        } else if let Some(nodes) = LiveNodes::new(&config) {
-            let config = config.to_builder().live_nodes(nodes.clone()).build();
+        } else if let Some(nodes) = LiveNodes::try_new(&config)? {
+            let config = config
+                .to_builder()
+                .auto_created_live_nodes(nodes.clone())
+                .build();
             (config, Some(nodes))
         } else {
             (config, None)
         };
+
+        let uses_plaintext_transport = live_nodes
+            .as_ref()
+            .is_some_and(|nodes| nodes.scheme() == "http")
+            || live_nodes.is_none()
+                && config
+                    .endpoint_url()
+                    .and_then(|endpoint| url::Url::parse(endpoint).ok())
+                    .is_some_and(|endpoint| endpoint.scheme() == "http");
+        let uses_direct_https_transport = live_nodes.is_none()
+            && config
+                .endpoint_url()
+                .and_then(|endpoint| url::Url::parse(endpoint).ok())
+                .is_some_and(|endpoint| endpoint.scheme() == "https");
+        let has_custom_http_client = dynamodb_config.http_client().is_some();
+
+        if uses_direct_https_transport && !has_custom_http_client {
+            ensure_native_roots_are_usable().map_err(|message| AlternatorClientBuildError {
+                kind: AlternatorClientBuildErrorKind::TlsConfiguration(message),
+            })?;
+        }
+
+        if !has_custom_http_client {
+            // The SDK only selects its modern default connector for v2026 and
+            // newer behavior versions. Supply that connector explicitly for
+            // older versions instead of re-enabling the legacy Hyper stack.
+            let needs_pre_2026_transport = !behavior_version
+                .is_at_least(aws_sdk_dynamodb::config::BehaviorVersion::v2026_01_12());
+            // A TLS-capable connector eagerly validates native roots even for
+            // an HTTP endpoint, so use an HTTP-only connector when no roots
+            // are available.
+            let needs_rootless_plaintext_transport = uses_plaintext_transport
+                && !live_nodes
+                    .as_ref()
+                    .map(|nodes| nodes.has_usable_native_roots())
+                    .unwrap_or_else(native_roots_are_usable);
+
+            if needs_pre_2026_transport || needs_rootless_plaintext_transport {
+                builder.set_http_client(Some(sdk_http_client(
+                    behavior_version,
+                    !needs_rootless_plaintext_transport,
+                )));
+            }
+        }
 
         if !has_region {
             builder = builder.region(Some(aws_sdk_dynamodb::config::Region::from_static(
@@ -136,10 +291,10 @@ impl AlternatorClient {
             nodes.ensure_discovery_started();
         }
 
-        Self {
+        Ok(Self {
             dynamodb_client,
             config,
-        }
+        })
     }
 
     pub fn from_conf_with_live_nodes(
@@ -540,6 +695,7 @@ mod tests {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
                 .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
 
@@ -562,6 +718,7 @@ mod tests {
             AlternatorConfig::builder()
                 .optimize_headers(true)
                 .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
 
@@ -574,5 +731,82 @@ mod tests {
                 .expect("does not have length"),
             0
         )
+    }
+
+    #[test]
+    fn try_from_conf_honors_sdk_behavior_version_default() {
+        let client = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .endpoint_url("http://127.0.0.1:8000")
+                .seed_hosts(Vec::<String>::new())
+                .build(),
+        );
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn try_from_conf_rejects_missing_or_invalid_routing_configuration() {
+        let missing = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .build(),
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("no Alternator routing target"));
+
+        let invalid = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .scheme("http")
+                .seed_hosts(["127.0.0.1:invalid"])
+                .build(),
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("invalid seed host"));
+
+        let invalid_scheme = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .scheme("https://dynamodb.us-east-1.amazonaws.com/x")
+                .seed_hosts(["127.0.0.1"])
+                .build(),
+        )
+        .unwrap_err();
+        assert!(
+            invalid_scheme
+                .to_string()
+                .contains("invalid Alternator transport scheme")
+        );
+
+        let invalid_direct = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .endpoint_url("not a URL")
+                .seed_hosts(Vec::<String>::new())
+                .build(),
+        )
+        .unwrap_err();
+        assert!(
+            invalid_direct
+                .to_string()
+                .contains("no Alternator routing target")
+        );
+
+        for endpoint in ["ftp://host", "ws://host"] {
+            let unsupported_direct = AlternatorClient::try_from_conf(
+                AlternatorConfig::builder()
+                    .behavior_version_latest()
+                    .endpoint_url(endpoint)
+                    .seed_hosts(Vec::<String>::new())
+                    .build(),
+            )
+            .unwrap_err();
+            assert!(
+                unsupported_direct
+                    .to_string()
+                    .contains("invalid Alternator transport scheme")
+            );
+        }
     }
 }

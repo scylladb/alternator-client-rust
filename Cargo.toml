@@ -19,47 +19,48 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
-aws-sdk-dynamodb = "=1.118.0"
-aws-smithy-async = "1.2.7"
-aws-smithy-runtime = "1.9.8"
-aws-smithy-runtime-api = "1.10.0"
-aws-types = "1.3.11"
-aws-runtime = "1.5.18"
-tokio = { version = "1", features = ["full"] }
-aws-smithy-types = { version = "1.3.6", features = ["http-body-1-x"] }
+aws-sdk-dynamodb = { version = "=1.118.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-smithy-async = "1.3.0"
+aws-smithy-http-client = { version = "1.2.0", default-features = false, features = ["rustls-aws-lc"] }
+aws-smithy-runtime = "1.12.0"
+aws-smithy-runtime-api = "1.13.0"
+aws-types = "1.5.0"
+aws-runtime = "1.9.0"
+tokio = { version = "1.49", features = ["full"] }
+aws-smithy-types = { version = "1.6.1", features = ["http-body-1-x"] }
 flate2 = "1.1.5"
-http-body-util = "0.1"
-anyhow = "1.0.102"
+http-body-util = "0.1.3"
 itertools = "0.14.0"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12.16", default-features = false, features = ["json", "rustls-tls-manual-roots-no-provider"] }
+rustls = { version = "0.23.31", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8.1"
 url = "2.5.8"
 arc-swap = "1.9.1"
 rand = "0.10.1"
 dashmap = "6.1.0"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
 futures-util = "0.3"
-http-body = "1.0"
-bytes = "1"
+http-body = "1.0.1"
+bytes = "1.11.1"
 
 [dev-dependencies]
-aws-sdk-dynamodb = { version = "=1.118.0", features = ["test-util"] }
-aws-smithy-types = "1.3.6"
-aws-smithy-http-client = { version = "1.1.5", features = ["rustls-aws-lc"] }
+anyhow = "1.0.103"
+aws-credential-types = { version = "1.3.0", features = ["test-util"] }
+aws-smithy-types = "1.6.1"
 uuid = { version = "1.22.0", features = ["v4"] }
 hyper = { version = "1.8", features = ["client", "server", "http1"] }
-http = "1.0"
-http-body-util = "0.1"
-hyper-util = "0.1"
+http = "1.3.1"
+http-body-util = "0.1.3"
+hyper-util = "0.1.16"
 serial_test = "3.2.0"
 futures = "0.3.31"
 test-context = "0.5.5"
 rustdoc-types = "0.56.0"
 serde_json = "1.0"
 rcgen = "0.13"
-rustls = "0.23"
-tokio-rustls = "0.26"
-rustls-pki-types = "1"
+tokio-rustls = "0.26.2"
+rustls-pki-types = "1.12.0"
 ctor = "0.8.0"
 
 [lints.rust]
