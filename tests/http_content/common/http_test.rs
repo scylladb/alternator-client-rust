@@ -42,7 +42,7 @@
 //! **Note:** Since load balancing is enabled automatically, the GET requests
 //! from discovery may interfere with the test logic. To work around this, you
 //! can disable load balancing by setting an empty list of seed hosts in the
-//! client configuration with `.seed_hosts(Vec::<String>::new())`.
+//! client configuration with `.without_discovery()`.
 
 use crate::http_content::proxy::*;
 
@@ -150,6 +150,25 @@ impl<Config: HttpTestConfig> HttpTestContext<Config> {
 
     pub fn get_proxy_address(&self) -> String {
         self.proxy_address.clone()
+    }
+
+    /// Host part of the proxy address, for use as a seed host.
+    pub fn get_proxy_host(&self) -> String {
+        self.proxy_address
+            .rsplit_once(':')
+            .expect("proxy address has a port")
+            .0
+            .to_string()
+    }
+
+    /// Port part of the proxy address, for use with `AlternatorBuilder::port`.
+    pub fn get_proxy_port(&self) -> u16 {
+        self.proxy_address
+            .rsplit_once(':')
+            .expect("proxy address has a port")
+            .1
+            .parse()
+            .expect("proxy address port is numeric")
     }
 
     pub fn register_resource(&mut self, resource_name: String) {

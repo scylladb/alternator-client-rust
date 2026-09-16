@@ -159,7 +159,8 @@ fn create_client_with_scope_and_affinity(
 ) -> AlternatorClient {
     AlternatorClient::from_conf(
         minimal_builder()
-            .endpoint_url(default_endpoint_url(cluster))
+            .seed_hosts([default_seed_host(cluster)])
+            .port(default_seed_port(cluster))
             .routing_scope(scope)
             .key_route_affinity(affinity_config)
             .build(),
@@ -825,16 +826,13 @@ async fn bad_scope_test() {
     let n = 20;
     make_n_calls(&client, n).await;
     // With a bad scope, the client should call only the seed.
-    let seed_url = default_endpoint_url(cluster);
-    let seed_ip = seed_url
-        .strip_prefix("http://")
-        .unwrap()
-        .split(':')
-        .next()
-        .unwrap();
+    let seed_ip = default_seed_host(cluster);
 
-    assert!(request_counter.get_posts_to_ips(&[seed_ip]) >= n);
-    assert_eq!(request_counter.get_posts_to_other_ips(&[seed_ip]), 0);
+    assert!(request_counter.get_posts_to_ips(&[seed_ip.as_str()]) >= n);
+    assert_eq!(
+        request_counter.get_posts_to_other_ips(&[seed_ip.as_str()]),
+        0
+    );
 }
 
 // Check only if the restarted node gets requests from client.

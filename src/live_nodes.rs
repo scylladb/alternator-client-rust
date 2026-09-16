@@ -101,7 +101,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use futures_util::FutureExt;
 use rand::seq::SliceRandom;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
@@ -126,9 +126,8 @@ pub(crate) enum LiveNodesBuildError {
 impl std::fmt::Display for LiveNodesBuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingRoutingTarget => formatter.write_str(
-                "no Alternator routing target configured; set endpoint_url or non-empty seed_hosts",
-            ),
+            Self::MissingRoutingTarget => formatter
+                .write_str("no Alternator routing target configured; set non-empty seed_hosts"),
             Self::InvalidSeedHost { seed_host, source } => {
                 write!(formatter, "invalid seed host {seed_host:?}: {source}")
             }
@@ -243,6 +242,13 @@ fn build_discovery_http_client(
     Ok((client, native_roots_usable))
 }
 
+/// Shared state for Alternator node discovery and client-side routing.
+///
+/// Most clients should let [`AlternatorClient::from_conf`] construct this
+/// automatically. Construct and share a [`LiveNodes`] instance explicitly only
+/// when multiple clients should reuse one background discovery task.
+///
+/// [`AlternatorClient::from_conf`]: crate::client::AlternatorClient::from_conf
 #[derive(Debug)]
 pub struct LiveNodes {
     routing_scope: RoutingScope,
@@ -261,22 +267,68 @@ pub struct LiveNodes {
     discovery_runtime: ArcSwapOption<DiscoveryRuntime>,
 }
 
+/// How long a "still running" probe result is reused before the owning
+/// runtime is probed again.
+///
+/// [`LiveNodes::ensure_discovery_started`] runs on every request, so an
+/// unconditional probe would put a blocking-pool task on the routing path of
+/// every request made from a runtime that does not own discovery. Handing
+/// discovery over this much later than the shutdown is harmless next to
+/// refresh intervals measured in seconds.
+const SHUTDOWN_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
 #[derive(Debug)]
 struct DiscoveryRuntime {
     id: tokio::runtime::Id,
     handle: Handle,
+    /// Cached probe result. Shutdown is terminal, so it is only ever cached
+    /// once it is observed.
+    shutdown: AtomicBool,
+    last_probe: Mutex<Option<Instant>>,
 }
 
 impl DiscoveryRuntime {
+    fn new(id: tokio::runtime::Id, handle: Handle) -> Self {
+        Self {
+            id,
+            handle,
+            shutdown: AtomicBool::new(false),
+            last_probe: Mutex::new(None),
+        }
+    }
+
     fn is_shutdown(&self) -> bool {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+
+        {
+            let mut last_probe = self
+                .last_probe
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let now = Instant::now();
+            match *last_probe {
+                Some(previous) if now.duration_since(previous) < SHUTDOWN_PROBE_INTERVAL => {
+                    return false;
+                }
+                _ => *last_probe = Some(now),
+            }
+        }
+
         // A live blocking pool either runs this closure or leaves it pending.
         // Once runtime shutdown starts, spawn_blocking rejects it synchronously
         // with a cancelled JoinError. Unlike an async probe, this still works
         // while an async worker cannot drop the discovery task's guard.
-        matches!(
+        let shutdown = matches!(
             self.handle.spawn_blocking(|| ()).now_or_never(),
             Some(Err(error)) if error.is_cancelled()
-        )
+        );
+        if shutdown {
+            self.shutdown.store(true, Ordering::Relaxed);
+        }
+
+        shutdown
     }
 }
 
@@ -302,8 +354,9 @@ impl Drop for DiscoveryTaskGuard {
 impl LiveNodes {
     /// Creates discovery state from the configured seed hosts.
     ///
-    /// Returns [`None`] when an SDK endpoint URL is configured and discovery is
-    /// explicitly disabled with an empty seed-host list.
+    /// Returns [`None`] when discovery is turned off with
+    /// [`AlternatorBuilder::without_discovery`](crate::config::AlternatorBuilder::without_discovery),
+    /// in which case requests go straight to the first seed host.
     ///
     /// # Panics
     ///
@@ -333,21 +386,28 @@ impl LiveNodes {
         let Some(seed_nodes) = config.seed_hosts() else {
             return Err(LiveNodesBuildError::MissingRoutingTarget);
         };
+        let Some(first_seed) = seed_nodes.first() else {
+            return Err(LiveNodesBuildError::MissingRoutingTarget);
+        };
 
-        if seed_nodes.is_empty() {
-            let Some(endpoint_url) = config.endpoint_url() else {
-                return Err(LiveNodesBuildError::MissingRoutingTarget);
-            };
-            if config.http_client().is_none() {
-                let endpoint = Url::parse(endpoint_url)
-                    .map_err(|_| LiveNodesBuildError::MissingRoutingTarget)?;
-                if !endpoint.scheme().eq_ignore_ascii_case("http")
-                    && !endpoint.scheme().eq_ignore_ascii_case("https")
-                {
-                    return Err(LiveNodesBuildError::InvalidScheme(
-                        endpoint.scheme().to_string(),
-                    ));
-                }
+        if config.without_discovery() {
+            // Requests go to the seed host itself, so it has to be a usable
+            // target even though nothing is discovered through it. A custom
+            // HTTP client may speak a scheme this driver does not know.
+            let endpoint =
+                build_seed_url(&alternator_scheme, first_seed, port).map_err(|source| {
+                    LiveNodesBuildError::InvalidSeedHost {
+                        seed_host: first_seed.clone(),
+                        source,
+                    }
+                })?;
+            if config.http_client().is_none()
+                && !endpoint.scheme().eq_ignore_ascii_case("http")
+                && !endpoint.scheme().eq_ignore_ascii_case("https")
+            {
+                return Err(LiveNodesBuildError::InvalidScheme(
+                    endpoint.scheme().to_string(),
+                ));
             }
             return Ok(None);
         }
@@ -503,10 +563,7 @@ impl LiveNodes {
             old_task.abort();
         }
 
-        let runtime = Arc::new(DiscoveryRuntime {
-            id: runtime_id,
-            handle: handle.clone(),
-        });
+        let runtime = Arc::new(DiscoveryRuntime::new(runtime_id, handle.clone()));
         self.discovery_runtime.store(Some(runtime.clone()));
         let weak_self = Arc::downgrade(self);
         let notify = self.notify.clone();
@@ -565,7 +622,7 @@ impl LiveNodes {
     }
 
     /// Returns the first live node not in `used_nodes` starting with the next node in round-robin order.
-    /// Used by [`crate::QueryPlan`] round-robin strategy.
+    /// Used by the internal round-robin query plan.
     pub fn get_next_node_round_robin(
         self: &Arc<Self>,
         used_nodes: &std::collections::HashSet<Arc<Url>>,
@@ -648,7 +705,11 @@ impl LiveNodes {
     }
 }
 
-fn build_seed_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, url::ParseError> {
+pub(crate) fn build_seed_url(
+    scheme: &str,
+    addr: &str,
+    port: Option<u16>,
+) -> Result<Url, url::ParseError> {
     let unbracketed = addr
         .strip_prefix('[')
         .and_then(|addr| addr.strip_suffix(']'))
@@ -702,8 +763,8 @@ mod tests {
 
     fn test_config() -> AlternatorConfig {
         AlternatorConfig::builder()
-            .behavior_version_latest()
-            .endpoint_url("http://127.0.0.1:1".to_string())
+            .seed_hosts(["127.0.0.1"])
+            .port(1)
             .build()
     }
 
@@ -818,8 +879,8 @@ mod tests {
     fn discovery_restarts_after_its_runtime_is_dropped() {
         let (port, request_count, server) = start_runtime_restart_server();
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
-            .endpoint_url(format!("http://127.0.0.1:{port}"))
+            .seed_hosts(["127.0.0.1"])
+            .port(port)
             .active_interval(Duration::from_secs(60 * 60))
             .idle_interval(Duration::from_secs(60 * 60))
             .build();
@@ -889,8 +950,8 @@ mod tests {
     fn first_access_hands_discovery_off_after_background_runtime_shutdown() {
         let (port, request_count, server) = start_runtime_restart_server();
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
-            .endpoint_url(format!("http://127.0.0.1:{port}"))
+            .seed_hosts(["127.0.0.1"])
+            .port(port)
             .active_interval(Duration::from_secs(60 * 60))
             .idle_interval(Duration::from_secs(60 * 60))
             .build();
@@ -951,14 +1012,14 @@ mod tests {
         let nodes = LiveNodes::new(&test_config()).unwrap();
         let first_runtime = tokio::runtime::Runtime::new().unwrap();
         let second_runtime = tokio::runtime::Runtime::new().unwrap();
-        let first = Arc::new(DiscoveryRuntime {
-            id: first_runtime.handle().id(),
-            handle: first_runtime.handle().clone(),
-        });
-        let second = Arc::new(DiscoveryRuntime {
-            id: second_runtime.handle().id(),
-            handle: second_runtime.handle().clone(),
-        });
+        let first = Arc::new(DiscoveryRuntime::new(
+            first_runtime.handle().id(),
+            first_runtime.handle().clone(),
+        ));
+        let second = Arc::new(DiscoveryRuntime::new(
+            second_runtime.handle().id(),
+            second_runtime.handle().clone(),
+        ));
 
         nodes.discovery_runtime.store(Some(first.clone()));
         let stale_guard = DiscoveryTaskGuard {
@@ -980,11 +1041,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_seed_hosts_with_an_endpoint_disable_discovery() {
+    fn without_discovery_disables_discovery() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
-            .endpoint_url("http://127.0.0.1:8000")
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .without_discovery()
             .build();
 
         assert!(LiveNodes::try_new(&config).unwrap().is_none());
@@ -992,41 +1053,53 @@ mod tests {
     }
 
     #[test]
-    fn direct_endpoint_validation_uses_the_endpoint_scheme() {
-        for (endpoint, discovery_scheme, expected_scheme) in
-            [("ftp://host", "http", "ftp"), ("ws://host", "https", "ws")]
-        {
+    fn direct_routing_validates_the_configured_scheme() {
+        for unsupported_scheme in ["ftp", "ws"] {
             let config = AlternatorConfig::builder()
-                .behavior_version_latest()
-                .endpoint_url(endpoint)
-                .seed_hosts(Vec::<String>::new())
-                .scheme(discovery_scheme)
+                .seed_hosts(["host"])
+                .without_discovery()
+                .scheme(unsupported_scheme)
                 .build();
 
             assert!(matches!(
                 LiveNodes::try_new(&config),
                 Err(LiveNodesBuildError::InvalidScheme(scheme))
-                    if scheme == expected_scheme
+                    if scheme == unsupported_scheme
             ));
             assert!(crate::AlternatorClient::try_from_conf(config).is_err());
         }
 
         let direct_http = AlternatorConfig::builder()
-            .behavior_version_latest()
-            .endpoint_url("http://host")
-            .seed_hosts(Vec::<String>::new())
-            .scheme("ftp")
+            .seed_hosts(["host"])
+            .without_discovery()
+            .scheme("https")
             .build();
         assert!(LiveNodes::try_new(&direct_http).unwrap().is_none());
         assert!(crate::AlternatorClient::try_from_conf(direct_http).is_ok());
     }
 
     #[test]
+    fn without_discovery_needs_a_seed_host() {
+        for config in [
+            AlternatorConfig::builder().without_discovery().build(),
+            AlternatorConfig::builder()
+                .seed_hosts(Vec::<String>::new())
+                .without_discovery()
+                .build(),
+        ] {
+            assert!(matches!(
+                LiveNodes::try_new(&config),
+                Err(LiveNodesBuildError::MissingRoutingTarget)
+            ));
+        }
+    }
+
+    #[test]
     fn custom_http_client_defers_direct_scheme_validation() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
-            .endpoint_url("custom://host")
-            .seed_hosts(Vec::<String>::new())
+            .scheme("custom")
+            .seed_hosts(["host"])
+            .without_discovery()
             .http_client(aws_smithy_http_client::Builder::new().build_http())
             .build();
 
@@ -1036,9 +1109,7 @@ mod tests {
 
     #[test]
     fn missing_seed_hosts_and_endpoint_are_rejected() {
-        let config = AlternatorConfig::builder()
-            .behavior_version_latest()
-            .build();
+        let config = AlternatorConfig::builder().build();
 
         assert!(matches!(
             LiveNodes::try_new(&config),
@@ -1050,7 +1121,6 @@ mod tests {
     #[should_panic(expected = "invalid seed host")]
     fn malformed_seed_host_fails_closed_even_when_another_seed_is_valid() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .seed_hosts(["127.0.0.1", "127.0.0.1:invalid"])
             .build();
@@ -1068,7 +1138,6 @@ mod tests {
             "example.com:8000",
         ] {
             let config = AlternatorConfig::builder()
-                .behavior_version_latest()
                 .scheme("http")
                 .seed_hosts([seed_host])
                 .build();
@@ -1084,7 +1153,6 @@ mod tests {
     fn discovery_rejects_unsupported_and_url_shaped_schemes() {
         for scheme in ["ftp", "https://dynamodb.us-east-1.amazonaws.com/x"] {
             let config = AlternatorConfig::builder()
-                .behavior_version_latest()
                 .scheme(scheme)
                 .seed_hosts(["127.0.0.1"])
                 .build();
@@ -1099,8 +1167,8 @@ mod tests {
     #[test]
     fn ipv6_address_parsing() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
-            .endpoint_url("http://[::1]:8000".to_string())
+            .seed_hosts(["[::1]"])
+            .port(8000)
             .build();
         let nodes = LiveNodes::new(&config).unwrap();
         assert_eq!(nodes.seed_urls[0].scheme(), "http");
@@ -1112,7 +1180,6 @@ mod tests {
     #[test]
     fn raw_ipv6_seed_host_is_bracketed() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(8000)
             .seed_hosts(["::1"])
@@ -1127,7 +1194,6 @@ mod tests {
     async fn raw_ipv6_seed_discovers_raw_ipv6_node() {
         let (port, server) = start_localnodes_server_on("[::1]:0", "[::1]", r#"["::1"]"#).await;
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(["::1"])
@@ -1147,7 +1213,6 @@ mod tests {
     async fn dns_entrypoint_discovers_dns_node_records() {
         let (port, server) = start_localnodes_server(r#"["localhost","node-a.internal"]"#).await;
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(vec!["localhost".to_string()])
@@ -1172,7 +1237,6 @@ mod tests {
         let (port, server) =
             start_localnodes_server(r#"["node-a.internal:9000","node-b.internal"]"#).await;
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(vec!["localhost".to_string()])
@@ -1266,7 +1330,6 @@ mod tests {
     async fn refresh_recovers_through_original_raw_ipv6_seed() {
         let (port, server) = start_localnodes_server_on("[::1]:0", "[::1]", r#"["::1"]"#).await;
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(["::1"])
@@ -1329,7 +1392,6 @@ mod tests {
 
     fn dns_live_nodes(port: u16, resolved_ips: &[IpAddr]) -> Arc<LiveNodes> {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(["dual.test"])

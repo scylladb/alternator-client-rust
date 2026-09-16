@@ -62,9 +62,10 @@ pub enum KeyRouteAffinityType {
 /// Or when passing it directly to `AlternatorConfig::builder()`:
 /// ```
 /// use alternator_driver::{AlternatorClient, AlternatorConfig, KeyRouteAffinityType};
+///
 /// let config = AlternatorConfig::builder()
-///     .behavior_version_latest()
-///     .endpoint_url("http://127.0.0.1:8000")
+///     .seed_hosts(["127.0.0.1"])
+///     .port(8000)
 ///     .key_route_affinity(KeyRouteAffinityType::Rmw)
 ///     .build();
 /// let client = AlternatorClient::from_conf(config);

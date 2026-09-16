@@ -22,7 +22,7 @@
 //!
 //! Two scenarios:
 //!
-//! - Load balancing **off** (`seed_hosts([])`, as in the http_content tests):
+//! - Load balancing **off** (`without_discovery()`, as in the http_content tests):
 //!   no discovery, so a single data connection carries everything and the
 //!   assertion can be made directly after the calls.
 //!
@@ -41,7 +41,7 @@ use alternator_driver::AlternatorClient;
 
 use std::time::Duration;
 
-// A client that talks directly to `endpoint_url` with load balancing disabled,
+// A client that talks directly to its seed host with load balancing disabled,
 // using an HTTP connection pool with the given idle timeout.
 fn create_lb_disabled_client(
     cluster: &Cluster,
@@ -56,8 +56,9 @@ fn create_lb_disabled_client(
     AlternatorClient::from_conf(
         minimal_builder()
             .http_client(http_client)
-            .endpoint_url(default_endpoint_url(cluster))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([default_seed_host(cluster)])
+            .port(default_seed_port(cluster))
+            .without_discovery()
             .build(),
     )
 }

@@ -264,9 +264,9 @@ impl HttpTestConfig for CustomUserAgentConfig {
 pub async fn test_custom_user_agent(ctx: &mut HttpTestContext<CustomUserAgentConfig>) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .optimize_headers(true)
             .user_agent("orders-service/1.0")
             .build(),
@@ -299,9 +299,9 @@ impl HttpTestConfig for DisabledUserAgentConfig {
 pub async fn test_without_user_agent(ctx: &mut HttpTestContext<DisabledUserAgentConfig>) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .optimize_headers(true)
             .without_user_agent()
             .build(),
@@ -316,9 +316,9 @@ pub async fn test_without_credentials(ctx: &mut HttpTestContext<WithoutCredentia
     // construct client with credentials disabled
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .optimize_headers(true)
             .build(),
     );
@@ -336,9 +336,9 @@ pub async fn test_without_credentials_drops_injected_auth_headers(
     // construct client with credentials disabled
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .optimize_headers(true)
             .interceptor(InjectAuthHeadersInterceptor)
             .build(),
@@ -356,9 +356,9 @@ pub async fn test_per_request_credentials_preserve_signed_headers(
 ) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .optimize_headers(true)
             .require_auth()
             .build(),
@@ -384,9 +384,9 @@ pub async fn test_missing_per_request_credentials_fails_before_no_auth_fallback(
 ) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .optimize_headers(true)
             .require_auth()
             .build(),
@@ -451,9 +451,9 @@ pub async fn test_with_credentials(ctx: &mut HttpTestContext<WithCredentialsConf
     // construct client with credentials enabled
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .optimize_headers(true)
             .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .build(),
@@ -511,9 +511,9 @@ pub async fn test_whitelist_needed(ctx: &mut HttpTestContext<WhitelistNeededConf
     // construct client with header stripping disabled
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .optimize_headers(false)
             .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
             .build(),

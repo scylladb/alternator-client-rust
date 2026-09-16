@@ -154,9 +154,13 @@ impl Intercept for AlternatorInterceptor {
     ) -> Result<(), BoxError> {
         // Take the next node from the query plan and override the request URI.
         if let Some(query_plan) = cfg.interceptor_state().load::<QueryPlan>() {
-            let next_node = query_plan.next_node().ok_or(
-                "query plan exhausted before the request could be routed to an Alternator node",
-            )?;
+            // A plan that ran out of nodes restarts instead of failing: retries
+            // beyond the cluster size are normal. Only the total absence of a
+            // live node fails the request, so a request is never left pointing
+            // at the endpoint the SDK resolved on its own.
+            let next_node = query_plan
+                .next_node_or_restart()
+                .ok_or("no live Alternator node available to route the request to")?;
             let request = context.request_mut();
             let mut current = url::Url::parse(request.uri())?;
             current
@@ -475,7 +479,7 @@ impl Intercept for AffinityQueryPlanInterceptor {
 mod tests {
     use super::*;
     use crate::keyrouting::KeyRouteAffinityType;
-    use aws_sdk_dynamodb::config::{BehaviorVersion, Region};
+    use aws_sdk_dynamodb::config::Region;
     use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemInput;
     use aws_sdk_dynamodb::types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest};
     use aws_smithy_runtime_api::client::interceptors::context::InterceptorContext;
@@ -489,7 +493,7 @@ mod tests {
 
     fn make_client() -> aws_sdk_dynamodb::Client {
         let config = aws_sdk_dynamodb::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
+            .behavior_version(crate::config::ALTERNATOR_BEHAVIOR_VERSION())
             .region(Region::new("us-east-1"))
             .endpoint_url("http://127.0.0.1:1")
             .build();
@@ -610,10 +614,11 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_query_plan_rejects_unrouted_sdk_endpoint() {
+    fn exhausted_query_plan_never_leaves_the_unrouted_sdk_endpoint() {
         const SDK_ENDPOINT: &str = "https://dynamodb.us-east-1.amazonaws.com/";
 
-        let query_plan = QueryPlan::new_basic(make_live_nodes());
+        let live_nodes = make_live_nodes();
+        let query_plan = QueryPlan::new_basic(live_nodes.clone());
         while query_plan.next_node().is_some() {}
 
         let mut cfg = ConfigBag::base();
@@ -634,12 +639,45 @@ mod tests {
             false,
         );
 
-        let error = interceptor
+        interceptor
             .modify_before_signing(&mut context, &runtime_components, &mut cfg)
-            .expect_err("an exhausted query plan must fail closed");
+            .expect("an exhausted plan restarts instead of failing the retry");
 
-        assert!(error.to_string().contains("query plan exhausted"));
-        assert_eq!(context.request().uri(), SDK_ENDPOINT);
+        let routed = url::Url::parse(context.request().uri()).expect("routed uri");
+        assert_ne!(context.request().uri(), SDK_ENDPOINT);
+        assert!(
+            live_nodes.get_live_nodes().iter().any(|node| {
+                node.scheme() == routed.scheme()
+                    && node.host_str() == routed.host_str()
+                    && node.port() == routed.port()
+            }),
+            "request must be routed to a live Alternator node, got {routed}"
+        );
+    }
+
+    #[test]
+    fn restarted_query_plan_keeps_retrying_a_single_node_cluster() {
+        let config = AlternatorConfig::builder()
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(["only-node.example.com"])
+            .build();
+        let live_nodes = LiveNodes::new(&config).expect("live nodes");
+        let query_plan = QueryPlan::new_basic(live_nodes);
+
+        // The SDK reuses one plan for every attempt of a request, and the
+        // default retry config allows more attempts than this cluster has
+        // nodes.
+        let nodes: Vec<_> = (0..3)
+            .map(|_| {
+                query_plan
+                    .next_node_or_restart()
+                    .expect("every attempt must be routable")
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(nodes, vec!["http://only-node.example.com:8000/"; 3]);
     }
 
     fn preferred_node_for_key(live_nodes: &Arc<LiveNodes>, key: &str) -> String {
