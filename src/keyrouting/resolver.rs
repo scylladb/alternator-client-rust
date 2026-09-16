@@ -264,7 +264,7 @@ mod tests {
         LiveNodes, RequestCompression, ResponseCompression, RoundRobinQueryPlanInterceptor,
         UserAgent,
     };
-    use aws_sdk_dynamodb::config::{BehaviorVersion, Credentials, Region};
+    use aws_sdk_dynamodb::config::{Credentials, Region};
     use aws_sdk_dynamodb::types::AttributeValue;
     use aws_smithy_runtime_api::client::http::{
         HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
@@ -288,7 +288,7 @@ mod tests {
     /// background `DescribeTable` fails fast off-thread.
     fn make_client() -> aws_sdk_dynamodb::Client {
         let config = aws_sdk_dynamodb::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
+            .behavior_version(crate::config::ALTERNATOR_BEHAVIOR_VERSION())
             .region(Region::new("us-east-1"))
             .endpoint_url("http://127.0.0.1:1") // unreachable on purpose
             .build();
@@ -419,13 +419,12 @@ mod tests {
         affinity_config: crate::keyrouting::KeyRouteAffinityConfig,
     ) -> (aws_sdk_dynamodb::Client, Arc<PartitionKeyResolver>) {
         let live_nodes_config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .endpoint_url("http://127.0.0.1:1")
             .build();
         let live_nodes = LiveNodes::new(&live_nodes_config).expect("seed node config is valid");
 
         let base_builder = aws_sdk_dynamodb::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
+            .behavior_version(crate::config::ALTERNATOR_BEHAVIOR_VERSION())
             .region(Region::new("us-east-1"))
             .credentials_provider(Credentials::for_tests_with_session_token())
             .endpoint_url("http://127.0.0.1:1")
@@ -682,7 +681,6 @@ mod tests {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
                 .credentials_provider(Credentials::for_tests_with_session_token())
-                .behavior_version_latest()
                 .endpoint_url("http://127.0.0.1:1")
                 .http_client(http_client.clone())
                 .key_route_affinity(crate::keyrouting::KeyRouteAffinityType::AnyWrite)
@@ -820,7 +818,6 @@ mod tests_no_tokio_runtime {
                 .credentials_provider(
                     aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
                 )
-                .behavior_version_latest()
                 .endpoint_url("http://127.0.0.1:8000")
                 .http_client(NoTokioHttp)
                 .sleep_impl(NoTokioSleep)

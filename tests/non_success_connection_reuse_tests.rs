@@ -202,7 +202,6 @@ async fn alternator_discovery_non_success_responses_keep_connection_reusable() {
 
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(server.address.port())
             .seed_hosts(vec![server.address.ip().to_string()])
@@ -251,7 +250,6 @@ async fn dynamodb_non_success_responses_keep_connection_reusable() {
     let http_client = aws_smithy_http_client::Builder::new().build_http();
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .behavior_version_latest()
             .region(aws_sdk_dynamodb::config::Region::new("eu-central-1"))
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),

@@ -41,6 +41,7 @@ enum QueryPlanState {
     RoundRobin { used_nodes: HashSet<Arc<Url>> },
     /// Seeded deterministic state for Key Route Affinity
     Affinity {
+        seed: i64,
         // Boxed to prevent "large size difference between variants" warning
         go_rand: Box<GoRand>,
         remaining_nodes: Option<Vec<Arc<Url>>>,
@@ -72,6 +73,7 @@ impl QueryPlan {
         Self {
             live_nodes,
             state: Mutex::new(QueryPlanState::Affinity {
+                seed: seed as i64,
                 go_rand: Box::new(GoRand::new(seed as i64)),
                 remaining_nodes: None,
             }),
@@ -117,6 +119,7 @@ impl QueryPlan {
             QueryPlanState::Affinity {
                 go_rand,
                 remaining_nodes,
+                ..
             } => {
                 let remaining = remaining_nodes.get_or_insert_with(|| {
                     let mut nodes = self.live_nodes.get_live_nodes();
@@ -158,6 +161,49 @@ impl QueryPlan {
 
                 remaining.pop_front()
             }
+        }
+    }
+
+    /// Gets the next node to use, restarting the plan from the beginning once
+    /// every node has been tried.
+    ///
+    /// The SDK builds one plan per request and reuses it for every attempt of
+    /// that request, so a plan running out of nodes only means that the retry
+    /// count is higher than the number of live nodes - a single-node cluster
+    /// exhausts its plan on the first attempt. Restarting keeps those retries
+    /// routed to Alternator instead of leaving the request at the endpoint the
+    /// SDK resolved, which may be a public AWS DynamoDB endpoint.
+    ///
+    /// Returns `None` only when there is no live node to route to at all.
+    pub fn next_node_or_restart(&self) -> Option<Arc<Url>> {
+        if let Some(node) = self.next_node() {
+            return Some(node);
+        }
+
+        self.restart();
+        self.next_node()
+    }
+
+    /// Drops the record of which nodes were already tried, so the plan yields
+    /// its full node order again from the start.
+    fn restart(&self) {
+        let mut state = self.state.lock().unwrap();
+
+        match &mut *state {
+            QueryPlanState::RoundRobin { used_nodes } => used_nodes.clear(),
+            QueryPlanState::Affinity {
+                seed,
+                go_rand,
+                remaining_nodes,
+            } => {
+                // Re-seed so a restarted affinity plan repeats its original
+                // node order and tries the preferred coordinator first again.
+                **go_rand = GoRand::new(*seed);
+                *remaining_nodes = None;
+            }
+            QueryPlanState::PreferredNodes {
+                remaining_nodes, ..
+            } => *remaining_nodes = None,
         }
     }
 }

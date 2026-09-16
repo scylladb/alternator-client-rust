@@ -157,7 +157,6 @@ pub async fn test_request_compression_gzip(ctx: &mut HttpTestContext<Config>) {
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -207,7 +206,6 @@ pub async fn test_request_compression_deflate(ctx: &mut HttpTestContext<Config>)
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -286,7 +284,6 @@ pub async fn test_enabled_by_per_request_customization(ctx: &mut HttpTestContext
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -396,7 +393,6 @@ pub async fn test_disabled_by_per_request_customization(ctx: &mut HttpTestContex
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -556,7 +552,6 @@ pub async fn test_response_decompression_gzip(ctx: &mut HttpTestContext<Config>)
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -599,7 +594,6 @@ pub async fn test_response_decompression_deflate(ctx: &mut HttpTestContext<Confi
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -645,7 +639,6 @@ pub async fn test_response_decompression_uncompressed_still_works(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -690,7 +683,6 @@ pub async fn test_response_decompression_unexpected_compression(ctx: &mut HttpTe
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -787,7 +779,6 @@ pub async fn test_response_compression_sends_accept_encoding_gzip(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -835,7 +826,6 @@ pub async fn test_response_compression_disabled_does_not_send_accept_encoding(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -881,7 +871,6 @@ pub async fn test_response_compression_enabled_by_per_request_customization(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -931,7 +920,6 @@ pub async fn test_response_compression_disabled_by_per_request_customization(
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
@@ -983,7 +971,6 @@ pub async fn test_response_compression_with_optimize_headers(ctx: &mut HttpTestC
         AlternatorConfig::builder()
             .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
             .seed_hosts(Vec::<String>::new())
-            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
