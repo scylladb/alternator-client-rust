@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Eligible key-affinity requests use every rack in the selected datacenter while
+  ordinary requests retain rack-aware routing. The derived affinity scope keeps
+  explicit fallback order, deduplicates equivalent widened scopes by their first
+  occurrence, and reuses matching ordinary discovery results.
+
 ## [1.0.0] - 2026-10-02
 
 ### Added
