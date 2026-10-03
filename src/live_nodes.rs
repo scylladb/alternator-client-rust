@@ -726,6 +726,7 @@ impl LiveNodes {
             self.live_nodes.store(Arc::new(partial));
         }
         state.latest_published_generation = generation;
+        self.initial_discovery_notify.notify_waiters();
     }
 
     async fn discover_cluster_live_nodes_from(
@@ -895,12 +896,25 @@ impl LiveNodes {
     /// so the deterministic coordinator is derived from every rack rather
     /// than from whichever bootstrap seeds one client happened to receive.
     pub(crate) async fn wait_for_initial_discovery(self: &Arc<Self>) -> bool {
-        self.wait_for_initial_discovery_with_timeout(self.initial_discovery_wait_timeout())
-            .await
+        self.ensure_discovery_started();
+
+        loop {
+            let notified = self.initial_discovery_notify.notified();
+            if self.initial_discovery_complete.load(Ordering::Acquire) {
+                return true;
+            }
+            if tokio::time::timeout(self.initial_discovery_wait_timeout(), notified)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
     }
 
     fn initial_discovery_wait_timeout(&self) -> Duration {
         let seed_count = u32::try_from(self.seed_urls.len()).unwrap_or(u32::MAX);
+        let live_count = u32::try_from(self.live_nodes.load().len()).unwrap_or(u32::MAX);
         let scope_count = u32::try_from(
             std::iter::successors(Some(&self.routing_scope), |scope| scope.fallback()).count(),
         )
@@ -910,12 +924,16 @@ impl LiveNodes {
         // original seeds. A cluster fallback can visit the union of those two
         // sets. Add one request per configured scope for empty-result
         // fallback traversal, then a small scheduling margin.
-        let request_budget = seed_count.saturating_mul(4).saturating_add(scope_count);
+        let candidate_budget = seed_count.saturating_add(live_count);
+        let request_budget = candidate_budget
+            .saturating_mul(2)
+            .saturating_add(scope_count);
         DISCOVERY_HTTP_OPERATION_TIMEOUT
             .saturating_mul(request_budget)
             .saturating_add(INITIAL_DISCOVERY_WAIT_SLACK)
     }
 
+    #[cfg(test)]
     async fn wait_for_initial_discovery_with_timeout(self: &Arc<Self>, timeout: Duration) -> bool {
         self.ensure_discovery_started();
 
@@ -1208,6 +1226,16 @@ mod tests {
         assert_eq!(
             nodes.initial_discovery_wait_timeout(),
             Duration::from_secs(56)
+        );
+
+        nodes.live_nodes.store(Arc::new(
+            (1..=5)
+                .map(|index| Arc::new(Url::parse(&format!("http://node{index}.test:1")).unwrap()))
+                .collect(),
+        ));
+        assert_eq!(
+            nodes.initial_discovery_wait_timeout(),
+            Duration::from_secs(86)
         );
     }
 
