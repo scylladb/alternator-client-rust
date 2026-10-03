@@ -446,6 +446,7 @@ impl AffinityQueryPlanInterceptor {
             .then(|| QueryPlan::new_with_affinity_votes(self.affinity_nodes.clone(), hashes))
     }
 
+    #[cfg(test)]
     /// Builds the [`QueryPlan`] for this request. Falls back to round-robin
     /// when affinity doesn't apply for any reason
     fn get_query_plan(&self, input: &Input) -> QueryPlan {
@@ -466,13 +467,14 @@ impl Intercept for AffinityQueryPlanInterceptor {
         cfg: &mut ConfigBag,
     ) -> Result<(), aws_smithy_runtime_api::box_error::BoxError> {
         let input = context.input();
-        if classifier::DynamoOp::from_input(input)
-            .is_some_and(|operation| operation.should_apply(self.config.affinity_type))
+        let affinity_plan = self.try_affinity_plan(input);
+        if affinity_plan.is_some()
             && let Some(params) = cfg.get_mut_from_interceptor_state::<EndpointResolverParams>()
         {
             params.set_property(AffinityDiscoveryRequired);
         }
-        let query_plan = self.get_query_plan(input);
+        let query_plan =
+            affinity_plan.unwrap_or_else(|| QueryPlan::new_basic(self.routing_nodes.clone()));
 
         cfg.interceptor_state().store_put(query_plan);
         Ok(())

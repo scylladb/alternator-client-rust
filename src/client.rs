@@ -145,8 +145,10 @@ struct AffinityDiscoveryEndpointResolver {
 impl ResolveEndpoint for AffinityDiscoveryEndpointResolver {
     fn resolve_endpoint<'a>(&'a self, params: &'a EndpointResolverParams) -> EndpointFuture<'a> {
         EndpointFuture::new(async move {
-            if params.get_property::<AffinityDiscoveryRequired>().is_some() {
-                self.affinity_nodes.wait_for_initial_discovery().await;
+            if params.get_property::<AffinityDiscoveryRequired>().is_some()
+                && !self.affinity_nodes.wait_for_initial_discovery().await
+            {
+                return Err("timed out waiting for the cross-rack affinity topology".into());
             }
             self.inner.resolve_endpoint(params).await
         })

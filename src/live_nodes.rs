@@ -118,6 +118,7 @@ use url::Url;
 
 const DEFAULT_ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const INITIAL_DISCOVERY_WAIT_PER_SEED: Duration = Duration::from_secs(10);
 
 /// An error encountered while constructing live-node discovery state.
 #[derive(Debug)]
@@ -724,7 +725,6 @@ impl LiveNodes {
             self.live_nodes.store(Arc::new(partial));
         }
         state.latest_published_generation = generation;
-        self.mark_initial_discovery_complete();
     }
 
     async fn discover_cluster_live_nodes_from(
@@ -893,16 +893,28 @@ impl LiveNodes {
     /// Rack-scoped clients use this before their first affinity-routed request
     /// so the deterministic coordinator is derived from every rack rather
     /// than from whichever bootstrap seeds one client happened to receive.
-    pub(crate) async fn wait_for_initial_discovery(self: &Arc<Self>) {
+    pub(crate) async fn wait_for_initial_discovery(self: &Arc<Self>) -> bool {
+        let seed_count = u32::try_from(self.seed_urls.len()).unwrap_or(u32::MAX);
+        let timeout = INITIAL_DISCOVERY_WAIT_PER_SEED
+            .saturating_mul(seed_count)
+            .saturating_add(Duration::from_secs(1));
+        self.wait_for_initial_discovery_with_timeout(timeout).await
+    }
+
+    async fn wait_for_initial_discovery_with_timeout(self: &Arc<Self>, timeout: Duration) -> bool {
         self.ensure_discovery_started();
 
-        loop {
-            let notified = self.initial_discovery_notify.notified();
-            if self.initial_discovery_complete.load(Ordering::Acquire) {
-                return;
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.initial_discovery_notify.notified();
+                if self.initial_discovery_complete.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
             }
-            notified.await;
-        }
+        })
+        .await
+        .is_ok()
     }
 
     /// Returns a list of all current live nodes and updates the last activity timestamp.
@@ -1141,10 +1153,28 @@ mod tests {
             vec![Arc::new(Url::parse("http://127.0.0.2:1").unwrap())],
         );
 
-        tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("waiter should observe the topology")
-            .expect("waiter task should complete");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter should observe the topology")
+                .expect("waiter task should complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_discovery_wait_is_bounded() {
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(1)
+            .active_interval(Duration::from_secs(60))
+            .build();
+        let nodes = LiveNodes::new(&config).expect("live nodes");
+
+        assert!(
+            !nodes
+                .wait_for_initial_discovery_with_timeout(Duration::from_millis(10))
+                .await
+        );
     }
 
     fn discovery_is_running(nodes: &LiveNodes) -> bool {
@@ -2287,6 +2317,10 @@ mod tests {
             &[healthy.clone(), stale.clone()],
             "partial publication must add newly validated nodes without dropping last-known-good nodes"
         );
+        assert!(
+            !nodes.initial_discovery_complete.load(Ordering::Acquire),
+            "a partial cluster union must not release affinity requests"
+        );
 
         release.notify_one();
         let discovered = tokio::time::timeout(Duration::from_secs(1), discovery)
@@ -2295,6 +2329,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(discovered, vec![healthy]);
+        nodes.publish_live_nodes(generation, discovered);
+        assert!(nodes.initial_discovery_complete.load(Ordering::Acquire));
     }
 
     #[tokio::test]
