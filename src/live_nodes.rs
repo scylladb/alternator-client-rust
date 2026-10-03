@@ -118,7 +118,8 @@ use url::Url;
 
 const DEFAULT_ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const INITIAL_DISCOVERY_WAIT_PER_SEED: Duration = Duration::from_secs(10);
+const DISCOVERY_HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const INITIAL_DISCOVERY_WAIT_SLACK: Duration = Duration::from_secs(1);
 
 /// An error encountered while constructing live-node discovery state.
 #[derive(Debug)]
@@ -245,7 +246,7 @@ fn build_default_discovery_http_client(
 ) -> Result<(DiscoveryHttpClient, bool), LiveNodesBuildError> {
     let (builder, native_roots_usable) = discovery_http_client_builder_with_root_status(scheme)?;
     let client = builder
-        .timeout(Duration::from_secs(5))
+        .timeout(DISCOVERY_HTTP_OPERATION_TIMEOUT)
         .connect_timeout(Duration::from_secs(2))
         .build()
         .map_err(LiveNodesBuildError::HttpClient)?;
@@ -307,7 +308,7 @@ impl DiscoveryHttpClient {
                     .timeout_config(
                         TimeoutConfig::builder()
                             .connect_timeout(Duration::from_secs(2))
-                            .operation_timeout(Duration::from_secs(5))
+                            .operation_timeout(DISCOVERY_HTTP_OPERATION_TIMEOUT)
                             .build(),
                     )
                     .with_connection_poisoning();
@@ -894,11 +895,25 @@ impl LiveNodes {
     /// so the deterministic coordinator is derived from every rack rather
     /// than from whichever bootstrap seeds one client happened to receive.
     pub(crate) async fn wait_for_initial_discovery(self: &Arc<Self>) -> bool {
+        self.wait_for_initial_discovery_with_timeout(self.initial_discovery_wait_timeout())
+            .await
+    }
+
+    fn initial_discovery_wait_timeout(&self) -> Duration {
         let seed_count = u32::try_from(self.seed_urls.len()).unwrap_or(u32::MAX);
-        let timeout = INITIAL_DISCOVERY_WAIT_PER_SEED
-            .saturating_mul(seed_count)
-            .saturating_add(Duration::from_secs(1));
-        self.wait_for_initial_discovery_with_timeout(timeout).await
+        let scope_count = u32::try_from(
+            std::iter::successors(Some(&self.routing_scope), |scope| scope.fallback()).count(),
+        )
+        .unwrap_or(u32::MAX);
+
+        // A failed scoped pass can visit the current candidates and then all
+        // original seeds. A cluster fallback can visit the union of those two
+        // sets. Add one request per configured scope for empty-result
+        // fallback traversal, then a small scheduling margin.
+        let request_budget = seed_count.saturating_mul(4).saturating_add(scope_count);
+        DISCOVERY_HTTP_OPERATION_TIMEOUT
+            .saturating_mul(request_budget)
+            .saturating_add(INITIAL_DISCOVERY_WAIT_SLACK)
     }
 
     async fn wait_for_initial_discovery_with_timeout(self: &Arc<Self>, timeout: Duration) -> bool {
@@ -1174,6 +1189,25 @@ mod tests {
             !nodes
                 .wait_for_initial_discovery_with_timeout(Duration::from_millis(10))
                 .await
+        );
+    }
+
+    #[test]
+    fn initial_discovery_timeout_accounts_for_seeds_and_fallback_scopes() {
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1", "127.0.0.2"])
+            .port(1)
+            .routing_scope(
+                RoutingScope::from_rack("dc1".to_string(), "rack1".to_string())
+                    .with_fallback(RoutingScope::from_datacenter("dc1".to_string()))
+                    .with_fallback(RoutingScope::from_cluster()),
+            )
+            .build();
+        let nodes = LiveNodes::new(&config).expect("live nodes");
+
+        assert_eq!(
+            nodes.initial_discovery_wait_timeout(),
+            Duration::from_secs(56)
         );
     }
 
