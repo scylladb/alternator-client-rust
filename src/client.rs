@@ -486,6 +486,7 @@ impl AlternatorClient {
                 RoundRobinQueryPlanInterceptor::new(nodes.clone()),
             )),
             (Some(nodes), Some(cfg)) => {
+                let affinity_nodes = nodes.affinity_view();
                 // The affinity interceptor needs a PartitionKeyResolver, which needs a client
                 // to make DescribeTable calls. Using the main client for that would create a
                 // cycle: main client -> affinity interceptor -> resolver -> DescribeTable
@@ -504,7 +505,12 @@ impl AlternatorClient {
                     ));
                 partition_keys = Some(resolver.clone());
                 Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
-                    AffinityQueryPlanInterceptor::new(cfg.clone(), nodes.clone(), resolver),
+                    AffinityQueryPlanInterceptor::new(
+                        cfg.clone(),
+                        nodes.clone(),
+                        affinity_nodes,
+                        resolver,
+                    ),
                 ))
             }
         };
@@ -1752,6 +1758,371 @@ mod tests {
                     .to_string()
                     .contains("invalid Alternator transport scheme")
             );
+        }
+    }
+    #[derive(Debug, Default)]
+    struct ScopedRoutingFixture {
+        released: std::sync::atomic::AtomicBool,
+        release: tokio::sync::Notify,
+        discovery: std::sync::Mutex<Vec<String>>,
+        requests: std::sync::Mutex<Vec<String>>,
+        responses: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ScopedRoutingHttpClient(std::sync::Arc<ScopedRoutingFixture>);
+
+    impl HttpClient for ScopedRoutingHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    impl HttpConnector for ScopedRoutingHttpClient {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let url = url::Url::parse(request.uri()).unwrap();
+            if request.method() != "GET" {
+                self.0
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .push(url.host_str().unwrap().to_string());
+                return HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                    StatusCode::try_from(200).unwrap(),
+                    SdkBody::from("{}"),
+                )));
+            }
+            assert_eq!(url.path(), "/localnodes");
+            let state = self.0.clone();
+            HttpConnectorFuture::new(async move {
+                let notified = state.release.notified();
+                if !state.released.load(std::sync::atomic::Ordering::SeqCst) {
+                    notified.await;
+                }
+                let query = url.query().unwrap_or_default();
+                state.discovery.lock().unwrap().push(query.to_string());
+                let default_body = match query {
+                    "dc=dc1&rack=rack1" => r#"["10.0.0.1"]"#,
+                    "dc=dc1&rack=rack2" => r#"["10.0.0.2"]"#,
+                    "dc=dc1" => r#"["10.0.0.1","10.0.0.2"]"#,
+                    "dc=dc2" => r#"["10.0.0.3"]"#,
+                    "dc=dc2&rack=rack1" | "dc=dc2&rack=rack2" => r#"["10.0.0.3"]"#,
+                    "" => r#"["10.0.0.1","10.0.0.2","10.0.0.3"]"#,
+                    other => panic!("unexpected discovery scope {other}"),
+                };
+                let body = state
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .get(query)
+                    .cloned()
+                    .unwrap_or_else(|| default_body.to_owned());
+                Ok(HttpResponse::new(
+                    StatusCode::try_from(200).unwrap(),
+                    SdkBody::from(body),
+                ))
+            })
+        }
+    }
+
+    fn scoped_routing_client(
+        state: &std::sync::Arc<ScopedRoutingFixture>,
+        scope: crate::RoutingScope,
+        mode: crate::KeyRouteAffinityType,
+    ) -> AlternatorClient {
+        scoped_routing_client_with_interval(
+            state,
+            scope,
+            mode,
+            std::time::Duration::from_secs(3600),
+        )
+    }
+
+    fn scoped_routing_client_with_interval(
+        state: &std::sync::Arc<ScopedRoutingFixture>,
+        scope: crate::RoutingScope,
+        mode: crate::KeyRouteAffinityType,
+        interval: std::time::Duration,
+    ) -> AlternatorClient {
+        AlternatorClient::from_conf(
+            AlternatorConfig::builder()
+                .seed_hosts(["seed.test"])
+                .http_client(ScopedRoutingHttpClient(state.clone()))
+                .routing_scope(scope)
+                .key_route_affinity(
+                    crate::KeyRouteAffinityConfig::builder()
+                        .with_type(mode)
+                        .with_pk_info("orders", "pk")
+                        .build(),
+                )
+                .active_interval(interval)
+                .idle_interval(std::time::Duration::from_secs(3600))
+                .build(),
+        )
+    }
+
+    async fn scoped_write(
+        client: &AlternatorClient,
+        state: &ScopedRoutingFixture,
+        key: &str,
+    ) -> String {
+        client
+            .put_item()
+            .table_name("orders")
+            .item(
+                key,
+                aws_sdk_dynamodb::types::AttributeValue::S("shared-key".into()),
+            )
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await
+            .unwrap();
+        state.requests.lock().unwrap().last().unwrap().clone()
+    }
+
+    async fn scoped_batch_write(client: &AlternatorClient, state: &ScopedRoutingFixture) -> String {
+        use aws_sdk_dynamodb::types::{AttributeValue, PutRequest, WriteRequest};
+        client
+            .batch_write_item()
+            .request_items(
+                "orders",
+                vec![
+                    WriteRequest::builder()
+                        .put_request(
+                            PutRequest::builder()
+                                .item("pk", AttributeValue::S("shared-key".into()))
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                ],
+            )
+            .send()
+            .await
+            .unwrap();
+        state.requests.lock().unwrap().last().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn rack_affinity_constructor_preserves_startup_and_routes_both_views() {
+        for mode in [
+            crate::KeyRouteAffinityType::Rmw,
+            crate::KeyRouteAffinityType::AnyWrite,
+        ] {
+            let state = std::sync::Arc::new(ScopedRoutingFixture::default());
+            let rack1 = scoped_routing_client(
+                &state,
+                crate::RoutingScope::from_rack("dc1".into(), "rack1".into())
+                    .with_fallback(crate::RoutingScope::from_datacenter("dc2".into())),
+                mode,
+            );
+            let rack2 = scoped_routing_client(
+                &state,
+                crate::RoutingScope::from_rack("dc1".into(), "rack2".into())
+                    .with_fallback(crate::RoutingScope::from_datacenter("dc2".into())),
+                mode,
+            );
+            // Discovery is deliberately held: the existing seed fallback must
+            // still transmit eligible requests without a readiness requirement.
+            assert_eq!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    scoped_write(&rack1, &state, "pk")
+                )
+                .await
+                .unwrap(),
+                "seed.test"
+            );
+            state
+                .released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            state.release.notify_waiters();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let first = scoped_write(&rack1, &state, "pk").await;
+                    let second = scoped_write(&rack2, &state, "pk").await;
+                    if first == second && ["10.0.0.1", "10.0.0.2"].contains(&first.as_str()) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if mode == crate::KeyRouteAffinityType::AnyWrite {
+                let coordinator = scoped_write(&rack1, &state, "pk").await;
+                assert_eq!(scoped_batch_write(&rack1, &state).await, coordinator);
+                assert_eq!(scoped_batch_write(&rack2, &state).await, coordinator);
+            }
+            for (client, expected) in [(&rack1, "10.0.0.1"), (&rack2, "10.0.0.2")] {
+                client
+                    .get_item()
+                    .table_name("orders")
+                    .key(
+                        "pk",
+                        aws_sdk_dynamodb::types::AttributeValue::S("shared-key".into()),
+                    )
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(state.requests.lock().unwrap().last().unwrap(), expected);
+                assert_eq!(scoped_write(client, &state, "unusable-key").await, expected);
+                if mode == crate::KeyRouteAffinityType::Rmw {
+                    assert_eq!(scoped_batch_write(client, &state).await, expected);
+                }
+            }
+            let discovery = state.discovery.lock().unwrap();
+            assert!(discovery.contains(&"dc=dc1".to_string()));
+            assert!(!discovery.contains(&"dc=dc2".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_configuration_avoids_duplicate_initial_discovery() {
+        for (scope, mode, expected, expected_hosts) in [
+            (
+                crate::RoutingScope::from_rack("dc1".into(), "rack1".into()),
+                crate::KeyRouteAffinityType::None,
+                "dc=dc1&rack=rack1",
+                &["10.0.0.1"][..],
+            ),
+            (
+                crate::RoutingScope::from_datacenter("dc1".into()),
+                crate::KeyRouteAffinityType::AnyWrite,
+                "dc=dc1",
+                &["10.0.0.1", "10.0.0.2"][..],
+            ),
+            (
+                crate::RoutingScope::from_cluster(),
+                crate::KeyRouteAffinityType::AnyWrite,
+                "",
+                &["10.0.0.1", "10.0.0.2", "10.0.0.3"][..],
+            ),
+            (
+                crate::RoutingScope::from_datacenter("dc1".into())
+                    .with_fallback(crate::RoutingScope::from_rack("dc2".into(), "rack1".into())),
+                crate::KeyRouteAffinityType::AnyWrite,
+                "dc=dc1",
+                &["10.0.0.1", "10.0.0.2"][..],
+            ),
+        ] {
+            let state = std::sync::Arc::new(ScopedRoutingFixture::default());
+            state
+                .released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let client = scoped_routing_client(&state, scope, mode);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let host = scoped_write(&client, &state, "pk").await;
+                    if expected_hosts.contains(&host.as_str()) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(*state.discovery.lock().unwrap(), [expected]);
+        }
+    }
+
+    #[tokio::test]
+    async fn rack_affinity_follows_explicit_dc_fallback_and_recovers_after_refresh() {
+        for mode in [
+            crate::KeyRouteAffinityType::Rmw,
+            crate::KeyRouteAffinityType::AnyWrite,
+        ] {
+            let state = std::sync::Arc::new(ScopedRoutingFixture::default());
+            state
+                .released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let clients = ["rack1", "rack2"].map(|rack| {
+                let scope = crate::RoutingScope::from_rack("dc1".into(), rack.into())
+                    .with_fallback(crate::RoutingScope::from_datacenter("dc2".into()));
+                let client = scoped_routing_client_with_interval(
+                    &state,
+                    scope.clone(),
+                    mode,
+                    std::time::Duration::from_millis(10),
+                );
+                assert_eq!(client.config().routing_scope(), Some(scope));
+                client
+            });
+
+            // Both clients must converge across racks in DC1, then follow the
+            // explicit fallback only when DC1 is empty, and return to DC1 after
+            // recovery. The recovered membership is deliberately different.
+            for (responses, eligible_hosts, ordinary_hosts) in [
+                (
+                    vec![],
+                    vec!["10.0.0.1", "10.0.0.2"],
+                    ["10.0.0.1", "10.0.0.2"],
+                ),
+                (
+                    vec![
+                        ("dc=dc1&rack=rack1", "[]"),
+                        ("dc=dc1&rack=rack2", "[]"),
+                        ("dc=dc1", "[]"),
+                    ],
+                    vec!["10.0.0.3"],
+                    ["10.0.0.3", "10.0.0.3"],
+                ),
+                (
+                    vec![
+                        ("dc=dc1&rack=rack1", r#"["10.0.0.4"]"#),
+                        ("dc=dc1&rack=rack2", r#"["10.0.0.5"]"#),
+                        ("dc=dc1", r#"["10.0.0.4","10.0.0.5"]"#),
+                    ],
+                    vec!["10.0.0.4", "10.0.0.5"],
+                    ["10.0.0.4", "10.0.0.5"],
+                ),
+            ] {
+                *state.responses.lock().unwrap() = responses
+                    .into_iter()
+                    .map(|(query, body)| (query.to_owned(), body.to_owned()))
+                    .collect();
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let first = scoped_write(&clients[0], &state, "pk").await;
+                        let second = scoped_write(&clients[1], &state, "pk").await;
+                        let mut converged =
+                            first == second && eligible_hosts.contains(&first.as_str());
+                        for (client, ordinary) in clients.iter().zip(ordinary_hosts) {
+                            // Missing-key requests must stay on ordinary routing
+                            // even when the two discovery snapshots differ.
+                            converged &=
+                                scoped_write(client, &state, "missing-key").await == ordinary;
+                            let batch = scoped_batch_write(client, &state).await;
+                            converged &= batch
+                                == if mode == crate::KeyRouteAffinityType::AnyWrite {
+                                    first.as_str()
+                                } else {
+                                    ordinary
+                                };
+                        }
+                        if converged {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("ordinary and affinity routing did not converge after refresh");
+                if eligible_hosts == ["10.0.0.1", "10.0.0.2"] {
+                    assert!(
+                        !state
+                            .discovery
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|query| query == "dc=dc2")
+                    );
+                }
+            }
         }
     }
 }

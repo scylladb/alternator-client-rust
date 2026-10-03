@@ -282,6 +282,31 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
+Key-route affinity uses a separate discovery view when any scope in the configured
+chain restricts a rack. It replaces every rack restriction with its datacenter,
+preserving explicit fallback order after equivalent widened scopes collapse to
+their first occurrence. For example,
+`rack(A,r1) → rack(B,r2) → cluster` becomes `DC(A) → DC(B) → cluster`.
+Named datacenters are queried through `/localnodes?dc=<configured-dc>`; other
+datacenters stay excluded while the preferred one is usable.
+
+Eligible affinity requests use that view, so clients in different racks of the
+same datacenter choose the same coordinator for the same key when their candidate
+membership matches. Reads, noneligible writes and requests without a usable key
+retain ordinary rack-aware routing. The affinity chain is resolved once at client
+initialization, preserving explicit fallback order and the first occurrence of
+each equivalent discovery query with the same seed aggregation behavior. No
+implicit fallback is added.
+
+Both views use the same discovery machinery. Matching results, including empty
+responses, are reused within one refresh attempt; later attempts retry discovery.
+Disabled affinity and ordinary results that already satisfy the affinity scope
+need no additional discovery. Optional affinity discovery does not delay ordinary
+refresh scheduling. Captured single-item and batch plans keep their selected
+membership across topology changes and retries. Before discovery succeeds or
+during failures, requests retain the existing seed or stale-snapshot fallback;
+they do not wait for an affinity readiness gate.
+
 ### Scope fallbacks
 
 A scope can be narrow enough that no nodes match it — for example, a specific rack that has no live nodes at the moment. In that case the client uses the configured fallback scope instead. Fallbacks are explicit and chainable:
