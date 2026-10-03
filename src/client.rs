@@ -406,6 +406,19 @@ impl AlternatorClient {
         ));
 
         let live_nodes = LiveNodes::try_new(&config)?;
+        let affinity_config = config
+            .key_route_affinity()
+            .filter(|config| config.is_enabled());
+        let affinity_live_nodes = match (
+            live_nodes.as_ref(),
+            affinity_config.as_ref(),
+            config.routing_scope(),
+        ) {
+            (Some(_), Some(_), Some(scope)) if scope.rack().is_some() => {
+                LiveNodes::try_new_for_scope(&config, scope.without_rack())?
+            }
+            _ => live_nodes.clone(),
+        };
 
         // With discovery off nothing rewrites the request, so the transport
         // is decided by the scheme configured for the seed host itself.
@@ -453,36 +466,42 @@ impl AlternatorClient {
 
         validate_sdk_default_config(stalled_stream_protection_explicitly_unset)?;
 
-        let routing_interceptor: Option<aws_sdk_dynamodb::config::SharedInterceptor> = match (
-            live_nodes.as_ref(),
-            config.key_route_affinity().filter(|c| c.is_enabled()),
-        ) {
-            (None, _) => None,
-            (Some(nodes), None) => Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
-                RoundRobinQueryPlanInterceptor::new(nodes.clone()),
-            )),
-            (Some(nodes), Some(cfg)) => {
-                // The affinity interceptor needs a PartitionKeyResolver, which needs a client
-                // to make DescribeTable calls. Using the main client for that would create a
-                // cycle: main client -> affinity interceptor -> resolver -> DescribeTable
-                // -> main client. Build a separate discovery client from the same base config
-                // but with round-robin routing only..
-                let pk_discovery_client = try_dynamodb_client_from_conf(
-                    builder
-                        .clone()
-                        .interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()))
-                        .build(),
-                )?;
-                let resolver =
-                    std::sync::Arc::new(keyrouting::resolver::PartitionKeyResolver::new(
-                        pk_discovery_client,
-                        cfg.pk_info_per_table.clone(),
-                    ));
-                Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
-                    AffinityQueryPlanInterceptor::new(cfg.clone(), nodes.clone(), resolver),
-                ))
-            }
-        };
+        let routing_interceptor: Option<aws_sdk_dynamodb::config::SharedInterceptor> =
+            match (live_nodes.as_ref(), affinity_config.as_ref()) {
+                (None, _) => None,
+                (Some(nodes), None) => Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
+                    RoundRobinQueryPlanInterceptor::new(nodes.clone()),
+                )),
+                (Some(nodes), Some(cfg)) => {
+                    let affinity_nodes = affinity_live_nodes
+                        .as_ref()
+                        .expect("discovery state exists for affinity routing");
+                    // The affinity interceptor needs a PartitionKeyResolver, which needs a client
+                    // to make DescribeTable calls. Using the main client for that would create a
+                    // cycle: main client -> affinity interceptor -> resolver -> DescribeTable
+                    // -> main client. Build a separate discovery client from the same base config
+                    // but with round-robin routing only..
+                    let pk_discovery_client = try_dynamodb_client_from_conf(
+                        builder
+                            .clone()
+                            .interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()))
+                            .build(),
+                    )?;
+                    let resolver =
+                        std::sync::Arc::new(keyrouting::resolver::PartitionKeyResolver::new(
+                            pk_discovery_client,
+                            cfg.pk_info_per_table.clone(),
+                        ));
+                    Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
+                        AffinityQueryPlanInterceptor::new(
+                            cfg.clone(),
+                            nodes.clone(),
+                            affinity_nodes.clone(),
+                            resolver,
+                        ),
+                    ))
+                }
+            };
 
         if let Some(interceptor) = routing_interceptor {
             builder = builder.interceptor(interceptor);
@@ -493,6 +512,9 @@ impl AlternatorClient {
         let dynamodb_client = try_dynamodb_client_from_conf(dynamodb_config)?;
 
         if let Some(nodes) = &live_nodes {
+            nodes.ensure_discovery_started();
+        }
+        if let Some(nodes) = &affinity_live_nodes {
             nodes.ensure_discovery_started();
         }
 

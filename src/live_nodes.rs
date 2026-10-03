@@ -551,14 +551,30 @@ impl LiveNodes {
     pub(crate) fn try_new(
         config: &crate::config::AlternatorConfig,
     ) -> Result<Option<Arc<Self>>, LiveNodesBuildError> {
+        Self::try_new_with_scope(config, None)
+    }
+
+    /// Creates discovery state using `routing_scope` instead of the scope in
+    /// `config` while retaining all other transport and refresh settings.
+    pub(crate) fn try_new_for_scope(
+        config: &crate::config::AlternatorConfig,
+        routing_scope: RoutingScope,
+    ) -> Result<Option<Arc<Self>>, LiveNodesBuildError> {
+        Self::try_new_with_scope(config, Some(routing_scope))
+    }
+
+    fn try_new_with_scope(
+        config: &crate::config::AlternatorConfig,
+        routing_scope: Option<RoutingScope>,
+    ) -> Result<Option<Arc<Self>>, LiveNodesBuildError> {
         let active_interval = config
             .active_interval()
             .unwrap_or(DEFAULT_ACTIVE_REFRESH_INTERVAL);
         let idle_interval = config
             .idle_interval()
             .unwrap_or(DEFAULT_IDLE_REFRESH_INTERVAL);
-        let routing_scope = config
-            .routing_scope()
+        let routing_scope = routing_scope
+            .or_else(|| config.routing_scope())
             .unwrap_or(RoutingScope::from_cluster());
         let alternator_scheme = config.scheme().unwrap_or("http".to_string());
         let port = config.port();

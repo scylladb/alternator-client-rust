@@ -351,7 +351,10 @@ impl Intercept for RoundRobinQueryPlanInterceptor {
 #[derive(Debug)]
 pub(crate) struct AffinityQueryPlanInterceptor {
     config: KeyRouteAffinityConfig,
-    live_nodes: Arc<LiveNodes>,
+    /// Nodes selected by the configured rack-aware routing scope.
+    routing_nodes: Arc<LiveNodes>,
+    /// Nodes across every rack in the preferred datacenter.
+    affinity_nodes: Arc<LiveNodes>,
     resolver: Arc<resolver::PartitionKeyResolver>,
 }
 
@@ -373,12 +376,14 @@ impl AffinityQueryPlanInterceptor {
     /// mappings provided by the user in the AlternatorConfig.
     pub fn new(
         config: KeyRouteAffinityConfig,
-        live_nodes: Arc<LiveNodes>,
+        routing_nodes: Arc<LiveNodes>,
+        affinity_nodes: Arc<LiveNodes>,
         resolver: Arc<resolver::PartitionKeyResolver>,
     ) -> Self {
         Self {
             config,
-            live_nodes,
+            routing_nodes,
+            affinity_nodes,
             resolver,
         }
     }
@@ -423,13 +428,13 @@ impl AffinityQueryPlanInterceptor {
                     continue;
                 };
 
-                return Some(QueryPlan::new_with_hash(self.live_nodes.clone(), hash));
+                return Some(QueryPlan::new_with_hash(self.affinity_nodes.clone(), hash));
             }
 
             return None;
         }
 
-        let affinity_nodes = QueryPlan::sorted_affinity_nodes(&self.live_nodes);
+        let affinity_nodes = QueryPlan::sorted_affinity_nodes(&self.affinity_nodes);
         let mut votes: HashMap<Arc<Url>, usize> = HashMap::new();
 
         for candidate in candidates {
@@ -443,7 +448,7 @@ impl AffinityQueryPlanInterceptor {
 
         let preferred_nodes = vote_preference_order(votes)?;
         Some(QueryPlan::new_with_preferred_nodes(
-            self.live_nodes.clone(),
+            self.affinity_nodes.clone(),
             preferred_nodes,
         ))
     }
@@ -452,7 +457,7 @@ impl AffinityQueryPlanInterceptor {
     /// when affinity doesn't apply for any reason
     fn get_query_plan(&self, input: &Input) -> QueryPlan {
         self.try_affinity_plan(input)
-            .unwrap_or_else(|| QueryPlan::new_basic(self.live_nodes.clone()))
+            .unwrap_or_else(|| QueryPlan::new_basic(self.routing_nodes.clone()))
     }
 }
 
@@ -495,7 +500,9 @@ mod tests {
     use super::*;
     use crate::keyrouting::KeyRouteAffinityType;
     use aws_sdk_dynamodb::config::Region;
-    use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemInput;
+    use aws_sdk_dynamodb::operation::{
+        batch_write_item::BatchWriteItemInput, put_item::PutItemInput,
+    };
     use aws_sdk_dynamodb::types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest};
     use aws_smithy_runtime_api::client::interceptors::context::InterceptorContext;
     use aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder;
@@ -529,6 +536,16 @@ mod tests {
         LiveNodes::new(&config).expect("live nodes")
     }
 
+    fn make_live_nodes_from_hosts(hosts: &[&str]) -> Arc<LiveNodes> {
+        let config = AlternatorConfig::builder()
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(hosts.iter().copied())
+            .build();
+
+        LiveNodes::new(&config).expect("live nodes")
+    }
+
     fn make_interceptor(
         pk_info: impl IntoIterator<Item = (&'static str, &'static str)>,
     ) -> (AffinityQueryPlanInterceptor, Arc<LiveNodes>) {
@@ -543,7 +560,12 @@ mod tests {
             make_client(),
             config.pk_info_per_table.clone(),
         ));
-        let interceptor = AffinityQueryPlanInterceptor::new(config, live_nodes.clone(), resolver);
+        let interceptor = AffinityQueryPlanInterceptor::new(
+            config,
+            live_nodes.clone(),
+            live_nodes.clone(),
+            resolver,
+        );
 
         (interceptor, live_nodes)
     }
@@ -626,6 +648,50 @@ mod tests {
             }
         }
         expected
+    }
+
+    #[test]
+    fn affinity_uses_all_racks_while_non_qualifying_writes_stay_rack_local() {
+        let routing_nodes = make_live_nodes_from_hosts(&["rack1-a.example.com"]);
+        let affinity_nodes = make_live_nodes_from_hosts(&[
+            "rack1-a.example.com",
+            "rack2-a.example.com",
+            "rack3-a.example.com",
+        ]);
+        let config = KeyRouteAffinityConfig::builder()
+            .with_type(KeyRouteAffinityType::Rmw)
+            .with_pk_info("orders", "pk")
+            .build();
+        let resolver = Arc::new(resolver::PartitionKeyResolver::new(
+            make_client(),
+            config.pk_info_per_table.clone(),
+        ));
+        let interceptor =
+            AffinityQueryPlanInterceptor::new(config, routing_nodes, affinity_nodes, resolver);
+
+        let lwt_input = Input::erase(
+            PutItemInput::builder()
+                .table_name("orders")
+                .item("pk", s("shared-key"))
+                .condition_expression("attribute_not_exists(pk)")
+                .build()
+                .unwrap(),
+        );
+        let mut lwt_nodes = node_sequence(&interceptor.get_query_plan(&lwt_input), 3);
+        lwt_nodes.sort_unstable();
+        assert_eq!(lwt_nodes, ["rack1-a", "rack2-a", "rack3-a"]);
+
+        let plain_write_input = Input::erase(
+            PutItemInput::builder()
+                .table_name("orders")
+                .item("pk", s("shared-key"))
+                .build()
+                .unwrap(),
+        );
+        assert_eq!(
+            node_sequence(&interceptor.get_query_plan(&plain_write_input), 2),
+            ["rack1-a"]
+        );
     }
 
     #[test]

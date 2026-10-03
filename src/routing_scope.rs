@@ -115,6 +115,19 @@ impl RoutingScope {
         self.dc.is_none() && self.rack.is_none()
     }
 
+    /// Returns the same scope and fallback chain without restricting the
+    /// preferred scope to one rack.
+    ///
+    /// Key-route affinity needs every rack in the preferred datacenter so
+    /// clients in different racks derive the same coordinator for a
+    /// partition. Datacenter locality and the caller's fallback policy remain
+    /// unchanged.
+    pub(crate) fn without_rack(&self) -> Self {
+        let mut scope = self.clone();
+        scope.rack = None;
+        scope
+    }
+
     /// Returns the next scope in the fallback chain, if one is configured.
     pub fn fallback(&self) -> Option<&RoutingScope> {
         self.fallback.as_deref()
@@ -146,6 +159,18 @@ mod tests {
             scope.build_localnodes_url(url).as_str(),
             "http://localhost/localnodes"
         );
+    }
+
+    #[test]
+    fn without_rack_preserves_datacenter_and_fallbacks() {
+        let scope = RoutingScope::from_rack("dc1".to_string(), "rack1".to_string())
+            .with_fallback(RoutingScope::from_cluster());
+
+        let widened = scope.without_rack();
+
+        assert_eq!(widened.dc(), Some("dc1"));
+        assert_eq!(widened.rack(), None);
+        assert!(widened.fallback().is_some_and(RoutingScope::is_cluster));
     }
 
     #[test]

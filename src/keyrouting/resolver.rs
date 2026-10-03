@@ -453,6 +453,7 @@ mod tests {
             base_builder
                 .interceptor(AffinityQueryPlanInterceptor::new(
                     affinity_config,
+                    live_nodes.clone(),
                     live_nodes,
                     resolver.clone(),
                 ))
