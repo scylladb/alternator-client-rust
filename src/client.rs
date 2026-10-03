@@ -20,6 +20,9 @@ use aws_smithy_runtime_api::{
     box_error::BoxError,
     client::{
         connector_metadata::ConnectorMetadata,
+        endpoint::{
+            EndpointFuture, EndpointResolverParams, ResolveEndpoint, SharedEndpointResolver,
+        },
         http::{HttpClient, HttpConnectorSettings, SharedHttpClient, SharedHttpConnector},
         identity::{
             IdentityFuture, ResolveCachedIdentity, SharedIdentityCache, SharedIdentityResolver,
@@ -129,6 +132,32 @@ fn validate_sdk_default_config(
     }
 
     Ok(())
+}
+
+/// Defers endpoint resolution for affinity-eligible operations until the
+/// cross-rack live-node view has completed its first successful refresh.
+#[derive(Debug)]
+struct AffinityDiscoveryEndpointResolver {
+    inner: SharedEndpointResolver,
+    affinity_nodes: std::sync::Arc<LiveNodes>,
+}
+
+impl ResolveEndpoint for AffinityDiscoveryEndpointResolver {
+    fn resolve_endpoint<'a>(&'a self, params: &'a EndpointResolverParams) -> EndpointFuture<'a> {
+        EndpointFuture::new(async move {
+            if params.get_property::<AffinityDiscoveryRequired>().is_some() {
+                self.affinity_nodes.wait_for_initial_discovery().await;
+            }
+            self.inner.resolve_endpoint(params).await
+        })
+    }
+
+    fn finalize_params<'a>(
+        &'a self,
+        params: &'a mut EndpointResolverParams,
+    ) -> Result<(), BoxError> {
+        self.inner.finalize_params(params)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -419,6 +448,17 @@ impl AlternatorClient {
             }
             _ => live_nodes.clone(),
         };
+        if let (Some(routing_nodes), Some(affinity_nodes)) =
+            (live_nodes.as_ref(), affinity_live_nodes.as_ref())
+            && !std::sync::Arc::ptr_eq(routing_nodes, affinity_nodes)
+        {
+            builder.set_endpoint_resolver(Some(SharedEndpointResolver::new(
+                AffinityDiscoveryEndpointResolver {
+                    inner: dynamodb_config.endpoint_resolver(),
+                    affinity_nodes: affinity_nodes.clone(),
+                },
+            )));
+        }
 
         // With discovery off nothing rewrites the request, so the transport
         // is decided by the scheme configured for the seed host itself.

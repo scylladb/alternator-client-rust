@@ -348,6 +348,8 @@ pub(crate) struct LiveNodes {
     native_roots_usable: bool,
     last_activity: Arc<Mutex<Instant>>,
     notify: Arc<tokio::sync::Notify>,
+    initial_discovery_complete: AtomicBool,
+    initial_discovery_notify: tokio::sync::Notify,
     discovery_tasks: Mutex<DiscoveryTaskState>,
     discovery_runtime: ArcSwapOption<DiscoveryRuntime>,
 }
@@ -640,6 +642,8 @@ impl LiveNodes {
             native_roots_usable,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             notify: Arc::new(tokio::sync::Notify::new()),
+            initial_discovery_complete: AtomicBool::new(false),
+            initial_discovery_notify: tokio::sync::Notify::new(),
             discovery_tasks: Mutex::new(DiscoveryTaskState::default()),
             discovery_runtime: ArcSwapOption::empty(),
         })))
@@ -720,6 +724,7 @@ impl LiveNodes {
             self.live_nodes.store(Arc::new(partial));
         }
         state.latest_published_generation = generation;
+        self.mark_initial_discovery_complete();
     }
 
     async fn discover_cluster_live_nodes_from(
@@ -877,6 +882,29 @@ impl LiveNodes {
         }
     }
 
+    fn mark_initial_discovery_complete(&self) {
+        if !self.initial_discovery_complete.swap(true, Ordering::AcqRel) {
+            self.initial_discovery_notify.notify_waiters();
+        }
+    }
+
+    /// Waits until discovery has published its first non-empty topology.
+    ///
+    /// Rack-scoped clients use this before their first affinity-routed request
+    /// so the deterministic coordinator is derived from every rack rather
+    /// than from whichever bootstrap seeds one client happened to receive.
+    pub(crate) async fn wait_for_initial_discovery(self: &Arc<Self>) {
+        self.ensure_discovery_started();
+
+        loop {
+            let notified = self.initial_discovery_notify.notified();
+            if self.initial_discovery_complete.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Returns a list of all current live nodes and updates the last activity timestamp.
     pub(crate) fn get_live_nodes(self: &Arc<Self>) -> Vec<Arc<Url>> {
         self.ensure_discovery_started();
@@ -983,6 +1011,7 @@ impl LiveNodes {
             self.live_nodes.store(Arc::new(new_nodes));
         }
         state.latest_published_generation = generation;
+        self.mark_initial_discovery_complete();
     }
 }
 
@@ -1088,6 +1117,34 @@ mod tests {
             releases.push(Some(release_tx));
         }
         BlockingPoolBlockers(releases)
+    }
+
+    #[tokio::test]
+    async fn initial_discovery_waits_for_a_published_topology() {
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(1)
+            .active_interval(Duration::from_secs(60))
+            .build();
+        let nodes = LiveNodes::new(&config).expect("live nodes");
+        let waiter = tokio::spawn({
+            let nodes = nodes.clone();
+            async move { nodes.wait_for_initial_discovery().await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        let generation = nodes.begin_refresh();
+        nodes.publish_live_nodes(
+            generation,
+            vec![Arc::new(Url::parse("http://127.0.0.2:1").unwrap())],
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should observe the topology")
+            .expect("waiter task should complete");
     }
 
     fn discovery_is_running(nodes: &LiveNodes) -> bool {

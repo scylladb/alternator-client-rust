@@ -15,6 +15,7 @@
 use crate::*;
 
 use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::endpoint::EndpointResolverParams;
 use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::interceptors::context::Input;
 use aws_smithy_runtime_api::client::interceptors::context::{
@@ -24,14 +25,17 @@ use aws_smithy_runtime_api::client::interceptors::context::{
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
-use std::collections::HashMap;
 use std::sync::Arc;
-use url::Url;
 
 use crate::keyrouting::affinity_config::KeyRouteAffinityConfig;
 use crate::keyrouting::classifier;
 use crate::keyrouting::hasher;
 use crate::keyrouting::resolver;
+
+/// Endpoint-resolution marker for operations that require a discovered
+/// cross-rack affinity topology before their first transmission attempt.
+#[derive(Debug)]
+pub(crate) struct AffinityDiscoveryRequired;
 
 /// Driver's main interceptor
 ///
@@ -434,23 +438,12 @@ impl AffinityQueryPlanInterceptor {
             return None;
         }
 
-        let affinity_nodes = QueryPlan::sorted_affinity_nodes(&self.affinity_nodes);
-        let mut votes: HashMap<Arc<Url>, usize> = HashMap::new();
-
-        for candidate in candidates {
-            let Some(hash) = self.candidate_partition_key_hash(&candidate) else {
-                continue;
-            };
-
-            let preferred_node = affinity_nodes.preferred_node_for_hash(hash)?;
-            *votes.entry(preferred_node).or_insert(0) += 1;
-        }
-
-        let preferred_nodes = vote_preference_order(votes)?;
-        Some(QueryPlan::new_with_preferred_nodes(
-            self.affinity_nodes.clone(),
-            preferred_nodes,
-        ))
+        let hashes: Vec<_> = candidates
+            .into_iter()
+            .filter_map(|candidate| self.candidate_partition_key_hash(&candidate))
+            .collect();
+        (!hashes.is_empty())
+            .then(|| QueryPlan::new_with_affinity_votes(self.affinity_nodes.clone(), hashes))
     }
 
     /// Builds the [`QueryPlan`] for this request. Falls back to round-robin
@@ -459,21 +452,6 @@ impl AffinityQueryPlanInterceptor {
         self.try_affinity_plan(input)
             .unwrap_or_else(|| QueryPlan::new_basic(self.routing_nodes.clone()))
     }
-}
-
-fn vote_preference_order(votes: HashMap<Arc<Url>, usize>) -> Option<Vec<Arc<Url>>> {
-    let mut voted_nodes: Vec<_> = votes.into_iter().collect();
-    if voted_nodes.is_empty() {
-        return None;
-    }
-
-    voted_nodes.sort_unstable_by(|(left_node, left_count), (right_node, right_count)| {
-        right_count
-            .cmp(left_count)
-            .then_with(|| left_node.as_str().cmp(right_node.as_str()))
-    });
-
-    Some(voted_nodes.into_iter().map(|(node, _)| node).collect())
 }
 
 impl Intercept for AffinityQueryPlanInterceptor {
@@ -488,6 +466,12 @@ impl Intercept for AffinityQueryPlanInterceptor {
         cfg: &mut ConfigBag,
     ) -> Result<(), aws_smithy_runtime_api::box_error::BoxError> {
         let input = context.input();
+        if classifier::DynamoOp::from_input(input)
+            .is_some_and(|operation| operation.should_apply(self.config.affinity_type))
+            && let Some(params) = cfg.get_mut_from_interceptor_state::<EndpointResolverParams>()
+        {
+            params.set_property(AffinityDiscoveryRequired);
+        }
         let query_plan = self.get_query_plan(input);
 
         cfg.interceptor_state().store_put(query_plan);
@@ -501,13 +485,14 @@ mod tests {
     use crate::keyrouting::KeyRouteAffinityType;
     use aws_sdk_dynamodb::config::Region;
     use aws_sdk_dynamodb::operation::{
-        batch_write_item::BatchWriteItemInput, put_item::PutItemInput,
+        batch_write_item::BatchWriteItemInput, get_item::GetItemInput, put_item::PutItemInput,
     };
     use aws_sdk_dynamodb::types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest};
     use aws_smithy_runtime_api::client::interceptors::context::InterceptorContext;
     use aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder;
     use aws_smithy_runtime_api::http::Request;
     use std::collections::HashMap;
+    use url::Url;
 
     fn s(value: &str) -> AttributeValue {
         AttributeValue::S(value.to_string())
@@ -568,6 +553,28 @@ mod tests {
         );
 
         (interceptor, live_nodes)
+    }
+
+    fn make_interceptor_with_node_sets(
+        affinity_type: KeyRouteAffinityType,
+        routing_hosts: &[&str],
+        affinity_hosts: &[&str],
+    ) -> AffinityQueryPlanInterceptor {
+        let config = KeyRouteAffinityConfig::builder()
+            .with_type(affinity_type)
+            .with_pk_info("orders", "pk")
+            .build();
+        let resolver = Arc::new(resolver::PartitionKeyResolver::new(
+            make_client(),
+            config.pk_info_per_table.clone(),
+        ));
+
+        AffinityQueryPlanInterceptor::new(
+            config,
+            make_live_nodes_from_hosts(routing_hosts),
+            make_live_nodes_from_hosts(affinity_hosts),
+            resolver,
+        )
     }
 
     fn put_write(pk_name: &str, pk_value: AttributeValue, payload: &str) -> WriteRequest {
@@ -651,23 +658,22 @@ mod tests {
     }
 
     #[test]
-    fn affinity_uses_all_racks_while_non_qualifying_writes_stay_rack_local() {
-        let routing_nodes = make_live_nodes_from_hosts(&["rack1-a.example.com"]);
-        let affinity_nodes = make_live_nodes_from_hosts(&[
+    fn rack_scoped_clients_share_lwt_affinity_coordinator() {
+        let affinity_hosts = [
             "rack1-a.example.com",
             "rack2-a.example.com",
             "rack3-a.example.com",
-        ]);
-        let config = KeyRouteAffinityConfig::builder()
-            .with_type(KeyRouteAffinityType::Rmw)
-            .with_pk_info("orders", "pk")
-            .build();
-        let resolver = Arc::new(resolver::PartitionKeyResolver::new(
-            make_client(),
-            config.pk_info_per_table.clone(),
-        ));
-        let interceptor =
-            AffinityQueryPlanInterceptor::new(config, routing_nodes, affinity_nodes, resolver);
+        ];
+        let rack1 = make_interceptor_with_node_sets(
+            KeyRouteAffinityType::Rmw,
+            &["rack1-a.example.com"],
+            &affinity_hosts,
+        );
+        let rack2 = make_interceptor_with_node_sets(
+            KeyRouteAffinityType::Rmw,
+            &["rack2-a.example.com"],
+            &affinity_hosts,
+        );
 
         let lwt_input = Input::erase(
             PutItemInput::builder()
@@ -677,20 +683,132 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let mut lwt_nodes = node_sequence(&interceptor.get_query_plan(&lwt_input), 3);
-        lwt_nodes.sort_unstable();
-        assert_eq!(lwt_nodes, ["rack1-a", "rack2-a", "rack3-a"]);
+        let rack1_coordinator = first_node(rack1.get_query_plan(&lwt_input));
+        let rack2_coordinator = first_node(rack2.get_query_plan(&lwt_input));
 
-        let plain_write_input = Input::erase(
-            PutItemInput::builder()
+        assert_eq!(rack1_coordinator, rack2_coordinator);
+        assert!(matches!(
+            rack1_coordinator.as_str(),
+            "rack1-a" | "rack2-a" | "rack3-a"
+        ));
+    }
+
+    #[test]
+    fn rack_scoped_clients_share_any_write_batch_affinity_coordinator() {
+        let affinity_hosts = [
+            "rack1-a.example.com",
+            "rack2-a.example.com",
+            "rack3-a.example.com",
+        ];
+        let rack1 = make_interceptor_with_node_sets(
+            KeyRouteAffinityType::AnyWrite,
+            &["rack1-a.example.com"],
+            &affinity_hosts,
+        );
+        let rack2 = make_interceptor_with_node_sets(
+            KeyRouteAffinityType::AnyWrite,
+            &["rack2-a.example.com"],
+            &affinity_hosts,
+        );
+        let input = batch_input("orders", vec![put_write("pk", s("shared-key"), "payload")]);
+
+        assert_eq!(
+            first_node(rack1.get_query_plan(&input)),
+            first_node(rack2.get_query_plan(&input))
+        );
+    }
+
+    #[test]
+    fn rack_scoped_clients_keep_reads_local() {
+        let affinity_hosts = [
+            "rack1-a.example.com",
+            "rack2-a.example.com",
+            "rack3-a.example.com",
+        ];
+        let rack1 = make_interceptor_with_node_sets(
+            KeyRouteAffinityType::Rmw,
+            &["rack1-a.example.com"],
+            &affinity_hosts,
+        );
+        let rack2 = make_interceptor_with_node_sets(
+            KeyRouteAffinityType::Rmw,
+            &["rack2-a.example.com"],
+            &affinity_hosts,
+        );
+        let read_input = Input::erase(
+            GetItemInput::builder()
                 .table_name("orders")
-                .item("pk", s("shared-key"))
+                .key("pk", s("shared-key"))
                 .build()
                 .unwrap(),
         );
+
         assert_eq!(
-            node_sequence(&interceptor.get_query_plan(&plain_write_input), 2),
+            node_sequence(&rack1.get_query_plan(&read_input), 2),
             ["rack1-a"]
+        );
+        assert_eq!(
+            node_sequence(&rack2.get_query_plan(&read_input), 2),
+            ["rack2-a"]
+        );
+    }
+
+    #[test]
+    fn only_affinity_operations_wait_for_cross_rack_discovery() {
+        let interceptor = make_interceptor_with_node_sets(
+            KeyRouteAffinityType::Rmw,
+            &["rack1-a.example.com"],
+            &["rack1-a.example.com", "rack2-a.example.com"],
+        );
+        let runtime_components = RuntimeComponentsBuilder::for_tests().build().unwrap();
+
+        let lwt_input = Input::erase(
+            PutItemInput::builder()
+                .table_name("orders")
+                .item("pk", s("shared-key"))
+                .condition_expression("attribute_not_exists(pk)")
+                .build()
+                .unwrap(),
+        );
+        let mut lwt_context = InterceptorContext::new(lwt_input);
+        let mut lwt_context = BeforeSerializationInterceptorContextMut::from(&mut lwt_context);
+        let mut lwt_cfg = ConfigBag::base();
+        lwt_cfg
+            .interceptor_state()
+            .store_put(EndpointResolverParams::new(()));
+        interceptor
+            .modify_before_serialization(&mut lwt_context, &runtime_components, &mut lwt_cfg)
+            .unwrap();
+        assert!(
+            lwt_cfg
+                .interceptor_state()
+                .load::<EndpointResolverParams>()
+                .and_then(|params| params.get_property::<AffinityDiscoveryRequired>())
+                .is_some()
+        );
+
+        let read_input = Input::erase(
+            GetItemInput::builder()
+                .table_name("orders")
+                .key("pk", s("shared-key"))
+                .build()
+                .unwrap(),
+        );
+        let mut read_context = InterceptorContext::new(read_input);
+        let mut read_context = BeforeSerializationInterceptorContextMut::from(&mut read_context);
+        let mut read_cfg = ConfigBag::base();
+        read_cfg
+            .interceptor_state()
+            .store_put(EndpointResolverParams::new(()));
+        interceptor
+            .modify_before_serialization(&mut read_context, &runtime_components, &mut read_cfg)
+            .unwrap();
+        assert!(
+            read_cfg
+                .interceptor_state()
+                .load::<EndpointResolverParams>()
+                .and_then(|params| params.get_property::<AffinityDiscoveryRequired>())
+                .is_none()
         );
     }
 

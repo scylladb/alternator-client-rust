@@ -20,7 +20,7 @@
 use crate::keyrouting::deterministic_rng::DeterministicRng;
 use crate::live_nodes::LiveNodes;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use url::Url;
 
@@ -30,6 +30,7 @@ pub(crate) struct QueryPlan {
     state: Mutex<QueryPlanState>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct SortedAffinityNodes {
     nodes: Vec<Arc<Url>>,
@@ -45,6 +46,12 @@ enum QueryPlanState {
         rng: DeterministicRng,
         remaining_nodes: Option<Vec<Arc<Url>>>,
     },
+    /// Batch affinity votes, resolved against the live topology on first use.
+    AffinityVotes {
+        hashes: Vec<u64>,
+        remaining_nodes: Option<VecDeque<Arc<Url>>>,
+    },
+    #[cfg(test)]
     /// Deterministic order with selected nodes before the rest.
     PreferredNodes {
         preferred_nodes: Vec<Arc<Url>>,
@@ -79,6 +86,7 @@ impl QueryPlan {
         }
     }
 
+    #[cfg(test)]
     /// Creates a query plan that tries `preferred_nodes` first, then the
     /// remaining live nodes in sorted order.
     pub(crate) fn new_with_preferred_nodes(
@@ -94,6 +102,23 @@ impl QueryPlan {
         }
     }
 
+    /// Creates a batch-affinity plan whose vote targets are resolved lazily.
+    ///
+    /// Endpoint resolution may wait for initial cross-rack discovery after
+    /// serialization, so converting hashes to nodes here would capture the
+    /// bootstrap seed set too early.
+    pub(crate) fn new_with_affinity_votes(live_nodes: Arc<LiveNodes>, hashes: Vec<u64>) -> Self {
+        debug_assert!(!hashes.is_empty());
+        Self {
+            live_nodes,
+            state: Mutex::new(QueryPlanState::AffinityVotes {
+                hashes,
+                remaining_nodes: None,
+            }),
+        }
+    }
+
+    #[cfg(test)]
     /// Returns the current live-node list in the canonical order used by
     /// affinity routing.
     pub(crate) fn sorted_affinity_nodes(live_nodes: &Arc<LiveNodes>) -> SortedAffinityNodes {
@@ -140,6 +165,15 @@ impl QueryPlan {
 
                 Some(selected_node)
             }
+            QueryPlanState::AffinityVotes {
+                hashes,
+                remaining_nodes,
+            } => {
+                let remaining = remaining_nodes
+                    .get_or_insert_with(|| affinity_vote_order(&self.live_nodes, hashes));
+                remaining.pop_front()
+            }
+            #[cfg(test)]
             QueryPlanState::PreferredNodes {
                 preferred_nodes,
                 remaining_nodes,
@@ -198,6 +232,10 @@ impl QueryPlan {
                 *rng = DeterministicRng::new(*seed);
                 *remaining_nodes = None;
             }
+            QueryPlanState::AffinityVotes {
+                remaining_nodes, ..
+            } => *remaining_nodes = None,
+            #[cfg(test)]
             QueryPlanState::PreferredNodes {
                 remaining_nodes, ..
             } => *remaining_nodes = None,
@@ -205,6 +243,38 @@ impl QueryPlan {
     }
 }
 
+fn affinity_vote_order(live_nodes: &Arc<LiveNodes>, hashes: &[u64]) -> VecDeque<Arc<Url>> {
+    let mut nodes = live_nodes.get_live_nodes();
+    sort_node_urls(&mut nodes);
+    if nodes.is_empty() {
+        return VecDeque::new();
+    }
+
+    let mut votes: HashMap<Arc<Url>, usize> = HashMap::new();
+    for hash in hashes {
+        let mut rng = DeterministicRng::new(*hash as i64);
+        let preferred = nodes[rng.index(nodes.len())].clone();
+        *votes.entry(preferred).or_insert(0) += 1;
+    }
+
+    let mut voted_nodes: Vec<_> = votes.into_iter().collect();
+    voted_nodes.sort_unstable_by(|(left_node, left_count), (right_node, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_node.as_str().cmp(right_node.as_str()))
+    });
+
+    let mut ordered = VecDeque::with_capacity(nodes.len());
+    for (voted_node, _) in voted_nodes {
+        if let Some(index) = nodes.iter().position(|node| node == &voted_node) {
+            ordered.push_back(nodes.remove(index));
+        }
+    }
+    ordered.extend(nodes);
+    ordered
+}
+
+#[cfg(test)]
 impl SortedAffinityNodes {
     fn from_live_nodes(live_nodes: &Arc<LiveNodes>) -> Self {
         let mut nodes = live_nodes.get_live_nodes();
