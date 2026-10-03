@@ -22,6 +22,7 @@ set -euo pipefail
 
 version=$1
 commit_sha=$2
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 run_id=${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}
 run_attempt=${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}
 
@@ -58,6 +59,7 @@ else
 
     git config user.name "github-actions[bot]"
     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    bash "$script_dir/check-release-blockers.sh"
     git tag -a "$rc_tag" "$commit_sha" -m "Release candidate $rc_tag
 
 workflow-run: $run_id

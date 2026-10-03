@@ -24,11 +24,14 @@ package_dir=$1
 version=$2
 candidate_crate=$3
 package_name=alternator-client
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 [[ -n "${CARGO_REGISTRY_TOKEN:-}" ]] || {
     echo "trusted-publishing token is missing" >&2
     exit 1
 }
+
+bash "$script_dir/check-release-blockers.sh"
 
 set +e
 (

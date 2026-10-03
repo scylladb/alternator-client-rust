@@ -108,6 +108,20 @@ existing final tag, or a version that was already published outside recovery.
 It selects the next unused RC number and atomically creates an annotated tag,
 for example `v1.0.0-rc.1`.
 
+An open GitHub issue with the exact `release-blocker` label stops release
+mutation; pull requests with that label do not count. The check verifies that
+the label exists, queries every page of matching open issues, and fails closed
+on missing label configuration, API, authentication, or rate-limit errors,
+pagination failures, and malformed responses.
+
+The release process checks immediately before creating a new RC tag,
+publishing an absent version to crates.io, pushing a missing final tag, and
+publishing the verified draft GitHub Release. Existing exact registry bytes,
+run-owned tags, draft releases, and published immutable releases remain
+authoritative recovery state. After a blocker is cleared or API access
+recovers, rerun the failed jobs from the same workflow run; there is no blocker
+bypass.
+
 The candidate artifact is named
 `alternator-client-vX.Y.Z-rc.N-attempt-K`, where `K` is the workflow attempt.
 It contains:
@@ -166,7 +180,7 @@ change the archive.
 Run all commands below in the same dedicated Bash session; they deliberately
 use a new temporary directory and stop on failed checks. Set `RUN_ID`, `RC_TAG`,
 and `ARTIFACT_NAME` from the stopped workflow. Use an authenticated `gh`
-session with read access to the repository.
+session with read access to the repository and its issues.
 
 ```sh
 set -euo pipefail
@@ -174,6 +188,8 @@ export RUN_ID=123456789
 export RC_TAG=v1.0.0-rc.1
 export ARTIFACT_NAME=alternator-client-v1.0.0-rc.1-attempt-1
 export REPOSITORY=scylladb/alternator-client-rust
+export GITHUB_REPOSITORY="$REPOSITORY"
+export GH_TOKEN="$(gh auth token)"
 
 release_root="$(mktemp -d)"
 git clone --no-checkout https://github.com/scylladb/alternator-client-rust.git \
@@ -266,14 +282,16 @@ RC instead.
 Using the crates.io account that will own the new package, with its email
 address verified, create a local API token with endpoint scope `publish-new`,
 crate scope exactly `alternator-client`, and the shortest practical expiry.
-Copy it into the shell
-without echoing or committing it, and publish from the same unchanged RC
-checkout:
+Copy it into an unexported shell variable without echoing or committing it.
+Recheck release blockers immediately before publication, then expose the token
+only to Cargo and publish from the same unchanged RC checkout:
 
 ```sh
-read -rsp 'crates.io token: ' CARGO_REGISTRY_TOKEN
-export CARGO_REGISTRY_TOKEN
+read -rsp 'crates.io token: ' registry_token
 printf '\n'
+bash "$release_root/source/scripts/release/check-release-blockers.sh"
+export CARGO_REGISTRY_TOKEN="$registry_token"
+unset registry_token
 publish_status=0
 (
   cd "$release_root/source"

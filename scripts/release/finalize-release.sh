@@ -27,6 +27,7 @@ candidate_dir=$4
 evidence_file=$5
 package_name=alternator-client
 final_tag="v$version"
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 for command in curl gh git jq shasum; do
     command -v "$command" >/dev/null || {
@@ -78,6 +79,7 @@ if git rev-parse -q --verify "refs/tags/$final_tag" >/dev/null; then
 else
     git config user.name "github-actions[bot]"
     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    bash "$script_dir/check-release-blockers.sh"
     git tag -a "$final_tag" "$commit_sha" -m "Release $package_name $version
 
 Promoted from: $rc_tag
@@ -250,6 +252,7 @@ remote_final_commit=$(git ls-remote origin "refs/tags/$final_tag^{}" | awk '{ pr
     exit 1
 }
 
+bash "$script_dir/check-release-blockers.sh"
 gh release edit "$final_tag" --repo "$GITHUB_REPOSITORY" --draft=false
 
 for attempt in $(seq 1 12); do
