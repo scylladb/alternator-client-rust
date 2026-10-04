@@ -82,7 +82,7 @@ fn assert_tls_outcomes(outcomes: &[BuildOutcome; 5]) {
         .as_ref()
         .expect_err("HTTPS discovery must reject unusable native roots");
     assert!(
-        discovery_error.contains("failed to configure discovery TLS"),
+        discovery_error.contains("failed to configure SDK TLS"),
         "{discovery_error}"
     );
 

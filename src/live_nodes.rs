@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Maintains and updates a list of known live Alternator nodes using the `/localnodes` endpoint.
+//! Maintains and updates a list of known Alternator nodes using Scylla system tables.
 //!
 //! # Overview
 //!
 //! [`LiveNodes`] is constructed from an [`AlternatorConfig`] and seeded with a list of hosts.
 //! When [`ensure_discovery_started`] finds an active Tokio runtime, it launches a
-//! background task which periodically calls [`update_live_nodes`] to request the known
-//! nodes in a random order to get an updated list of live nodes. After a
-//! successful refresh, the list is updated to nodes from the highest available
-//! scope in the fallback chain provided by the user.
-//! Discovery reuses a configured AWS SDK HTTP client so custom transport and
-//! TLS settings also apply to `/localnodes`. Without one, it uses a basic
-//! [`reqwest::Client`] with timeouts and native CA roots.
+//! background task which periodically calls [`update_live_nodes`] to query the
+//! `.scylla.alternator.system.local` and `.scylla.alternator.system.peers`
+//! virtual tables through a known node. After a successful refresh, the list is
+//! updated to nodes from the highest available scope in the fallback chain
+//! provided by the user. Discovery uses an injected [`aws_sdk_dynamodb::Client`]
+//! so it shares configured transport, authentication, and TLS settings.
 //!
 //! # Polling cadence
 //!
@@ -39,26 +38,21 @@
 //!
 //! # Discovery mechanism
 //!
-//! Each refresh starts from the highest scope in the fallback chain, shuffles
-//! the current node list, and walks it as a candidate queue:
-//! - If a node responds with a non-empty list, the list is used as the new live nodes list,
-//!   and the refresh ends.
-//! - If a node responds with an empty list, it is put back at the end of the queue,
-//!   and the next node is tried, with the next fallback scope.
-//! - A network error causes the node to be dropped from the queue, but the next nodes are
-//!   tried with the same scope.
-//! - If the queue is exhausted without a successful response, it is populated with
-//!   the seed nodes, and the process repeats. If the seeds are exhausted without success, the refresh ends with no changes.
+//! Each refresh shuffles the current node list and walks it as a candidate
+//! queue. A pair of scans is pinned to each candidate endpoint and reads
+//! `rpc_address`, `data_center`, and `rack` from both virtual tables:
+//! - Both scans, including all pagination, must succeed before the snapshot is
+//!   considered complete.
+//! - The client filters that snapshot through the preferred routing scope and
+//!   each configured fallback, publishing the first non-empty node set.
+//! - A scan or network error drops that candidate and tries the next one.
+//! - If the current candidates are exhausted, the original seed nodes get one
+//!   recovery pass. Exhausting them, or finding no matching scope, leaves the
+//!   last published node set unchanged.
 //!
-//! For cluster-wide scope, the refresh queries `/localnodes` from configured
-//! seed nodes and already-known live nodes, then unions the responses. To cover
-//! all datacenters, the initial configuration must include at least one working
-//! seed host from every datacenter that should receive traffic. Each non-empty
-//! response is published as a union with the current snapshot so responsive
-//! datacenters become routable without waiting for every stale candidate. The
-//! completed union replaces that partial snapshot after the pass finishes.
-//!
-//! Once it successfully gets a non-empty response, it atomically updates the [`live_nodes`] list using [`ArcSwap`].
+//! System-table membership describes topology rather than independently probed
+//! liveness. Once discovery gets a non-empty topology, it atomically updates
+//! the [`live_nodes`] list using [`ArcSwap`].
 //!
 //!  # Lifetime
 //!
@@ -102,11 +96,8 @@
 
 use crate::routing_scope::RoutingScope;
 use arc_swap::{ArcSwap, ArcSwapOption};
-use aws_sdk_dynamodb::config::{SharedAsyncSleep, SharedHttpClient};
-use aws_smithy_async::time::SharedTimeSource;
-use aws_smithy_runtime::client::orchestrator::operation::Operation;
-use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, OrchestratorError};
-use aws_smithy_types::timeout::TimeoutConfig;
+use aws_sdk_dynamodb::types::AttributeValue;
+use aws_smithy_types::{retry::RetryConfig, timeout::TimeoutConfig};
 use futures_util::FutureExt;
 use rand::seq::SliceRandom;
 use std::collections::{HashMap, VecDeque};
@@ -119,9 +110,13 @@ use url::Url;
 const DEFAULT_ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DISCOVERY_HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCOVERY_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIAL_DISCOVERY_WAIT_SLACK: Duration = Duration::from_secs(1);
+const SYSTEM_LOCAL_TABLE: &str = ".scylla.alternator.system.local";
+const SYSTEM_PEERS_TABLE: &str = ".scylla.alternator.system.peers";
+const TOPOLOGY_PROJECTION: &str = "rpc_address,data_center,rack";
 
-/// An error encountered while constructing live-node discovery state.
+/// An error encountered while constructing topology-discovery state.
 #[derive(Debug)]
 pub(crate) enum LiveNodesBuildError {
     MissingRoutingTarget,
@@ -130,8 +125,6 @@ pub(crate) enum LiveNodesBuildError {
         source: url::ParseError,
     },
     InvalidScheme(String),
-    TlsConfiguration(String),
-    HttpClient(reqwest::Error),
 }
 
 impl std::fmt::Display for LiveNodesBuildError {
@@ -146,15 +139,6 @@ impl std::fmt::Display for LiveNodesBuildError {
                 formatter,
                 "invalid Alternator transport scheme {scheme:?}: expected http or https, or a valid custom URI scheme for direct routing with a custom HTTP client"
             ),
-            Self::TlsConfiguration(message) => {
-                write!(formatter, "failed to configure discovery TLS: {message}")
-            }
-            Self::HttpClient(source) => {
-                write!(
-                    formatter,
-                    "failed to build the HTTP client for live-node discovery: {source}"
-                )
-            }
         }
     }
 }
@@ -164,41 +148,8 @@ impl std::error::Error for LiveNodesBuildError {
         match self {
             Self::MissingRoutingTarget | Self::InvalidScheme(_) => None,
             Self::InvalidSeedHost { source, .. } => Some(source),
-            Self::TlsConfiguration(_) => None,
-            Self::HttpClient(source) => Some(source),
         }
     }
-}
-
-#[cfg(test)]
-fn discovery_http_client_builder(
-    scheme: &str,
-) -> Result<reqwest::ClientBuilder, LiveNodesBuildError> {
-    discovery_http_client_builder_with_root_status(scheme).map(|(builder, _)| builder)
-}
-
-fn discovery_http_client_builder_with_root_status(
-    scheme: &str,
-) -> Result<(reqwest::ClientBuilder, bool), LiveNodesBuildError> {
-    let (roots, errors) = load_native_root_store();
-    let native_roots_usable = !roots.is_empty();
-    if scheme.eq_ignore_ascii_case("https") && !native_roots_usable {
-        return Err(LiveNodesBuildError::TlsConfiguration(
-            unusable_native_roots_message(errors),
-        ));
-    }
-
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|error| LiveNodesBuildError::TlsConfiguration(error.to_string()))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-
-    Ok((
-        reqwest::Client::builder().use_preconfigured_tls(tls_config),
-        native_roots_usable,
-    ))
 }
 
 fn load_native_root_store() -> (rustls::RootCertStore, Vec<String>) {
@@ -241,100 +192,6 @@ fn unusable_native_roots_message(errors: Vec<String>) -> String {
     }
 }
 
-fn build_default_discovery_http_client(
-    scheme: &str,
-) -> Result<(DiscoveryHttpClient, bool), LiveNodesBuildError> {
-    let (builder, native_roots_usable) = discovery_http_client_builder_with_root_status(scheme)?;
-    let client = builder
-        .timeout(DISCOVERY_HTTP_OPERATION_TIMEOUT)
-        .connect_timeout(Duration::from_secs(2))
-        .build()
-        .map_err(LiveNodesBuildError::HttpClient)?;
-    Ok((DiscoveryHttpClient::Reqwest(client), native_roots_usable))
-}
-
-fn build_discovery_http_client(
-    config: &crate::config::AlternatorConfig,
-    scheme: &str,
-) -> Result<(DiscoveryHttpClient, bool), LiveNodesBuildError> {
-    match config.http_client() {
-        Some(http_client) => Ok((
-            DiscoveryHttpClient::Smithy {
-                http_client,
-                sleep_impl: config.sleep_impl(),
-                time_source: config.time_source(),
-            },
-            false,
-        )),
-        None => build_default_discovery_http_client(scheme),
-    }
-}
-
-#[derive(Debug)]
-enum DiscoveryHttpClient {
-    Reqwest(reqwest::Client),
-    Smithy {
-        http_client: SharedHttpClient,
-        sleep_impl: Option<SharedAsyncSleep>,
-        time_source: Option<SharedTimeSource>,
-    },
-}
-
-impl DiscoveryHttpClient {
-    async fn get_live_nodes(&self, url: &Url) -> Option<Vec<String>> {
-        match self {
-            Self::Reqwest(client) => client
-                .get(url.clone())
-                .send()
-                .await
-                .ok()?
-                .json::<Vec<String>>()
-                .await
-                .ok(),
-            Self::Smithy {
-                http_client,
-                sleep_impl,
-                time_source,
-            } => {
-                let endpoint_url = url.origin().ascii_serialization();
-                let mut builder = Operation::builder()
-                    .service_name("alternator")
-                    .operation_name("DiscoverLiveNodes")
-                    .behavior_version(crate::config::ALTERNATOR_BEHAVIOR_VERSION())
-                    .http_client(http_client.clone())
-                    .endpoint_url(&endpoint_url)
-                    .no_auth()
-                    .no_retry()
-                    .timeout_config(
-                        TimeoutConfig::builder()
-                            .connect_timeout(Duration::from_secs(2))
-                            .operation_timeout(DISCOVERY_HTTP_OPERATION_TIMEOUT)
-                            .build(),
-                    )
-                    .with_connection_poisoning();
-                if let Some(sleep_impl) = sleep_impl {
-                    builder = builder.sleep_impl(sleep_impl.clone());
-                }
-                if let Some(time_source) = time_source {
-                    builder = builder.time_source(time_source.clone());
-                }
-                builder
-                    .serializer(|url: Url| HttpRequest::get(url.as_str()).map_err(Into::into))
-                    .deserializer::<_, std::convert::Infallible>(|response| {
-                        let body = response.body().bytes().ok_or_else(|| {
-                            OrchestratorError::other("discovery response body was not buffered")
-                        })?;
-                        serde_json::from_slice(body).map_err(OrchestratorError::other)
-                    })
-                    .build()
-                    .invoke(url.clone())
-                    .await
-                    .ok()
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct LiveNodes {
     routing_scope: RoutingScope,
@@ -346,8 +203,7 @@ pub(crate) struct LiveNodes {
     seed_urls: Vec<Arc<Url>>,
     alternator_scheme: String,
     port: Option<u16>,
-    client: DiscoveryHttpClient,
-    native_roots_usable: bool,
+    client: aws_sdk_dynamodb::Client,
     last_activity: Arc<Mutex<Instant>>,
     notify: Arc<tokio::sync::Notify>,
     initial_discovery_complete: AtomicBool,
@@ -413,6 +269,34 @@ impl ShutdownProbe {
 struct RefreshState {
     next_generation: u64,
     latest_published_generation: u64,
+}
+
+#[derive(Debug)]
+struct TopologyRow {
+    rpc_address: String,
+    data_center: String,
+    rack: String,
+}
+
+impl TopologyRow {
+    fn from_item(
+        item: &HashMap<String, AttributeValue>,
+        rpc_address_fallback: Option<&str>,
+    ) -> Option<Self> {
+        let rpc_address = item
+            .get("rpc_address")
+            .and_then(|value| value.as_s().ok())
+            .and_then(|address| address.parse::<std::net::IpAddr>().ok())
+            .filter(|address| !address.is_unspecified())
+            .map(|address| address.to_string())
+            .or_else(|| rpc_address_fallback.map(str::to_owned))?;
+
+        Some(Self {
+            rpc_address,
+            data_center: item.get("data_center")?.as_s().ok()?.clone(),
+            rack: item.get("rack")?.as_s().ok()?.clone(),
+        })
+    }
 }
 
 impl DiscoveryRuntime {
@@ -549,20 +433,32 @@ impl LiveNodes {
     ///
     /// # Panics
     ///
-    /// Panics if routing configuration is missing or invalid, or if the
-    /// discovery HTTP client cannot be constructed. Invalid routing
+    /// Panics if routing configuration is missing or invalid. Invalid routing
     /// configuration fails closed instead of falling back to an unrelated SDK
     /// endpoint.
     #[cfg(test)]
     pub(crate) fn new(config: &crate::config::AlternatorConfig) -> Option<Arc<Self>> {
-        Self::try_new(config)
+        Self::try_new_for_test(config)
             .unwrap_or_else(|error| panic!("failed to construct LiveNodes: {error}"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_new_for_test(
+        config: &crate::config::AlternatorConfig,
+    ) -> Result<Option<Arc<Self>>, LiveNodesBuildError> {
+        let mut builder = config.dynamodb_config.to_builder().allow_no_auth();
+        if config.region().is_none() {
+            builder = builder.region(aws_sdk_dynamodb::config::Region::from_static("us-east-1"));
+        }
+        let client = aws_sdk_dynamodb::Client::from_conf(builder.build());
+        Self::try_new(config, client)
     }
 
     pub(crate) fn try_new(
         config: &crate::config::AlternatorConfig,
+        client: aws_sdk_dynamodb::Client,
     ) -> Result<Option<Arc<Self>>, LiveNodesBuildError> {
-        Self::try_new_with_scope(config, None)
+        Self::try_new_with_scope(config, None, client)
     }
 
     /// Creates discovery state using `routing_scope` instead of the scope in
@@ -570,13 +466,15 @@ impl LiveNodes {
     pub(crate) fn try_new_for_scope(
         config: &crate::config::AlternatorConfig,
         routing_scope: RoutingScope,
+        client: aws_sdk_dynamodb::Client,
     ) -> Result<Option<Arc<Self>>, LiveNodesBuildError> {
-        Self::try_new_with_scope(config, Some(routing_scope))
+        Self::try_new_with_scope(config, Some(routing_scope), client)
     }
 
     fn try_new_with_scope(
         config: &crate::config::AlternatorConfig,
         routing_scope: Option<RoutingScope>,
+        client: aws_sdk_dynamodb::Client,
     ) -> Result<Option<Arc<Self>>, LiveNodesBuildError> {
         let active_interval = config
             .active_interval()
@@ -634,8 +532,6 @@ impl LiveNodes {
             })
             .collect::<Result<Vec<_>, _>>()?;
         seed_urls.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-        let (client, native_roots_usable) =
-            build_discovery_http_client(config, seed_urls[0].scheme())?;
 
         Ok(Some(Arc::new(Self {
             routing_scope,
@@ -648,7 +544,6 @@ impl LiveNodes {
             alternator_scheme,
             port,
             client,
-            native_roots_usable,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             notify: Arc::new(tokio::sync::Notify::new()),
             initial_discovery_complete: AtomicBool::new(false),
@@ -658,42 +553,92 @@ impl LiveNodes {
         })))
     }
 
-    pub(crate) fn scheme(&self) -> &str {
-        self.seed_urls[0].scheme()
-    }
-
-    pub(crate) fn has_usable_native_roots(&self) -> bool {
-        self.native_roots_usable
-    }
-
     fn host_to_uri(&self, addr: &str) -> Result<Url, url::ParseError> {
         build_node_url(&self.alternator_scheme, addr, self.port)
     }
 
-    async fn fetch_live_nodes_for_scope(
+    async fn scan_topology_table(
         &self,
-        scope: &RoutingScope,
+        table_name: &str,
         node_addr: &Url,
-    ) -> Option<Vec<Arc<Url>>> {
-        let url = scope.build_localnodes_url(node_addr.clone());
-        let mut nodes = self.client.get_live_nodes(&url).await?;
+        rpc_address_fallback: Option<&str>,
+    ) -> Option<Vec<TopologyRow>> {
+        let endpoint_url = node_addr.origin().ascii_serialization();
+        let deadline = tokio::time::Instant::now() + DISCOVERY_HTTP_OPERATION_TIMEOUT;
 
-        nodes.sort();
-        Some(
-            nodes
-                .into_iter()
-                .filter_map(|addr| self.host_to_uri(&addr).ok().map(Arc::new))
-                .collect(),
-        )
+        tokio::time::timeout_at(deadline, async {
+            let mut rows = Vec::new();
+            let mut exclusive_start_key = None;
+
+            loop {
+                let config_override = aws_sdk_dynamodb::Config::builder()
+                    .endpoint_url(&endpoint_url)
+                    .retry_config(RetryConfig::disabled())
+                    .timeout_config(
+                        TimeoutConfig::builder()
+                            .connect_timeout(DISCOVERY_HTTP_CONNECT_TIMEOUT)
+                            .operation_timeout(DISCOVERY_HTTP_OPERATION_TIMEOUT)
+                            .build(),
+                    );
+                let output = self
+                    .client
+                    .scan()
+                    .table_name(table_name)
+                    .projection_expression(TOPOLOGY_PROJECTION)
+                    .set_exclusive_start_key(exclusive_start_key)
+                    .customize()
+                    .config_override(config_override)
+                    .send()
+                    .await
+                    .ok()?;
+
+                rows.extend(
+                    output
+                        .items()
+                        .iter()
+                        .filter_map(|item| TopologyRow::from_item(item, rpc_address_fallback)),
+                );
+                exclusive_start_key = output
+                    .last_evaluated_key()
+                    .filter(|key| !key.is_empty())
+                    .cloned();
+                if exclusive_start_key.is_none() {
+                    return Some(rows);
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
-    fn cluster_discovery_candidates(&self) -> Vec<Arc<Url>> {
-        let mut candidates = self.live_nodes.load().as_ref().clone();
-        candidates.extend(self.seed_urls.iter().cloned());
-        candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        candidates.dedup_by(|a, b| a.as_str() == b.as_str());
-        candidates.shuffle(&mut rand::rng());
-        candidates
+    async fn fetch_topology(&self, node_addr: &Url) -> Option<Vec<TopologyRow>> {
+        // Treat the two complete scans as one snapshot: publishing rows from
+        // only one table could silently drop the local node or every peer.
+        let local_address = node_addr.host_str()?;
+        let mut rows = self
+            .scan_topology_table(SYSTEM_LOCAL_TABLE, node_addr, Some(local_address))
+            .await?;
+        if rows.is_empty() {
+            return None;
+        }
+        rows.extend(
+            self.scan_topology_table(SYSTEM_PEERS_TABLE, node_addr, None)
+                .await?,
+        );
+        Some(rows)
+    }
+
+    fn topology_for_scope(&self, topology: &[TopologyRow], scope: &RoutingScope) -> Vec<Arc<Url>> {
+        let mut nodes = topology
+            .iter()
+            .filter(|row| scope.contains(&row.data_center, &row.rack))
+            .filter_map(|row| self.host_to_uri(&row.rpc_address).ok().map(Arc::new))
+            .collect::<Vec<_>>();
+
+        nodes.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        nodes.dedup_by(|left, right| left.as_str() == right.as_str());
+        nodes
     }
 
     fn begin_refresh(&self) -> u64 {
@@ -706,70 +651,6 @@ impl LiveNodes {
             .checked_add(1)
             .expect("live-node refresh generation overflowed");
         state.next_generation
-    }
-
-    async fn discover_cluster_live_nodes(&self, generation: u64) -> Option<Vec<Arc<Url>>> {
-        self.discover_cluster_live_nodes_from(generation, self.cluster_discovery_candidates())
-            .await
-    }
-
-    fn publish_partial_cluster_live_nodes(&self, generation: u64, discovered: &[Arc<Url>]) {
-        let mut state = self
-            .refresh_state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if generation < state.latest_published_generation {
-            return;
-        }
-
-        let current = self.live_nodes.load_full();
-        let mut partial = Vec::with_capacity(current.len() + discovered.len());
-        partial.extend(current.iter().cloned());
-        partial.extend(discovered.iter().cloned());
-        partial.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        partial.dedup_by(|a, b| a.as_str() == b.as_str());
-
-        if current.as_ref() != &partial {
-            self.live_nodes.store(Arc::new(partial));
-            // Only real candidate growth extends the readiness budget.
-            self.initial_discovery_notify.notify_waiters();
-        }
-        state.latest_published_generation = generation;
-    }
-
-    async fn discover_cluster_live_nodes_from(
-        &self,
-        generation: u64,
-        candidates: Vec<Arc<Url>>,
-    ) -> Option<Vec<Arc<Url>>> {
-        let scope = RoutingScope::from_cluster();
-        let mut new_nodes = Vec::new();
-        let mut got_response = false;
-
-        for node_addr in candidates {
-            if node_is_in_list(&node_addr, &new_nodes) {
-                continue;
-            }
-
-            if let Some(mut nodes) = self.fetch_live_nodes_for_scope(&scope, &node_addr).await {
-                got_response = true;
-                let response_was_nonempty = !nodes.is_empty();
-                new_nodes.append(&mut nodes);
-                new_nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-                new_nodes.dedup_by(|a, b| a.as_str() == b.as_str());
-                if response_was_nonempty {
-                    self.publish_partial_cluster_live_nodes(generation, &new_nodes);
-                }
-            }
-        }
-
-        if !got_response {
-            return None;
-        }
-
-        new_nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        new_nodes.dedup_by(|a, b| a.as_str() == b.as_str());
-        Some(new_nodes)
     }
 
     /// Ensures the background discovery task is running.
@@ -869,13 +750,14 @@ impl LiveNodes {
                     )
                 };
 
-                if !is_idle {
-                    tokio::time::sleep(active_interval).await;
+                let interval = if is_idle {
+                    idle_interval
                 } else {
-                    tokio::select! {
-                        _ = tokio::time::sleep(idle_interval) => {}
-                        _ = notify.notified() => {}
-                    }
+                    active_interval
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = notify.notified() => {}
                 }
             }
         });
@@ -917,10 +799,9 @@ impl LiveNodes {
         scheduling_slack: Duration,
     ) -> bool {
         let started = tokio::time::Instant::now();
-        let mut observed_live_count = self.live_nodes.load().len();
-        let mut deadline = started
+        let deadline = started
             + self.initial_discovery_wait_timeout_for_live_count(
-                observed_live_count,
+                self.live_nodes.load().len(),
                 request_timeout,
                 scheduling_slack,
             );
@@ -928,34 +809,20 @@ impl LiveNodes {
         loop {
             let notified = self.initial_discovery_notify.notified();
             // Register for owner-exit notifications before checking ownership,
-            // then retry on every wake so this runtime can take over from an
-            // owner that stopped during the wait.
+            // then request an immediate refresh. Retry on every wake so this
+            // runtime can also take over from an owner that stopped during the
+            // wait.
             self.ensure_discovery_started();
             if self.initial_discovery_complete.load(Ordering::Acquire) {
                 return true;
             }
+            self.notify.notify_one();
 
             let timed_out = tokio::time::timeout_at(deadline, notified).await.is_err();
             if self.initial_discovery_complete.load(Ordering::Acquire) {
                 return true;
             }
-
-            let live_count = self.live_nodes.load().len();
-            let made_progress = live_count > observed_live_count;
-            if made_progress {
-                observed_live_count = live_count;
-                // Anchor every revision to the original start. Newly found
-                // candidates add only their own request allowance; repeated
-                // notifications cannot roll the full timeout forward.
-                deadline = started
-                    + self.initial_discovery_wait_timeout_for_live_count(
-                        observed_live_count,
-                        request_timeout,
-                        scheduling_slack,
-                    );
-            }
-
-            if tokio::time::Instant::now() >= deadline || (timed_out && !made_progress) {
+            if timed_out || tokio::time::Instant::now() >= deadline {
                 return false;
             }
         }
@@ -978,32 +845,26 @@ impl LiveNodes {
     ) -> Duration {
         let seed_count = u32::try_from(self.seed_urls.len()).unwrap_or(u32::MAX);
         let live_count = u32::try_from(live_count).unwrap_or(u32::MAX);
-        let scope_count = u32::try_from(
-            std::iter::successors(Some(&self.routing_scope), |scope| scope.fallback()).count(),
-        )
-        .unwrap_or(u32::MAX);
-
-        // A failed scoped pass can visit the current candidates and then all
-        // original seeds. A cluster fallback can visit the union of those two
-        // sets. Add one request per configured scope for empty-result
-        // fallback traversal, then a small scheduling margin.
+        // A failed pass can visit the current candidates and then all original
+        // seeds. Each candidate needs one bounded system.local scan and one
+        // bounded system.peers scan. Scope fallback filters the same snapshot
+        // locally, so it adds no network allowance.
         let candidate_budget = seed_count.saturating_add(live_count);
-        let request_budget = candidate_budget
-            .saturating_mul(2)
-            .saturating_add(scope_count);
+        let request_budget = candidate_budget.saturating_mul(2);
         request_timeout
             .saturating_mul(request_budget)
             .saturating_add(scheduling_slack)
     }
 
-    /// Returns a list of all current live nodes and updates the last activity timestamp.
+    /// Returns all currently discovered topology nodes and updates activity.
     pub(crate) fn get_live_nodes(self: &Arc<Self>) -> Vec<Arc<Url>> {
         self.ensure_discovery_started();
         self.mark_activity();
         self.live_nodes.load().as_ref().clone()
     }
 
-    /// Returns the first live node not in `used_nodes` starting with the next node in round-robin order.
+    /// Returns the first discovered node not in `used_nodes`, starting at the
+    /// next round-robin position.
     /// Used by [`crate::QueryPlan`] round-robin strategy.
     pub(crate) fn get_next_node_round_robin(
         self: &Arc<Self>,
@@ -1038,36 +899,15 @@ impl LiveNodes {
 
     async fn update_live_nodes(&self) {
         let generation = self.begin_refresh();
-        let mut scope = &self.routing_scope;
-        // Live nodes in a random order.
+        // Try discovered topology nodes in a random order.
         let mut nodes = self.live_nodes.load().as_ref().clone();
         nodes.shuffle(&mut rand::rng());
         let mut candidates: VecDeque<Arc<Url>> = nodes.into();
         let mut using_seeds = false;
 
         while let Some(node_addr) = candidates.pop_front() {
-            if scope.is_cluster() {
-                let Some(new_nodes) = self.discover_cluster_live_nodes(generation).await else {
-                    return;
-                };
-
-                if new_nodes.is_empty() {
-                    let Some(fallback) = scope.fallback() else {
-                        return;
-                    };
-                    scope = fallback;
-                    candidates.push_back(node_addr);
-                    continue;
-                }
-
-                self.publish_live_nodes(generation, new_nodes);
-                return;
-            }
-
-            let result = self.fetch_live_nodes_for_scope(scope, &node_addr).await;
-
             // Request failed: try the next candidate, or fall back to seeds.
-            let Some(new_nodes) = result else {
+            let Some(topology) = self.fetch_topology(&node_addr).await else {
                 if candidates.is_empty() && !using_seeds {
                     using_seeds = true;
                     candidates = self.seed_urls.clone().into();
@@ -1075,18 +915,21 @@ impl LiveNodes {
                 continue;
             };
 
-            // Empty result: retry under a fallback scope if one exists.
-            if new_nodes.is_empty() {
+            // One system-table snapshot covers every routing scope. Walk the
+            // fallback chain locally instead of issuing another pair of scans.
+            let mut scope = &self.routing_scope;
+            loop {
+                let new_nodes = self.topology_for_scope(&topology, scope);
+                if !new_nodes.is_empty() {
+                    self.publish_live_nodes(generation, new_nodes);
+                    return;
+                }
+
                 let Some(fallback) = scope.fallback() else {
                     return;
                 };
                 scope = fallback;
-                candidates.push_back(node_addr);
-                continue;
             }
-
-            self.publish_live_nodes(generation, new_nodes);
-            return;
         }
     }
 
@@ -1149,13 +992,6 @@ fn build_node_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, ur
     Ok(url)
 }
 
-fn node_is_in_list(node: &Url, nodes: &[Arc<Url>]) -> bool {
-    nodes.iter().any(|known| {
-        known.host_str() == node.host_str()
-            && known.port_or_known_default() == node.port_or_known_default()
-    })
-}
-
 impl Drop for LiveNodes {
     fn drop(&mut self) {
         if let Ok(mut state) = self.discovery_tasks.lock()
@@ -1173,13 +1009,11 @@ mod tests {
     use aws_smithy_runtime_api::client::http::{
         HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
     };
-    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+    use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
     use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
     use aws_smithy_runtime_api::http::StatusCode;
     use aws_smithy_types::body::SdkBody;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use std::collections::VecDeque;
 
     struct BlockingPoolBlockers(Vec<Option<std::sync::mpsc::SyncSender<()>>>);
 
@@ -1274,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_discovery_timeout_accounts_for_seeds_and_fallback_scopes() {
+    fn initial_discovery_timeout_accounts_for_candidates_and_both_scans() {
         let config = AlternatorConfig::builder()
             .seed_hosts(["127.0.0.1", "127.0.0.2"])
             .port(1)
@@ -1288,7 +1122,7 @@ mod tests {
 
         assert_eq!(
             nodes.initial_discovery_wait_timeout(),
-            Duration::from_secs(56)
+            Duration::from_secs(41)
         );
 
         nodes.live_nodes.store(Arc::new(
@@ -1298,7 +1132,7 @@ mod tests {
         ));
         assert_eq!(
             nodes.initial_discovery_wait_timeout(),
-            Duration::from_secs(86)
+            Duration::from_secs(71)
         );
     }
 
@@ -1314,7 +1148,23 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct DiscoveryResponseHttpClient(Arc<Mutex<Vec<String>>>);
+    struct DiscoveryResponseHttpClient {
+        requests: Arc<Mutex<Vec<String>>>,
+        responses: Arc<Mutex<VecDeque<(u16, String)>>>,
+    }
+
+    impl DiscoveryResponseHttpClient {
+        fn new(responses: impl IntoIterator<Item = impl Into<String>>) -> Self {
+            Self::with_statuses(responses.into_iter().map(|response| (200, response.into())))
+        }
+
+        fn with_statuses(responses: impl IntoIterator<Item = (u16, String)>) -> Self {
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+            }
+        }
+    }
 
     impl HttpClient for DiscoveryResponseHttpClient {
         fn http_connector(
@@ -1328,148 +1178,201 @@ mod tests {
 
     impl HttpConnector for DiscoveryResponseHttpClient {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-            self.0
+            let body = request
+                .body()
+                .bytes()
+                .expect("DynamoDB request body should be buffered");
+            self.requests.lock().unwrap().push(format!(
+                "{} {} {}",
+                request.method(),
+                request.uri(),
+                String::from_utf8_lossy(body)
+            ));
+            let (status, response) = self
+                .responses
                 .lock()
                 .unwrap()
-                .push(format!("{} {}", request.method(), request.uri()));
+                .pop_front()
+                .expect("unexpected topology request");
             HttpConnectorFuture::ready(Ok(HttpResponse::new(
-                StatusCode::try_from(200).unwrap(),
-                SdkBody::from(r#"["127.0.0.2"]"#),
+                StatusCode::try_from(status).unwrap(),
+                SdkBody::from(response),
             )))
         }
     }
 
-    #[derive(Clone, Debug)]
-    struct CoordinatedDiscoveryHttpClient {
-        stalled: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-    }
-
-    impl HttpClient for CoordinatedDiscoveryHttpClient {
-        fn http_connector(
-            &self,
-            _: &HttpConnectorSettings,
-            _: &RuntimeComponents,
-        ) -> SharedHttpConnector {
-            SharedHttpConnector::new(self.clone())
-        }
-    }
-
-    impl HttpConnector for CoordinatedDiscoveryHttpClient {
-        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-            assert_eq!(request.method(), "GET");
-
-            match request.uri() {
-                "http://responsive.test/localnodes" => {
-                    HttpConnectorFuture::ready(Ok(HttpResponse::new(
-                        StatusCode::try_from(200).unwrap(),
-                        SdkBody::from(r#"["healthy.test"]"#),
-                    )))
-                }
-                "http://stale.test/localnodes" => {
-                    let stalled = self.stalled.clone();
-                    let release = self.release.clone();
-                    HttpConnectorFuture::new(async move {
-                        stalled.notify_one();
-                        release.notified().await;
-                        Ok(HttpResponse::new(
-                            StatusCode::try_from(200).unwrap(),
-                            SdkBody::from("[]"),
-                        ))
-                    })
-                }
-                uri => panic!("unexpected discovery request URI: {uri}"),
-            }
-        }
-    }
-
-    async fn start_localnodes_server(body: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
-        start_localnodes_server_on("127.0.0.1:0", "localhost", body).await
-    }
-
     #[tokio::test]
-    async fn custom_http_client_is_used_for_discovery() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
+    async fn topology_scans_are_pinned_paginated_filtered_and_deduplicated() {
+        let http_client = DiscoveryResponseHttpClient::new([
+            r#"{"Items":[{"rpc_address":{"S":"10.0.0.2"},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}}],"Count":1,"ScannedCount":1,"LastEvaluatedKey":{"rpc_address":{"S":"10.0.0.2"}}}"#,
+            r#"{"Items":[{"rpc_address":{"S":"10.0.0.1"},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}}],"Count":1,"ScannedCount":1}"#,
+            r#"{"Items":[{"rpc_address":{"S":"10.0.0.2"},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}},{"rpc_address":{"S":"10.0.0.3"},"data_center":{"S":"dc1"},"rack":{"S":"rack2"}},{"data_center":{"S":"dc1"},"rack":{"S":"rack1"}},{"rpc_address":{"N":"4"},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}},{"rpc_address":{"S":""},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}}],"Count":5,"ScannedCount":5}"#,
+        ]);
         let config = AlternatorConfig::builder()
             .seed_hosts(["127.0.0.1"])
             .port(8000)
-            .http_client(DiscoveryResponseHttpClient(requests.clone()))
+            .routing_scope(RoutingScope::from_rack("dc1".into(), "rack1".into()))
+            .http_client(http_client.clone())
             .build();
         let nodes = LiveNodes::new(&config).unwrap();
 
         nodes.update_live_nodes().await;
 
+        let urls = nodes
+            .live_nodes
+            .load()
+            .iter()
+            .map(|url| url.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(urls, ["http://10.0.0.1:8000/", "http://10.0.0.2:8000/"]);
+
+        let requests = http_client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert!(request.starts_with("POST http://127.0.0.1:8000/ "));
+            let body = request.split_once("/ ").unwrap().1;
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(
+                body["ProjectionExpression"],
+                serde_json::Value::String(TOPOLOGY_PROJECTION.to_owned())
+            );
+        }
         assert_eq!(
-            requests.lock().unwrap().as_slice(),
-            ["GET http://127.0.0.1:8000/localnodes"]
+            serde_json::from_str::<serde_json::Value>(requests[0].split_once("/ ").unwrap().1)
+                .unwrap()["TableName"],
+            SYSTEM_LOCAL_TABLE
         );
+        let second =
+            serde_json::from_str::<serde_json::Value>(requests[1].split_once("/ ").unwrap().1)
+                .unwrap();
+        assert_eq!(second["TableName"], SYSTEM_LOCAL_TABLE);
+        assert_eq!(second["ExclusiveStartKey"]["rpc_address"]["S"], "10.0.0.2");
         assert_eq!(
-            nodes.live_nodes.load()[0].as_str(),
-            "http://127.0.0.2:8000/"
+            serde_json::from_str::<serde_json::Value>(requests[2].split_once("/ ").unwrap().1)
+                .unwrap()["TableName"],
+            SYSTEM_PEERS_TABLE
         );
     }
 
-    async fn start_localnodes_server_on(
-        bind_address: &str,
-        expected_host: &str,
-        body: &'static str,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind(bind_address).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let expected_host = expected_host.to_string();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = [0; 1024];
-            let n = stream.read(&mut buffer).await.unwrap();
-            let request = String::from_utf8_lossy(&buffer[..n]);
-            assert!(request.starts_with("GET /localnodes HTTP/1.1"));
-            assert!(
-                request.contains(&format!("host: {expected_host}:{port}"))
-                    || request.contains(&format!("Host: {expected_host}:{port}"))
-            );
+    #[tokio::test]
+    async fn failed_peers_scan_discards_local_rows_without_sdk_retry() {
+        let http_client = DiscoveryResponseHttpClient::with_statuses([
+            (
+                200,
+                r#"{"Items":[{"rpc_address":{"S":"10.0.0.1"},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}}],"Count":1,"ScannedCount":1}"#.to_owned(),
+            ),
+            (
+                500,
+                r#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"failed"}"#.to_owned(),
+            ),
+        ]);
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .http_client(http_client.clone())
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-
-        (port, server)
+        assert!(nodes.fetch_topology(&nodes.seed_urls[0]).await.is_none());
+        assert_eq!(
+            http_client.requests.lock().unwrap().len(),
+            2,
+            "operation override must disable SDK retries"
+        );
     }
 
-    fn start_runtime_restart_server() -> (u16, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
+    #[tokio::test]
+    async fn local_row_uses_candidate_for_an_unusable_rpc_address() {
+        for local_item in [
+            r#"{"rpc_address":{"S":"0.0.0.0"},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}}"#,
+            r#"{"rpc_address":{"N":"1"},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}}"#,
+            r#"{"data_center":{"S":"dc1"},"rack":{"S":"rack1"}}"#,
+        ] {
+            let http_client = DiscoveryResponseHttpClient::new([
+                format!(r#"{{"Items":[{local_item}],"Count":1,"ScannedCount":1}}"#),
+                r#"{"Items":[],"Count":0,"ScannedCount":0}"#.to_owned(),
+            ]);
+            let config = AlternatorConfig::builder()
+                .seed_hosts(["seed.example.com"])
+                .port(8000)
+                .http_client(http_client)
+                .build();
+            let nodes = LiveNodes::new(&config).unwrap();
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let server_request_count = request_count.clone();
-        let server = std::thread::spawn(move || {
-            for body in [r#"["127.0.0.1"]"#, r#"["127.0.0.2"]"#] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = Vec::new();
-                while !buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                    let mut chunk = [0; 512];
-                    let length = stream.read(&mut chunk).unwrap();
-                    assert!(length > 0, "request ended before its headers");
-                    buffer.extend_from_slice(&chunk[..length]);
-                }
-                let request = String::from_utf8_lossy(&buffer);
-                assert!(request.starts_with("GET /localnodes HTTP/1.1"));
+            let topology = nodes
+                .fetch_topology(&nodes.seed_urls[0])
+                .await
+                .expect("the candidate address should repair the local row");
 
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes()).unwrap();
-                server_request_count.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(topology.len(), 1);
+            assert_eq!(topology[0].rpc_address, "seed.example.com");
+            assert_eq!(topology[0].data_center, "dc1");
+            assert_eq!(topology[0].rack, "rack1");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_local_row_rejects_an_incomplete_topology() {
+        let http_client =
+            DiscoveryResponseHttpClient::new([r#"{"Items":[],"Count":0,"ScannedCount":0}"#]);
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .http_client(http_client.clone())
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        assert!(nodes.fetch_topology(&nodes.seed_urls[0]).await.is_none());
+        assert_eq!(
+            http_client.requests.lock().unwrap().len(),
+            1,
+            "system.peers must not be published without a valid local row"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_wait_wakes_discovery_after_a_failed_refresh() {
+        let failure = r#"{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"failed"}"#;
+        let http_client = DiscoveryResponseHttpClient::with_statuses([
+            (500, failure.to_owned()),
+            (500, failure.to_owned()),
+            (
+                200,
+                r#"{"Items":[{"rpc_address":{"S":"127.0.0.1"},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}}],"Count":1,"ScannedCount":1}"#.to_owned(),
+            ),
+            (200, r#"{"Items":[],"Count":0,"ScannedCount":0}"#.to_owned()),
+        ]);
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .active_interval(Duration::from_secs(60 * 60))
+            .idle_interval(Duration::from_secs(60 * 60))
+            .http_client(http_client.clone())
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        nodes.ensure_discovery_started();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while http_client.requests.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
             }
-        });
+        })
+        .await
+        .expect("the first refresh should exhaust the candidate and seed");
+        assert!(!nodes.initial_discovery_complete.load(Ordering::Acquire));
 
-        (port, request_count, server)
+        let ready = tokio::time::timeout(
+            Duration::from_secs(1),
+            nodes.wait_for_initial_discovery_with_timeouts(
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            ),
+        )
+        .await
+        .expect("readiness wait should wake sleeping discovery");
+
+        assert!(ready);
+        assert_eq!(http_client.requests.lock().unwrap().len(), 4);
     }
 
     #[test]
@@ -1510,56 +1413,6 @@ mod tests {
             let _ = nodes.get_live_nodes();
         });
         assert!(discovery_is_running(&nodes));
-    }
-
-    #[test]
-    fn discovery_restarts_after_its_runtime_is_dropped() {
-        let (port, request_count, server) = start_runtime_restart_server();
-        let config = AlternatorConfig::builder()
-            .seed_hosts(["127.0.0.1"])
-            .port(port)
-            .active_interval(Duration::from_secs(60 * 60))
-            .idle_interval(Duration::from_secs(60 * 60))
-            .build();
-        let nodes = LiveNodes::new(&config).unwrap();
-
-        {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(async {
-                nodes.ensure_discovery_started();
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    while request_count.load(Ordering::SeqCst) < 1 {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .expect("first runtime did not perform discovery");
-            });
-            drop(runtime);
-        }
-
-        {
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.block_on(async {
-                nodes.ensure_discovery_started();
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    loop {
-                        let current_nodes = nodes.get_live_nodes();
-                        if request_count.load(Ordering::SeqCst) >= 2
-                            && current_nodes[0].host_str() == Some("127.0.0.2")
-                        {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .expect("second runtime did not restart discovery");
-            });
-            drop(runtime);
-        }
-
-        server.join().unwrap();
     }
 
     #[test]
@@ -1658,67 +1511,6 @@ mod tests {
 
         let current_registration = nodes.discovery_runtime.load_full().unwrap();
         assert!(Arc::ptr_eq(&original_registration, &current_registration));
-    }
-
-    #[test]
-    fn first_access_hands_discovery_off_after_background_runtime_shutdown() {
-        let (port, request_count, server) = start_runtime_restart_server();
-        let config = AlternatorConfig::builder()
-            .seed_hosts(["127.0.0.1"])
-            .port(port)
-            .active_interval(Duration::from_secs(60 * 60))
-            .idle_interval(Duration::from_secs(60 * 60))
-            .build();
-        let nodes = LiveNodes::new(&config).unwrap();
-
-        let first_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        first_runtime.block_on(async {
-            nodes.ensure_discovery_started();
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while request_count.load(Ordering::SeqCst) < 1 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("first runtime did not perform discovery");
-        });
-
-        // Keep the only worker occupied so shutdown_background returns before
-        // it can drop the discovery future and run its task guard.
-        let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::sync_channel(0);
-        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(0);
-        first_runtime.spawn(async move {
-            blocker_started_tx.send(()).unwrap();
-            release_blocker_rx.recv().unwrap();
-        });
-        blocker_started_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("runtime worker was not blocked");
-
-        let second_runtime = tokio::runtime::Runtime::new().unwrap();
-        first_runtime.shutdown_background();
-        second_runtime.block_on(async {
-            // This one access must be enough to transfer to the replacement
-            // runtime even though the old task guard cannot run yet.
-            let _ = nodes.get_live_nodes();
-        });
-
-        let restarted = second_runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while request_count.load(Ordering::SeqCst) < 2 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-        });
-        release_blocker_tx.send(()).unwrap();
-        restarted.expect("discovery was not handed off to the replacement runtime");
-
-        server.join().unwrap();
     }
 
     #[test]
@@ -2178,7 +1970,7 @@ mod tests {
             .without_discovery()
             .build();
 
-        assert!(LiveNodes::try_new(&config).unwrap().is_none());
+        assert!(LiveNodes::try_new_for_test(&config).unwrap().is_none());
         assert!(crate::AlternatorClient::try_from_conf(config).is_ok());
     }
 
@@ -2192,7 +1984,7 @@ mod tests {
                 .build();
 
             assert!(matches!(
-                LiveNodes::try_new(&config),
+                LiveNodes::try_new_for_test(&config),
                 Err(LiveNodesBuildError::InvalidScheme(scheme))
                     if scheme == unsupported_scheme
             ));
@@ -2204,7 +1996,7 @@ mod tests {
             .without_discovery()
             .scheme("https")
             .build();
-        assert!(LiveNodes::try_new(&direct_http).unwrap().is_none());
+        assert!(LiveNodes::try_new_for_test(&direct_http).unwrap().is_none());
         assert!(crate::AlternatorClient::try_from_conf(direct_http).is_ok());
     }
 
@@ -2218,7 +2010,7 @@ mod tests {
                 .build(),
         ] {
             assert!(matches!(
-                LiveNodes::try_new(&config),
+                LiveNodes::try_new_for_test(&config),
                 Err(LiveNodesBuildError::MissingRoutingTarget)
             ));
         }
@@ -2242,7 +2034,7 @@ mod tests {
 
             assert_eq!(config.scheme().as_deref(), Some(stored));
             assert_eq!(config.endpoint_url().as_deref(), Some(endpoint));
-            assert!(LiveNodes::try_new(&config).unwrap().is_none());
+            assert!(LiveNodes::try_new_for_test(&config).unwrap().is_none());
             assert!(crate::AlternatorClient::try_from_conf(config).is_ok());
         }
     }
@@ -2272,7 +2064,7 @@ mod tests {
 
             assert_eq!(config.endpoint_url(), None, "accepted {malformed:?}");
             assert!(matches!(
-                LiveNodes::try_new(&config),
+                LiveNodes::try_new_for_test(&config),
                 Err(LiveNodesBuildError::InvalidScheme(_))
             ));
             assert!(crate::AlternatorClient::try_from_conf(config).is_err());
@@ -2288,7 +2080,7 @@ mod tests {
             .build();
 
         assert!(matches!(
-            LiveNodes::try_new(&config),
+            LiveNodes::try_new_for_test(&config),
             Err(LiveNodesBuildError::InvalidScheme(scheme)) if scheme == "custom"
         ));
         assert!(crate::AlternatorClient::try_from_conf(config).is_err());
@@ -2299,7 +2091,7 @@ mod tests {
         let config = AlternatorConfig::builder().build();
 
         assert!(matches!(
-            LiveNodes::try_new(&config),
+            LiveNodes::try_new_for_test(&config),
             Err(LiveNodesBuildError::MissingRoutingTarget)
         ));
     }
@@ -2330,7 +2122,7 @@ mod tests {
                 .build();
 
             assert!(matches!(
-                LiveNodes::try_new(&config),
+                LiveNodes::try_new_for_test(&config),
                 Err(LiveNodesBuildError::InvalidSeedHost { .. })
             ));
         }
@@ -2345,7 +2137,7 @@ mod tests {
                 .build();
 
             assert!(matches!(
-                LiveNodes::try_new(&config),
+                LiveNodes::try_new_for_test(&config),
                 Err(LiveNodesBuildError::InvalidScheme(invalid)) if invalid == scheme
             ));
         }
@@ -2378,229 +2170,6 @@ mod tests {
         assert_eq!(nodes.seed_urls[0].to_string(), "http://[::1]:8000/");
     }
 
-    #[tokio::test]
-    async fn raw_ipv6_seed_discovers_raw_ipv6_node() {
-        let (port, server) = start_localnodes_server_on("[::1]:0", "[::1]", r#"["::1"]"#).await;
-        let config = AlternatorConfig::builder()
-            .scheme("http")
-            .port(port)
-            .seed_hosts(["::1"])
-            .build();
-        let nodes = LiveNodes::new(&config).unwrap();
-
-        nodes.update_live_nodes().await;
-
-        server.await.unwrap();
-        assert_eq!(
-            nodes.live_nodes.load()[0].as_str(),
-            format!("http://[::1]:{port}/")
-        );
-    }
-
-    #[tokio::test]
-    async fn dns_entrypoint_discovers_dns_node_records() {
-        let (port, server) = start_localnodes_server(r#"["localhost","node-a.internal"]"#).await;
-        let config = AlternatorConfig::builder()
-            .scheme("http")
-            .port(port)
-            .seed_hosts(vec!["localhost".to_string()])
-            .active_interval(std::time::Duration::from_millis(10))
-            .idle_interval(std::time::Duration::from_secs(10))
-            .build();
-        let nodes = LiveNodes::new(&config).unwrap();
-
-        nodes.update_live_nodes().await;
-
-        server.await.unwrap();
-        let snapshot = nodes.live_nodes.load();
-        let hosts = snapshot
-            .iter()
-            .map(|url| url.host_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(hosts, vec!["localhost", "node-a.internal"]);
-    }
-
-    #[tokio::test]
-    async fn dns_entrypoint_applies_configured_port_to_dns_node_records() {
-        let (port, server) =
-            start_localnodes_server(r#"["node-a.internal:9000","node-b.internal"]"#).await;
-        let config = AlternatorConfig::builder()
-            .scheme("http")
-            .port(port)
-            .seed_hosts(vec!["localhost".to_string()])
-            .active_interval(std::time::Duration::from_millis(10))
-            .idle_interval(std::time::Duration::from_secs(10))
-            .build();
-        let nodes = LiveNodes::new(&config).unwrap();
-
-        nodes.update_live_nodes().await;
-
-        server.await.unwrap();
-        let snapshot = nodes.live_nodes.load();
-        let hosts_and_ports = snapshot
-            .iter()
-            .map(|url| (url.host_str().unwrap().to_string(), url.port()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            hosts_and_ports,
-            vec![
-                ("node-a.internal".to_string(), Some(port)),
-                ("node-b.internal".to_string(), Some(port)),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn dns_entrypoint_supports_single_family_and_cross_family_fallback() {
-        assert_dns_discovery("127.0.0.1:0", &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
-        assert_dns_discovery("[::1]:0", &[IpAddr::V6(Ipv6Addr::LOCALHOST)]).await;
-        assert_dns_discovery(
-            "127.0.0.1:0",
-            &[
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ],
-        )
-        .await;
-        assert_dns_discovery(
-            "[::1]:0",
-            &[
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-            ],
-        )
-        .await;
-        assert_dns_discovery(
-            "127.0.0.1:0",
-            &[
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)),
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ],
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn cluster_discovery_publishes_safe_partial_union_before_stalled_candidate_finishes() {
-        let stalled = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-
-        let config = AlternatorConfig::builder()
-            .scheme("http")
-            .seed_hosts(["responsive.test"])
-            .http_client(CoordinatedDiscoveryHttpClient {
-                stalled: stalled.clone(),
-                release: release.clone(),
-            })
-            .build();
-        let nodes = LiveNodes::new(&config).unwrap();
-        let stale = Arc::new(Url::parse("http://stale.test/").unwrap());
-        let healthy = Arc::new(Url::parse("http://healthy.test/").unwrap());
-        nodes.live_nodes.store(Arc::new(vec![stale.clone()]));
-        let candidates = vec![nodes.seed_urls[0].clone(), stale.clone()];
-        let generation = nodes.begin_refresh();
-        let discovery_nodes = nodes.clone();
-        let discovery = tokio::spawn(async move {
-            discovery_nodes
-                .discover_cluster_live_nodes_from(generation, candidates)
-                .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), stalled.notified())
-            .await
-            .expect("cluster discovery never reached the stale candidate");
-        assert!(
-            !discovery.is_finished(),
-            "cluster discovery unexpectedly finished while a candidate was stalled"
-        );
-        assert_eq!(
-            nodes.live_nodes.load().as_ref(),
-            &[healthy.clone(), stale.clone()],
-            "partial publication must add newly validated nodes without dropping last-known-good nodes"
-        );
-        assert!(
-            !nodes.initial_discovery_complete.load(Ordering::Acquire),
-            "a partial cluster union must not release affinity requests"
-        );
-
-        release.notify_one();
-        let discovered = tokio::time::timeout(Duration::from_secs(1), discovery)
-            .await
-            .expect("cluster discovery did not finish after releasing the stale candidate")
-            .unwrap()
-            .unwrap();
-        assert_eq!(discovered, vec![healthy]);
-        nodes.publish_live_nodes(generation, discovered);
-        assert!(nodes.initial_discovery_complete.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn older_concurrent_refresh_does_not_overwrite_newer_result() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let config = AlternatorConfig::builder()
-            .scheme("http")
-            .port(port)
-            .seed_hosts(["127.0.0.1"])
-            .build();
-        let nodes = LiveNodes::new(&config).unwrap();
-
-        let first_nodes = nodes.clone();
-        let first_update = tokio::spawn(async move { first_nodes.update_live_nodes().await });
-        let (mut first_request, _) =
-            tokio::time::timeout(Duration::from_secs(1), listener.accept())
-                .await
-                .expect("first refresh did not connect")
-                .unwrap();
-        let mut buffer = [0; 1024];
-        assert!(first_request.read(&mut buffer).await.unwrap() > 0);
-
-        let second_nodes = nodes.clone();
-        let second_update = tokio::spawn(async move { second_nodes.update_live_nodes().await });
-        let (mut second_request, _) =
-            tokio::time::timeout(Duration::from_secs(1), listener.accept())
-                .await
-                .expect("newer refresh did not overlap the stalled pass")
-                .unwrap();
-        assert!(second_request.read(&mut buffer).await.unwrap() > 0);
-
-        let newer_body = r#"["127.0.0.2"]"#;
-        let newer_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            newer_body.len(),
-            newer_body
-        );
-        second_request
-            .write_all(newer_response.as_bytes())
-            .await
-            .unwrap();
-        second_update.await.unwrap();
-
-        let older_body = r#"["127.0.0.3"]"#;
-        let older_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            older_body.len(),
-            older_body
-        );
-        first_request
-            .write_all(older_response.as_bytes())
-            .await
-            .unwrap();
-        first_update.await.unwrap();
-
-        let snapshot = nodes.live_nodes.load();
-        let hosts = snapshot
-            .iter()
-            .map(|node| node.host_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            hosts,
-            ["127.0.0.2"],
-            "older refresh must not alter the newer completed topology"
-        );
-    }
-
     #[test]
     fn newer_refresh_without_a_result_does_not_suppress_older_result() {
         let nodes = LiveNodes::new(&test_config()).unwrap();
@@ -2613,125 +2182,17 @@ mod tests {
         assert_eq!(nodes.live_nodes.load().as_ref(), &older_result);
     }
 
-    #[tokio::test]
-    async fn all_unavailable_dns_records_return_without_clearing_seed() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let mut nodes = dns_live_nodes(
-            port,
-            &[
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ],
-        );
-        Arc::get_mut(&mut nodes).unwrap().client = DiscoveryHttpClient::Reqwest(
-            discovery_http_client_builder("http")
-                .unwrap()
-                .timeout(Duration::from_millis(200))
-                .connect_timeout(Duration::from_millis(100))
-                .resolve_to_addrs(
-                    "dual.test",
-                    &[
-                        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-                    ],
-                )
-                .build()
-                .unwrap(),
-        );
+    #[test]
+    fn older_concurrent_refresh_does_not_overwrite_newer_result() {
+        let nodes = LiveNodes::new(&test_config()).unwrap();
+        let older_generation = nodes.begin_refresh();
+        let newer_generation = nodes.begin_refresh();
+        let older_result = vec![Arc::new(Url::parse("http://127.0.0.2:1/").unwrap())];
+        let newer_result = vec![Arc::new(Url::parse("http://127.0.0.3:1/").unwrap())];
 
-        tokio::time::timeout(Duration::from_secs(1), nodes.update_live_nodes())
-            .await
-            .expect("discovery must not hang when both address families are unavailable");
+        nodes.publish_live_nodes(newer_generation, newer_result.clone());
+        nodes.publish_live_nodes(older_generation, older_result);
 
-        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("dual.test"));
-    }
-
-    #[tokio::test]
-    async fn refresh_recovers_through_original_raw_ipv6_seed() {
-        let (port, server) = start_localnodes_server_on("[::1]:0", "[::1]", r#"["::1"]"#).await;
-        let config = AlternatorConfig::builder()
-            .scheme("http")
-            .port(port)
-            .seed_hosts(["::1"])
-            .build();
-        let nodes = LiveNodes::new(&config).unwrap();
-        nodes.live_nodes.store(Arc::new(vec![Arc::new(
-            Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
-        )]));
-
-        nodes.update_live_nodes().await;
-
-        server.await.unwrap();
-        assert_eq!(
-            nodes.live_nodes.load()[0].as_str(),
-            format!("http://[::1]:{port}/")
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_recovers_through_all_original_dns_seed_addresses() {
-        let (port, server) =
-            start_localnodes_server_on("127.0.0.1:0", "dual.test", r#"["recovered.internal"]"#)
-                .await;
-        let nodes = dns_live_nodes(
-            port,
-            &[
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ],
-        );
-        nodes.live_nodes.store(Arc::new(vec![Arc::new(
-            Url::parse(&format!("http://127.0.0.3:{port}/")).unwrap(),
-        )]));
-
-        nodes.update_live_nodes().await;
-
-        tokio::time::timeout(Duration::from_secs(1), server)
-            .await
-            .expect("recovery never reached a usable seed address")
-            .unwrap();
-        assert_eq!(
-            nodes.live_nodes.load()[0].as_str(),
-            format!("http://recovered.internal:{port}/")
-        );
-    }
-
-    async fn assert_dns_discovery(bind_address: &str, resolved_ips: &[IpAddr]) {
-        let (port, server) =
-            start_localnodes_server_on(bind_address, "dual.test", r#"["dual.test"]"#).await;
-        let nodes = dns_live_nodes(port, resolved_ips);
-
-        nodes.update_live_nodes().await;
-
-        tokio::time::timeout(Duration::from_secs(1), server)
-            .await
-            .expect("discovery never reached a usable seed address")
-            .unwrap();
-        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("dual.test"));
-    }
-
-    fn dns_live_nodes(port: u16, resolved_ips: &[IpAddr]) -> Arc<LiveNodes> {
-        let config = AlternatorConfig::builder()
-            .scheme("http")
-            .port(port)
-            .seed_hosts(["dual.test"])
-            .build();
-        let mut nodes = LiveNodes::new(&config).unwrap();
-        let addresses = resolved_ips
-            .iter()
-            .map(|ip| SocketAddr::new(*ip, port))
-            .collect::<Vec<_>>();
-        Arc::get_mut(&mut nodes).unwrap().client = DiscoveryHttpClient::Reqwest(
-            discovery_http_client_builder("http")
-                .unwrap()
-                .timeout(Duration::from_secs(1))
-                .connect_timeout(Duration::from_millis(500))
-                .resolve_to_addrs("dual.test", &addresses)
-                .build()
-                .unwrap(),
-        );
-        nodes
+        assert_eq!(nodes.live_nodes.load().as_ref(), &newer_result);
     }
 }

@@ -135,7 +135,7 @@ fn validate_sdk_default_config(
 }
 
 /// Defers endpoint resolution for affinity-eligible operations until the
-/// cross-rack live-node view has completed its first successful refresh.
+/// cross-rack topology view has completed its first successful refresh.
 #[derive(Debug)]
 struct AffinityDiscoveryEndpointResolver {
     inner: SharedEndpointResolver,
@@ -355,6 +355,35 @@ fn try_dynamodb_client_from_conf(
     }
 }
 
+/// Builds an auxiliary client while deferring user-component validation to
+/// the main client constructed from the same base configuration.
+///
+/// AWS validates HTTP clients and identity caches every time a service client
+/// is constructed. Topology discovery needs a separate client without routing
+/// interceptors, but custom components may require exactly-once validation.
+/// The main client remains the authoritative validation boundary.
+fn auxiliary_dynamodb_client_from_conf(
+    config: aws_sdk_dynamodb::Config,
+) -> Result<aws_sdk_dynamodb::Client, AlternatorClientBuildError> {
+    let http_client = config
+        .http_client()
+        .ok_or_else(|| AlternatorClientBuildError {
+            kind: AlternatorClientBuildErrorKind::SdkConfiguration(
+                "no HTTP client was selected".to_owned(),
+            ),
+        })?;
+    let identity_cache = config
+        .identity_cache()
+        .unwrap_or_else(|| aws_smithy_runtime::client::identity::IdentityCache::lazy().build());
+
+    let mut builder = config.to_builder();
+    builder.set_http_client(Some(SharedHttpClient::new(UnvalidatedHttpClient(
+        http_client,
+    ))));
+    builder.set_identity_cache(UnvalidatedIdentityCache(identity_cache));
+    Ok(aws_sdk_dynamodb::Client::from_conf(builder.build()))
+}
+
 /// Builds the modern connector selected by the pinned behavior version.
 ///
 /// Supplying it explicitly lets the fallible constructor capture SDK config
@@ -436,49 +465,14 @@ impl AlternatorClient {
             has_credentials_provider,
         ));
 
-        let live_nodes = LiveNodes::try_new(&config)?;
-        let affinity_config = config
-            .key_route_affinity()
-            .filter(|config| config.is_enabled());
-        let affinity_live_nodes = match (
-            live_nodes.as_ref(),
-            affinity_config.as_ref(),
-            config.routing_scope(),
-        ) {
-            (Some(_), Some(_), Some(scope)) if scope.rack().is_some() => {
-                LiveNodes::try_new_for_scope(&config, scope.without_rack())?
-            }
-            _ => live_nodes.clone(),
-        };
-        if let (Some(routing_nodes), Some(affinity_nodes)) =
-            (live_nodes.as_ref(), affinity_live_nodes.as_ref())
-            && !std::sync::Arc::ptr_eq(routing_nodes, affinity_nodes)
-        {
-            builder.set_endpoint_resolver(Some(SharedEndpointResolver::new(
-                AffinityDiscoveryEndpointResolver {
-                    inner: dynamodb_config.endpoint_resolver(),
-                    affinity_nodes: affinity_nodes.clone(),
-                },
-            )));
-        }
-
         // With discovery off nothing rewrites the request, so the transport
         // is decided by the scheme configured for the seed host itself.
-        let direct_scheme = live_nodes
-            .is_none()
-            .then(|| config.scheme().unwrap_or_else(|| "http".to_string()));
-        let uses_plaintext_transport = live_nodes
-            .as_ref()
-            .is_some_and(|nodes| nodes.scheme() == "http")
-            || direct_scheme
-                .as_deref()
-                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"));
-        let uses_direct_https_transport = direct_scheme
-            .as_deref()
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"));
+        let alternator_scheme = config.scheme().unwrap_or_else(|| "http".to_string());
+        let uses_plaintext_transport = alternator_scheme.eq_ignore_ascii_case("http");
+        let uses_https_transport = alternator_scheme.eq_ignore_ascii_case("https");
         let has_custom_http_client = dynamodb_config.http_client().is_some();
 
-        if uses_direct_https_transport && !has_custom_http_client {
+        if uses_https_transport && !has_custom_http_client {
             ensure_native_roots_are_usable().map_err(|message| AlternatorClientBuildError {
                 kind: AlternatorClientBuildErrorKind::TlsConfiguration(message),
             })?;
@@ -488,11 +482,8 @@ impl AlternatorClient {
             // A TLS-capable connector eagerly validates native roots even for
             // an HTTP endpoint, so use an HTTP-only connector when no roots
             // are available.
-            let needs_rootless_plaintext_transport = uses_plaintext_transport
-                && !live_nodes
-                    .as_ref()
-                    .map(|nodes| nodes.has_usable_native_roots())
-                    .unwrap_or_else(native_roots_are_usable);
+            let needs_rootless_plaintext_transport =
+                uses_plaintext_transport && !native_roots_are_usable();
 
             // Supplying the pinned behavior's connector explicitly gives the
             // fallible constructor a component through which it can run the
@@ -508,6 +499,41 @@ impl AlternatorClient {
 
         validate_sdk_default_config(stalled_stream_protection_explicitly_unset)?;
 
+        // Topology discovery uses ordinary DynamoDB Scan operations against
+        // Scylla's virtual system tables. Keep its client free of routing
+        // interceptors so every pair of system.local/system.peers scans can be
+        // pinned to the candidate node being inspected.
+        let topology_client = auxiliary_dynamodb_client_from_conf(builder.clone().build())?;
+        let live_nodes = LiveNodes::try_new(&config, topology_client.clone())?;
+        let affinity_config = config
+            .key_route_affinity()
+            .filter(|config| config.is_enabled());
+        let affinity_live_nodes = match (
+            live_nodes.as_ref(),
+            affinity_config.as_ref(),
+            config.routing_scope(),
+        ) {
+            (Some(_), Some(_), Some(scope)) if scope.has_rack_restriction() => {
+                LiveNodes::try_new_for_scope(
+                    &config,
+                    scope.without_rack(),
+                    topology_client.clone(),
+                )?
+            }
+            _ => live_nodes.clone(),
+        };
+        if let (Some(routing_nodes), Some(affinity_nodes)) =
+            (live_nodes.as_ref(), affinity_live_nodes.as_ref())
+            && !std::sync::Arc::ptr_eq(routing_nodes, affinity_nodes)
+        {
+            builder.set_endpoint_resolver(Some(SharedEndpointResolver::new(
+                AffinityDiscoveryEndpointResolver {
+                    inner: dynamodb_config.endpoint_resolver(),
+                    affinity_nodes: affinity_nodes.clone(),
+                },
+            )));
+        }
+
         let routing_interceptor: Option<aws_sdk_dynamodb::config::SharedInterceptor> =
             match (live_nodes.as_ref(), affinity_config.as_ref()) {
                 (None, _) => None,
@@ -522,8 +548,8 @@ impl AlternatorClient {
                     // to make DescribeTable calls. Using the main client for that would create a
                     // cycle: main client -> affinity interceptor -> resolver -> DescribeTable
                     // -> main client. Build a separate discovery client from the same base config
-                    // but with round-robin routing only..
-                    let pk_discovery_client = try_dynamodb_client_from_conf(
+                    // but with round-robin routing only.
+                    let pk_discovery_client = auxiliary_dynamodb_client_from_conf(
                         builder
                             .clone()
                             .interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()))
@@ -1334,6 +1360,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn topology_discovery_uses_configured_credentials() {
+        let captured = std::sync::Arc::new(CapturedRequest::default());
+        let client = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
+                .active_interval(std::time::Duration::from_secs(60))
+                .optimize_headers(true)
+                .http_client(SuccessfulHttpClient(captured.clone()))
+                .credentials_provider(
+                    aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+                )
+                .build(),
+        )
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while captured.calls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("topology discovery should scan system.local and system.peers");
+        drop(client);
+
+        assert!(
+            captured
+                .authorization
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(captured.amz_date.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            captured
+                .security_token
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
     #[derive(Debug)]
     struct RuntimeComponentsIdentityCache(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -1636,6 +1701,43 @@ mod tests {
             .unwrap();
             assert_eq!(
                 validation_count.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            drop(client);
+
+            let discovery_validation_count =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = AlternatorClient::try_from_conf(
+                AlternatorConfig::builder()
+                    .seed_hosts(["127.0.0.1"])
+                    .port(8000)
+                    .http_client(SingleValidationHttpClient(
+                        discovery_validation_count.clone(),
+                    ))
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(
+                discovery_validation_count.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            drop(client);
+
+            let affinity_validation_count =
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = AlternatorClient::try_from_conf(
+                AlternatorConfig::builder()
+                    .seed_hosts(["127.0.0.1"])
+                    .port(8000)
+                    .http_client(SingleValidationHttpClient(
+                        affinity_validation_count.clone(),
+                    ))
+                    .key_route_affinity(crate::keyrouting::KeyRouteAffinityType::AnyWrite)
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(
+                affinity_validation_count.load(std::sync::atomic::Ordering::Relaxed),
                 1
             );
             drop(client);

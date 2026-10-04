@@ -119,13 +119,13 @@ The client does not expose AWS custom auth schemes, auth scheme resolvers, auth 
 
 Advanced SDK knobs such as retry settings, timeout settings, HTTP clients, identity cache, framework metadata, and interceptors remain available as escape hatches. Framework metadata is passed through to the underlying DynamoDB config for SDK integrations, while `user_agent(...)` controls the client's final Alternator identification. Interceptors run alongside the client's routing, compression, decompression, and header optimization interceptors, so keep ordering effects in mind when using them.
 
-A configured HTTP client is also used for `/localnodes` discovery, so custom TLS trust stores, client certificates, proxies, and other transport settings apply to both discovery and regular Alternator API requests.
+A configured HTTP client is also used for topology discovery, so custom TLS trust stores, client certificates, proxies, and other transport settings apply to both discovery and regular Alternator API requests.
 
 Operation builders are DynamoDB SDK passthroughs for source compatibility, but Alternator support is server-dependent. AWS-only surfaces such as backup/PITR/export/import, global tables, Kinesis streaming destinations, contributor insights, resource policies, tagging, `describe_endpoints`, `describe_limits`, PartiQL, and replica auto-scaling may fail against Alternator unless the server explicitly supports them.
 
 ## Load balancing
 
-A single Alternator cluster typically consists of multiple nodes, any of which can serve any request. This crate distributes requests across the live nodes of the cluster rather than sending everything to one address. There's no separate load-balancer process, routing happens entirely client-side.
+A single Alternator cluster typically consists of multiple nodes, any of which can serve any request. This crate distributes requests across the discovered topology rather than sending everything to one address. There's no separate load-balancer process; routing happens entirely client-side.
 
 ### Seed hosts
 
@@ -140,7 +140,29 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
-For datacenter and rack scopes, the client calls `/localnodes` with the configured scope parameters. For the default cluster-wide scope, the client calls bare `/localnodes` on configured seed hosts and already-known live nodes, then unions the returned node lists. With discovery enabled, data-plane requests are rewritten to discovered live nodes after a routing target is selected.
+The client discovers cluster topology by scanning ScyllaDB's `system.local` and
+`system.peers` tables through the DynamoDB API. It filters the returned
+datacenter and rack metadata locally for the configured routing scope. One
+working seed can therefore discover nodes in every datacenter. With discovery
+enabled, data-plane requests are rewritten to discovered nodes after a routing
+target is selected.
+
+Topology discovery requires ScyllaDB 4.1 or newer. When Alternator authorization
+is enforced, the configured role also needs `SELECT` permission on
+`system.local` and `system.peers`; discovery uses the client's configured
+credentials provider. A client that supplies credentials only as per-operation
+overrides cannot use those credentials for background discovery.
+
+Use ScyllaDB 5.2 or newer when the node's bind and client-advertised addresses
+differ. Earlier releases can expose the bind address in
+`system.local.rpc_address`; if that address is valid but unreachable from the
+client, configure it to advertise a reachable address or upgrade ScyllaDB.
+
+These system tables describe cluster membership, not instantaneous node
+liveness. A member that is temporarily unavailable can remain in query plans;
+normal SDK retries advance through the other discovered nodes. Scope fallbacks
+apply when no topology member matches a scope, not merely when every matching
+member is temporarily unreachable.
 
 To give the client multiple candidates for initial discovery, or for deployments where a seed node might be down at startup time, pass multiple seed addresses directly along with the Alternator scheme and port:
 
@@ -158,8 +180,6 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
-For cluster-wide scope, provide at least one working seed host from every datacenter that should receive traffic. If a datacenter has no working seed in the configuration, the client cannot reliably discover and refresh live Alternator nodes from that datacenter.
-
 To disable client-side discovery and load balancing, for example when sending through a proxy or an external load balancer, give that address as the seed host and turn discovery off:
 
 ```rust
@@ -172,7 +192,7 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
-In this mode every request goes to that address as it is, with no `/localnodes` discovery and no rewriting. Without a seed host to send them to, building a client fails rather than falling back to an AWS endpoint.
+In this mode every request goes to that address as it is, with no system-table discovery and no rewriting. Without a seed host to send them to, building a client fails rather than falling back to an AWS endpoint.
 
 `AlternatorClient` instances are immutable. To retarget a client at another cluster, copy its configuration into a mutable builder, replace the routing settings, explicitly enable discovery, and construct a new client:
 
@@ -194,7 +214,8 @@ let retargeted = AlternatorClient::from_conf(builder.build());
 The AWS Rust SDK keeps a region in the DynamoDB configuration even when the
 configured seed hosts point at Alternator instead of an AWS DynamoDB regional
 endpoint. Alternator does not use this value for routing; this crate discovers
-live nodes through `/localnodes` and rewrites requests to those nodes. The
+cluster nodes through DynamoDB scans of `system.local` and `system.peers`, then
+rewrites requests to those nodes. The
 region can still appear in SDK diagnostics, traces, metrics, and signing
 metadata.
 
@@ -220,7 +241,7 @@ does not change Alternator node discovery or load balancing.
 
 ### Node discovery
 
-The client maintains a list of live nodes, which it refreshes in the background. The refresh has two cadences:
+The client maintains a list of topology nodes, which it refreshes in the background. The refresh has two cadences:
 
 Discovery state is an internal client implementation detail. `AlternatorConfig`
 stores only declarative settings; constructing multiple clients from cloned
@@ -248,7 +269,7 @@ The refresh task runs in the background for the lifetime of the client. It termi
 
 ### Routing scope
 
-By default, the client uses every live Alternator node it discovers across the cluster. For deployments spanning multiple datacenters or racks, you usually want requests to stay within a specific datacenter — or within a specific rack of a specific datacenter — to minimize cross-zone latency and bandwidth.
+By default, the client uses every Alternator node in the discovered topology. For deployments spanning multiple datacenters or racks, you usually want requests to stay within a specific datacenter — or within a specific rack of a specific datacenter — to minimize cross-zone latency and bandwidth.
 
 This is configured via `RoutingScope`:
 
@@ -273,7 +294,7 @@ let config = AlternatorConfig::builder()
 
 Key-route affinity is an intentional exception to rack-local routing. When it
 is enabled with a rack scope, requests for which the client can build an
-affinity plan select from every live node in the rack's datacenter. This lets
+affinity plan select from every discovered node in the rack's datacenter. This lets
 clients in different racks choose the same coordinator, but the selected node
 may be in another rack even while the local rack is healthy, adding cross-zone
 latency and bandwidth. Reads and other requests without an affinity plan keep
@@ -286,7 +307,7 @@ an incomplete topology.
 
 ### Scope fallbacks
 
-A scope can be narrow enough that no nodes match it — for example, a specific rack that has no live nodes at the moment. In that case the client uses the configured fallback scope instead. Fallbacks are explicit and chainable:
+A scope can be narrow enough that no discovered nodes match it — for example, a rack that does not exist in the current topology. In that case the client uses the configured fallback scope instead. Fallbacks are explicit and chainable:
 
 ```rust
 use alternator_driver::RoutingScope;
@@ -305,15 +326,15 @@ let scope = RoutingScope::from_rack("dc1".to_string(), "rack1".to_string())
 The first one says:
 - prefer `rack1` of `dc1`
 - if no nodes there, use any node in `dc1`
-- if still nothing, use any live node discovered in the cluster
+- if still nothing, use any node discovered in the cluster
 
-The client walks the chain from preferred to broadest, picking the first scope that has live nodes.
+The client walks the chain from preferred to broadest, picking the first scope that has discovered nodes.
 
 Each `.with_fallback(...)` call appends to the end of the chain, so the order in code matches the order of preference.
 
 ### Load balancing strategies
 
-For every request, the client picks a node and rewrites the request URI to point at that node before signing. The default strategy is round-robin across the live nodes. Requests and retries share the same rotation. Retries skip nodes already tried for the current request until every live node has been tried, then start another pass through the plan.
+For every request, the client picks a node and rewrites the request URI to point at that node before signing. The default strategy is round-robin across the discovered nodes. Requests and retries share the same rotation. Retries skip nodes already tried for the current request until every discovered node has been tried, then start another pass through the plan.
 
 Round-robin is the right default for the vast majority of workloads. For workloads that perform many LWTs against the same partition keys, see [Key route affinity](#key-route-affinity) below.
 

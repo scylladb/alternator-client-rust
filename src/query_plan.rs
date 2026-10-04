@@ -88,7 +88,7 @@ impl QueryPlan {
 
     #[cfg(test)]
     /// Creates a query plan that tries `preferred_nodes` first, then the
-    /// remaining live nodes in sorted order.
+    /// remaining discovered nodes in sorted order.
     pub(crate) fn new_with_preferred_nodes(
         live_nodes: Arc<LiveNodes>,
         preferred_nodes: Vec<Arc<Url>>,
@@ -119,7 +119,7 @@ impl QueryPlan {
     }
 
     #[cfg(test)]
-    /// Returns the current live-node list in the canonical order used by
+    /// Returns the current discovered-node list in the canonical order used by
     /// affinity routing.
     pub(crate) fn sorted_affinity_nodes(live_nodes: &Arc<LiveNodes>) -> SortedAffinityNodes {
         SortedAffinityNodes::from_live_nodes(live_nodes)
@@ -128,7 +128,7 @@ impl QueryPlan {
     /// Gets the next node to use in this query plan, or `None` if the plan is exhausted.
     ///
     /// With round-robin, on every attempt, the first node that hasn't been used yet in this request is returned.
-    /// Search begins from the last used node in the live nodes list, so that requests are distributed evenly across the cluster.
+    /// Search begins from the last used node in the discovered-node list, so that requests are distributed evenly across the cluster.
     ///
     /// With affinity, the next node is selected from the remaining nodes using a seeded pick-and-remove algorithm.
     pub fn next_node(&self) -> Option<Arc<Url>> {
@@ -206,7 +206,7 @@ impl QueryPlan {
     /// attempt routed to Alternator rather than leaving the request at the
     /// endpoint the SDK originally resolved.
     ///
-    /// Returns `None` only when there is no live node to route to.
+    /// Returns `None` only when there is no discovered node to route to.
     pub fn next_node_or_restart(&self) -> Option<Arc<Url>> {
         if let Some(node) = self.next_node() {
             return Some(node);
@@ -216,7 +216,7 @@ impl QueryPlan {
         self.next_node()
     }
 
-    /// Resets strategy-specific state for another pass over the live nodes.
+    /// Resets strategy-specific state for another pass over discovered nodes.
     fn restart(&self) {
         let mut state = self.state.lock().unwrap();
 
@@ -371,7 +371,7 @@ mod tests {
 
     // ----- Stable routing test vectors -----
     //
-    // These vectors use the canonical lexicographic live-node order.
+    // These vectors use the canonical lexicographic discovered-node order.
 
     #[test]
     fn stable_seed_42_10_nodes() {

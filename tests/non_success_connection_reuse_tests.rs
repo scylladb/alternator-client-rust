@@ -31,8 +31,20 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_INTERVAL: Duration = Duration::from_millis(100);
 
+const SCAN_TARGET: &str = "DynamoDB_20120810.Scan";
+const LIST_TABLES_TARGET: &str = "DynamoDB_20120810.ListTables";
+const SYSTEM_LOCAL_TABLE: &str = ".scylla.alternator.system.local";
+const SYSTEM_PEERS_TABLE: &str = ".scylla.alternator.system.peers";
+
+#[derive(Clone, Copy)]
+enum ExpectedRequest {
+    TopologyScan(&'static str),
+    DynamoDb(&'static str),
+}
+
 #[derive(Clone)]
 struct MockResponse {
+    request: ExpectedRequest,
     status: StatusCode,
     content_type: &'static str,
     body: &'static str,
@@ -77,15 +89,10 @@ impl KeepAliveTestServer {
     }
 }
 
-async fn start_keep_alive_server(
-    expected_method: Method,
-    expected_path: &'static str,
-    responses: Vec<MockResponse>,
-) -> KeepAliveTestServer {
+async fn start_keep_alive_server(responses: Vec<MockResponse>) -> KeepAliveTestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let responses = Arc::new(responses);
-    let expected_method = Arc::new(expected_method);
     let connections = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(Notify::new());
@@ -107,7 +114,6 @@ async fn start_keep_alive_server(
 
                 let requests = Arc::clone(&requests);
                 let responses = Arc::clone(&responses);
-                let expected_method = Arc::clone(&expected_method);
                 let done = Arc::clone(&done);
                 connection_tasks.spawn(async move {
                     let completion_requests = Arc::clone(&requests);
@@ -115,18 +121,39 @@ async fn start_keep_alive_server(
                     let service = service_fn(move |request: Request<Incoming>| {
                         let requests = Arc::clone(&requests);
                         let responses = Arc::clone(&responses);
-                        let expected_method = Arc::clone(&expected_method);
 
                         async move {
-                            assert_eq!(request.method(), expected_method.as_ref());
-                            assert_eq!(request.uri().path(), expected_path);
+                            assert_eq!(request.method(), Method::POST);
+                            assert_eq!(request.uri().path(), "/");
 
-                            let _ = request.into_body().collect().await?;
+                            let target = request
+                                .headers()
+                                .get("x-amz-target")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned);
+                            let body = request.into_body().collect().await?.to_bytes();
+
                             let index = requests.fetch_add(1, Ordering::SeqCst);
                             let response = responses
                                 .get(index)
                                 .unwrap_or_else(|| panic!("unexpected request {index}"))
                                 .clone();
+
+                            match response.request {
+                                ExpectedRequest::TopologyScan(expected_table) => {
+                                    assert_eq!(target.as_deref(), Some(SCAN_TARGET));
+                                    let table_name =
+                                        serde_json::from_slice::<serde_json::Value>(&body)
+                                            .expect("Scan request body should be valid JSON")
+                                            .get("TableName")
+                                            .and_then(|name| name.as_str())
+                                            .map(str::to_owned);
+                                    assert_eq!(table_name.as_deref(), Some(expected_table));
+                                }
+                                ExpectedRequest::DynamoDb(expected_target) => {
+                                    assert_eq!(target.as_deref(), Some(expected_target));
+                                }
+                            }
 
                             let mut builder = Response::builder()
                                 .status(response.status)
@@ -177,27 +204,32 @@ async fn start_keep_alive_server(
 
 #[tokio::test]
 async fn alternator_discovery_non_success_responses_keep_connection_reusable() {
-    let server = start_keep_alive_server(
-        Method::GET,
-        "/localnodes",
-        vec![
-            MockResponse {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                content_type: "application/json",
-                body: r#"{"message":"temporary failure"}"#,
-            },
-            MockResponse {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                content_type: "application/json",
-                body: r#"{"message":"busy"}"#,
-            },
-            MockResponse {
-                status: StatusCode::OK,
-                content_type: "application/json",
-                body: r#"["127.0.0.1"]"#,
-            },
-        ],
-    )
+    let server = start_keep_alive_server(vec![
+        MockResponse {
+            request: ExpectedRequest::TopologyScan(SYSTEM_LOCAL_TABLE),
+            status: StatusCode::BAD_REQUEST,
+            content_type: "application/x-amz-json-1.0",
+            body: r#"{"__type":"com.amazonaws.dynamodb.v20120810#ValidationException","message":"first failure"}"#,
+        },
+        MockResponse {
+            request: ExpectedRequest::TopologyScan(SYSTEM_LOCAL_TABLE),
+            status: StatusCode::BAD_REQUEST,
+            content_type: "application/x-amz-json-1.0",
+            body: r#"{"__type":"com.amazonaws.dynamodb.v20120810#ValidationException","message":"second failure"}"#,
+        },
+        MockResponse {
+            request: ExpectedRequest::TopologyScan(SYSTEM_LOCAL_TABLE),
+            status: StatusCode::OK,
+            content_type: "application/x-amz-json-1.0",
+            body: r#"{"Items":[{"rpc_address":{"S":"127.0.0.1"},"data_center":{"S":"datacenter1"},"rack":{"S":"rack1"}}],"Count":1,"ScannedCount":1}"#,
+        },
+        MockResponse {
+            request: ExpectedRequest::TopologyScan(SYSTEM_PEERS_TABLE),
+            status: StatusCode::OK,
+            content_type: "application/x-amz-json-1.0",
+            body: r#"{"Items":[{"rpc_address":{"S":"127.0.0.1"},"data_center":{"S":"datacenter1"},"rack":{"S":"rack1"}}],"Count":1,"ScannedCount":1}"#,
+        },
+    ])
     .await;
 
     let client = AlternatorClient::from_conf(
@@ -210,7 +242,7 @@ async fn alternator_discovery_non_success_responses_keep_connection_reusable() {
             .build(),
     );
 
-    server.wait_for_requests(3).await;
+    server.wait_for_requests(4).await;
 
     assert_eq!(
         server.connection_count(),
@@ -224,27 +256,26 @@ async fn alternator_discovery_non_success_responses_keep_connection_reusable() {
 
 #[tokio::test]
 async fn dynamodb_non_success_responses_keep_connection_reusable() {
-    let server = start_keep_alive_server(
-        Method::POST,
-        "/",
-        vec![
-            MockResponse {
-                status: StatusCode::BAD_REQUEST,
-                content_type: "application/x-amz-json-1.0",
-                body: r#"{"__type":"com.amazonaws.dynamodb.v20120810#ValidationException","message":"first failure"}"#,
-            },
-            MockResponse {
-                status: StatusCode::BAD_REQUEST,
-                content_type: "application/x-amz-json-1.0",
-                body: r#"{"__type":"com.amazonaws.dynamodb.v20120810#ValidationException","message":"second failure"}"#,
-            },
-            MockResponse {
-                status: StatusCode::OK,
-                content_type: "application/x-amz-json-1.0",
-                body: r#"{"TableNames":[]}"#,
-            },
-        ],
-    )
+    let server = start_keep_alive_server(vec![
+        MockResponse {
+            request: ExpectedRequest::DynamoDb(LIST_TABLES_TARGET),
+            status: StatusCode::BAD_REQUEST,
+            content_type: "application/x-amz-json-1.0",
+            body: r#"{"__type":"com.amazonaws.dynamodb.v20120810#ValidationException","message":"first failure"}"#,
+        },
+        MockResponse {
+            request: ExpectedRequest::DynamoDb(LIST_TABLES_TARGET),
+            status: StatusCode::BAD_REQUEST,
+            content_type: "application/x-amz-json-1.0",
+            body: r#"{"__type":"com.amazonaws.dynamodb.v20120810#ValidationException","message":"second failure"}"#,
+        },
+        MockResponse {
+            request: ExpectedRequest::DynamoDb(LIST_TABLES_TARGET),
+            status: StatusCode::OK,
+            content_type: "application/x-amz-json-1.0",
+            body: r#"{"TableNames":[]}"#,
+        },
+    ])
     .await;
 
     let http_client = aws_smithy_http_client::Builder::new().build_http();

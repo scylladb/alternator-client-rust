@@ -17,6 +17,7 @@ mod ccm_wrapper;
 use crate::ccm_wrapper::ccm::*;
 use crate::ccm_wrapper::cluster::*;
 use crate::ccm_wrapper::topology_spec::*;
+use serde_json::{Value, json};
 
 // GET request on node with alternator can only return "healthy".
 // Therefore if it did not refuse the connection - it is up.
@@ -24,10 +25,74 @@ async fn is_node_up(node: &Node) -> Result<bool, reqwest::Error> {
     Ok(reqwest::get(node.address()).await.is_ok())
 }
 
-async fn get_localnodes(url: &str) -> Result<Vec<String>, reqwest::Error> {
-    let response = reqwest::get(url).await?;
-    let nodes = response.json::<Vec<String>>().await?;
-    Ok(nodes)
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TopologyNode {
+    rpc_address: String,
+    data_center: String,
+    rack: String,
+}
+
+fn topology_attribute(item: &Value, attribute: &str) -> Option<String> {
+    item.get(attribute)
+        .and_then(|value| value.get("S"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+async fn scan_topology_table(
+    client: &reqwest::Client,
+    endpoint: &str,
+    table_name: &str,
+) -> Result<Vec<TopologyNode>, Box<dyn std::error::Error>> {
+    let mut nodes = Vec::new();
+    let mut exclusive_start_key = None;
+
+    loop {
+        let mut request = json!({
+            "TableName": table_name,
+            "ProjectionExpression": "rpc_address,data_center,rack",
+        });
+        if let Some(key) = exclusive_start_key {
+            request["ExclusiveStartKey"] = key;
+        }
+
+        let response = client
+            .post(endpoint)
+            .header("X-Amz-Target", "DynamoDB_20120810.Scan")
+            .header("Content-Type", "application/x-amz-json-1.0")
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+
+        let items = response
+            .get("Items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "Scan of {table_name} returned no Items array: {response}"
+                ))
+            })?;
+        nodes.extend(items.iter().filter_map(|item| {
+            Some(TopologyNode {
+                rpc_address: topology_attribute(item, "rpc_address")?,
+                data_center: topology_attribute(item, "data_center")?,
+                rack: topology_attribute(item, "rack")?,
+            })
+        }));
+
+        exclusive_start_key = response
+            .get("LastEvaluatedKey")
+            .and_then(Value::as_object)
+            .filter(|key| !key.is_empty())
+            .cloned()
+            .map(Value::Object);
+        if exclusive_start_key.is_none() {
+            return Ok(nodes);
+        }
+    }
 }
 
 // Test to verify if cluster matches the given topology.
@@ -67,57 +132,46 @@ fn verify_correctness_with_topology(
     Ok(())
 }
 
-// Test to see if real cluster matches the cluster struct, using localnodes API.
-async fn verify_correctness_with_localnodes(
+// Test that the topology exposed through Alternator system tables matches the cluster struct.
+async fn verify_correctness_with_system_tables(
     cluster: &Cluster,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for datacenter in cluster.datacenters().iter() {
-        let dc_localnodes_url = format!(
-            "{}/localnodes?dc={}",
-            // Take the first node address for the localnodes url.
-            datacenter.racks()[0].nodes()[0].address(),
-            datacenter.name
-        );
+    let endpoint = cluster
+        .nodes()
+        .into_iter()
+        .find(|node| node.is_up)
+        .ok_or_else(|| std::io::Error::other("cluster has no running node"))?
+        .address();
+    let client = reqwest::Client::new();
 
-        let localnodes: Vec<String> = get_localnodes(&dc_localnodes_url).await?;
+    let mut actual =
+        scan_topology_table(&client, &endpoint, ".scylla.alternator.system.local").await?;
+    actual
+        .extend(scan_topology_table(&client, &endpoint, ".scylla.alternator.system.peers").await?);
 
-        let mut localnodes: Vec<&str> = localnodes.iter().map(|s| s.as_str()).collect();
-        let mut dc_node_ips: Vec<&str> = datacenter.node_ips();
+    let mut expected = cluster
+        .datacenters()
+        .iter()
+        .flat_map(|datacenter| {
+            datacenter.racks().iter().flat_map(|rack| {
+                rack.nodes().iter().map(|node| TopologyNode {
+                    rpc_address: node.ip.clone(),
+                    data_center: datacenter.name.clone(),
+                    rack: rack.name.clone(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
 
-        dc_node_ips.sort();
-        localnodes.sort();
-
-        if dc_node_ips != localnodes {
-            return Err(format!(
-                "mismatch in {}.\n Nodes in the cluster structure: {:?},\n list returned by localnodes: {:?}",
-                datacenter.name, dc_node_ips, localnodes
-            ).into());
-        }
-
-        for rack in datacenter.racks().iter() {
-            let rack_localnodes_url = format!(
-                "{}/localnodes?dc={}&rack={}",
-                rack.nodes()[0].address(),
-                datacenter.name,
-                rack.name
-            );
-
-            let localnodes: Vec<String> = get_localnodes(&rack_localnodes_url).await?;
-
-            let mut localnodes: Vec<&str> = localnodes.iter().map(|s| s.as_str()).collect();
-            let mut rack_node_ips: Vec<&str> = rack.node_ips();
-
-            rack_node_ips.sort();
-            localnodes.sort();
-
-            if rack_node_ips != localnodes {
-                return Err(format!(
-                    "mismatch in {}/{}.\n Nodes in the cluster structure: {:?},\n list returned by localnodes: {:?}",
-                    datacenter.name, rack.name, rack_node_ips, localnodes
-                ).into());
-            }
-        }
+    actual.sort();
+    expected.sort();
+    if actual != expected {
+        return Err(format!(
+            "system-table topology mismatch.\n Cluster structure: {expected:?},\n system.local + system.peers: {actual:?}"
+        )
+        .into());
     }
+
     Ok(())
 }
 
@@ -174,7 +228,7 @@ async fn ccm_wrapper_test_cluster() -> Result<(), Box<dyn std::error::Error>> {
 
     Ccm::start_cluster(&mut cluster)?;
 
-    verify_correctness_with_localnodes(&cluster).await?;
+    verify_correctness_with_system_tables(&cluster).await?;
     check_if_correct_nodes_are_up(&cluster).await?;
 
     let node1_1_1 = cluster.node_mut(0, 0, 0).unwrap();

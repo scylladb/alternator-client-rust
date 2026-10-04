@@ -20,7 +20,7 @@
 /// Selects the preferred cluster nodes and an optional fallback chain for routing.
 ///
 /// A scope can target the whole cluster, one datacenter, or one rack within a
-/// datacenter. If no live nodes exist in that scope, the client tries each
+/// datacenter. If no discovered nodes exist in that scope, the client tries each
 /// scope added with [`Self::with_fallback`] in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingScope {
@@ -32,10 +32,8 @@ pub struct RoutingScope {
 impl RoutingScope {
     /// Routes across the whole cluster.
     ///
-    /// The client queries `/localnodes` on configured seed hosts and
-    /// already-known live nodes, then unions the returned node lists.
-    /// Provide at least one working seed host from every datacenter that should
-    /// receive traffic.
+    /// The client reads ScyllaDB's `system.local` and `system.peers` tables
+    /// through the DynamoDB API and routes across every discovered datacenter.
     pub fn from_cluster() -> Self {
         Self {
             dc: None,
@@ -61,7 +59,7 @@ impl RoutingScope {
     /// Routes requests to nodes in `rack` within `dc`.
     ///
     /// When key-route affinity is enabled, requests with an affinity plan use
-    /// every live node in `dc` so clients in different racks derive the same
+    /// every discovered node in `dc` so clients in different racks derive the same
     /// coordinator. Other requests remain restricted to `rack`.
     ///
     /// An empty datacenter name is treated as [`Self::from_cluster`]. An empty
@@ -84,7 +82,7 @@ impl RoutingScope {
     ///
     /// This function can be called multiple times to create a chain of fallback scopes.
     /// Each call of this function adds the new fallback scope at the end of the existing fallback chain.
-    /// Requests are always routed to the most preferred scope in the chain that has available nodes.
+    /// Requests are routed to the most preferred scope containing discovered nodes.
     ///
     /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
     /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
@@ -99,36 +97,33 @@ impl RoutingScope {
         self
     }
 
-    /// Appends the datacenter and rack parameters to the given URL as query parameters, if they are set in the scope.
-    /// append_pair performs URL encoding.
-    pub(crate) fn build_localnodes_url(&self, mut base_url: url::Url) -> url::Url {
-        base_url.set_path("/localnodes");
-        if self.dc.is_some() {
-            let mut query = base_url.query_pairs_mut();
-            if let Some(dc) = &self.dc {
-                query.append_pair("dc", dc);
-            }
-            if let Some(rack) = &self.rack {
-                query.append_pair("rack", rack);
-            }
-        }
-        base_url
+    /// Returns whether a topology row belongs to this scope.
+    pub(crate) fn contains(&self, dc: &str, rack: &str) -> bool {
+        self.dc.as_deref().is_none_or(|expected| expected == dc)
+            && self.rack.as_deref().is_none_or(|expected| expected == rack)
     }
 
-    pub(crate) fn is_cluster(&self) -> bool {
-        self.dc.is_none() && self.rack.is_none()
+    /// Returns whether this scope or any fallback restricts routing to a rack.
+    pub(crate) fn has_rack_restriction(&self) -> bool {
+        std::iter::successors(Some(self), |scope| scope.fallback())
+            .any(|scope| scope.rack.is_some())
     }
 
-    /// Returns the same scope and fallback chain without restricting the
-    /// preferred scope to one rack.
+    /// Returns the same scope and fallback chain without rack restrictions.
     ///
-    /// Key-route affinity needs every rack in the preferred datacenter so
-    /// clients in different racks derive the same coordinator for a
-    /// partition. Datacenter locality and the caller's fallback policy remain
-    /// unchanged.
+    /// Key-route affinity needs every rack in each selected datacenter so
+    /// clients in different racks derive the same coordinator for a partition.
+    /// Datacenter locality and fallback order remain unchanged.
     pub(crate) fn without_rack(&self) -> Self {
         let mut scope = self.clone();
-        scope.rack = None;
+        let mut current = &mut scope;
+        loop {
+            current.rack = None;
+            let Some(fallback) = current.fallback.as_deref_mut() else {
+                break;
+            };
+            current = fallback;
+        }
         scope
     }
 
@@ -158,23 +153,43 @@ mod tests {
         assert_eq!(scope.dc(), None);
         assert_eq!(scope.rack(), None);
         assert!(scope.fallback().is_none());
-        let url = url::Url::parse("http://localhost/").unwrap();
-        assert_eq!(
-            scope.build_localnodes_url(url).as_str(),
-            "http://localhost/localnodes"
-        );
+        assert!(scope.contains("dc1", "rack1"));
     }
 
     #[test]
-    fn without_rack_preserves_datacenter_and_fallbacks() {
+    fn without_rack_widens_every_scope_and_preserves_datacenters() {
         let scope = RoutingScope::from_rack("dc1".to_string(), "rack1".to_string())
+            .with_fallback(RoutingScope::from_rack(
+                "dc2".to_string(),
+                "rack2".to_string(),
+            ))
             .with_fallback(RoutingScope::from_cluster());
+
+        assert!(scope.has_rack_restriction());
 
         let widened = scope.without_rack();
 
         assert_eq!(widened.dc(), Some("dc1"));
         assert_eq!(widened.rack(), None);
-        assert!(widened.fallback().is_some_and(RoutingScope::is_cluster));
+        let dc2 = widened
+            .fallback()
+            .expect("datacenter fallback is preserved");
+        assert_eq!(dc2.dc(), Some("dc2"));
+        assert_eq!(dc2.rack(), None);
+        let cluster = dc2.fallback().expect("cluster fallback is preserved");
+        assert_eq!(cluster.dc(), None);
+        assert_eq!(cluster.rack(), None);
+        assert!(!widened.has_rack_restriction());
+    }
+
+    #[test]
+    fn rack_restriction_is_detected_in_a_fallback() {
+        let scope = RoutingScope::from_datacenter("dc1".to_string()).with_fallback(
+            RoutingScope::from_rack("dc2".to_string(), "rack2".to_string()),
+        );
+
+        assert!(scope.has_rack_restriction());
+        assert!(!scope.without_rack().has_rack_restriction());
     }
 
     #[test]
@@ -183,11 +198,8 @@ mod tests {
         assert_eq!(scope.dc(), Some("dc1"));
         assert_eq!(scope.rack(), None);
         assert!(scope.fallback().is_none());
-        let url = url::Url::parse("http://localhost/").unwrap();
-        assert_eq!(
-            scope.build_localnodes_url(url).as_str(),
-            "http://localhost/localnodes?dc=dc1"
-        );
+        assert!(scope.contains("dc1", "rack1"));
+        assert!(!scope.contains("dc2", "rack1"));
     }
 
     #[test]
@@ -196,11 +208,9 @@ mod tests {
         assert_eq!(scope.dc(), Some("dc1"));
         assert_eq!(scope.rack(), Some("rack1"));
         assert!(scope.fallback().is_none());
-        let url = url::Url::parse("http://localhost/").unwrap();
-        assert_eq!(
-            scope.build_localnodes_url(url).as_str(),
-            "http://localhost/localnodes?dc=dc1&rack=rack1"
-        );
+        assert!(scope.contains("dc1", "rack1"));
+        assert!(!scope.contains("dc1", "rack2"));
+        assert!(!scope.contains("dc2", "rack1"));
     }
 
     #[test]
@@ -222,16 +232,6 @@ mod tests {
         assert_eq!(second_fallback.dc(), None);
         assert_eq!(second_fallback.rack(), None);
         assert!(second_fallback.fallback().is_none());
-    }
-
-    #[test]
-    fn test_localnodes_query_encoding() {
-        let scope = RoutingScope::from_rack("dc 1".to_string(), "rack&1".to_string());
-        let url = url::Url::parse("http://localhost/").unwrap();
-        assert_eq!(
-            scope.build_localnodes_url(url).as_str(),
-            "http://localhost/localnodes?dc=dc+1&rack=rack%261"
-        );
     }
 
     #[test]

@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced `/localnodes` discovery with DynamoDB scans of ScyllaDB's
+  `system.local` and `system.peers` tables, enabling one seed host to discover
+  the full multi-datacenter topology.
+- Discovery now requires ScyllaDB 4.1 or newer and, when authorization is
+  enforced, `SELECT` permission on both system tables. System-table membership
+  is not a liveness signal, so unavailable members remain eligible for routing
+  until the cluster topology removes them and do not activate scope fallbacks.
+- ScyllaDB 5.2 or newer is recommended when bind and client-advertised
+  addresses differ; earlier versions can expose an unreachable bind address in
+  `system.local.rpc_address`.
+
 ## [1.0.0] - 2026-10-02
 
 ### Added

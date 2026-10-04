@@ -36,8 +36,24 @@ use tokio::sync::{Mutex, MutexGuard};
 pub(crate) const PROXY_PORT: u16 = 7999;
 pub(crate) const ALTERNATOR_PORT: u16 = 8000;
 
+const DYNAMODB_SCAN_TARGET: &str = "DynamoDB_20120810.Scan";
+const SYSTEM_LOCAL_TABLE: &str = ".scylla.alternator.system.local";
+const SYSTEM_PEERS_TABLE: &str = ".scylla.alternator.system.peers";
+
 pub(crate) const POLLING_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const POLLING_INTERVAL: Duration = Duration::from_millis(50);
+
+fn is_topology_scan(target: Option<&str>, body: &[u8]) -> bool {
+    target == Some(DYNAMODB_SCAN_TARGET)
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|body| {
+                body.get("TableName")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|table_name| matches!(table_name, SYSTEM_LOCAL_TABLE | SYSTEM_PEERS_TABLE))
+            })
+            .unwrap_or(false)
+}
 
 // Since cluster creation is expensive, we create it once and reuse it for every test.
 // Before a test gets access to the cluster, we make sure that all nodes are up and their ports are set to default.
@@ -93,12 +109,12 @@ pub(crate) fn default_seed_port(cluster: &Cluster) -> u16 {
 }
 
 // Struct for counting connections accepted / closed and requests made to the proxy.
-// GETs, POSTs, and describe_tables are counted separately.
-// GETs are service discovery calls, POSTs are the actual calls to DB, and describe_table calls
-// are from PartitionKeyResolver.
+// GETs, data POSTs, and DescribeTable requests are counted separately. Topology
+// discovery scans are excluded from the data POST count.
 #[derive(Debug)]
 pub(crate) struct NodeCounter {
     posts: AtomicUsize,
+    topology_scans: AtomicUsize,
     gets: AtomicUsize,
     describe_tables: AtomicUsize,
     connects: AtomicUsize,
@@ -109,6 +125,7 @@ impl NodeCounter {
     fn new() -> Self {
         Self {
             posts: AtomicUsize::new(0),
+            topology_scans: AtomicUsize::new(0),
             gets: AtomicUsize::new(0),
             describe_tables: AtomicUsize::new(0),
             connects: AtomicUsize::new(0),
@@ -120,12 +137,12 @@ impl NodeCounter {
         self.posts.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn gets(&self) -> usize {
-        self.gets.load(Ordering::Relaxed)
-    }
-
     pub(crate) fn connects(&self) -> usize {
         self.connects.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn topology_scans(&self) -> usize {
+        self.topology_scans.load(Ordering::Relaxed)
     }
 
     fn reset_posts(&self) {
@@ -134,6 +151,7 @@ impl NodeCounter {
 
     fn reset(&self) {
         self.reset_posts();
+        self.topology_scans.store(0, Ordering::Relaxed);
         self.gets.store(0, Ordering::Relaxed);
         self.describe_tables.store(0, Ordering::Relaxed);
         self.connects.store(0, Ordering::Relaxed);
@@ -173,17 +191,17 @@ impl RequestCounter {
         }
     }
 
-    pub(crate) fn total_gets(&self) -> usize {
-        self.counter
-            .values()
-            .map(|c| c.gets.load(Ordering::Relaxed))
-            .sum()
-    }
-
     pub(crate) fn total_posts(&self) -> usize {
         self.counter
             .values()
             .map(|c| c.posts.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    pub(crate) fn total_topology_scans(&self) -> usize {
+        self.counter
+            .values()
+            .map(|c| c.topology_scans.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -246,27 +264,31 @@ pub(crate) async fn start_counting_proxy(
         move |req, send| {
             let node_counter = Arc::clone(&request_counter);
             async move {
-                {
-                    let is_describe_table = req
-                        .headers()
-                        .get("x-amz-target")
-                        .is_some_and(|h| h == "DynamoDB_20120810.DescribeTable");
+                let (parts, body) = proxy::collect_request(req).await;
+                let is_describe_table = parts
+                    .headers
+                    .get("x-amz-target")
+                    .is_some_and(|h| h == "DynamoDB_20120810.DescribeTable");
+                let target = parts
+                    .headers
+                    .get("x-amz-target")
+                    .and_then(|target| target.to_str().ok());
+                let is_topology_scan = is_topology_scan(target, &body);
 
-                    match *req.method() {
-                        Method::POST => {
-                            if is_describe_table {
-                                node_counter.describe_tables.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                node_counter.posts.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        Method::GET => {
-                            node_counter.gets.fetch_add(1, Ordering::Relaxed);
-                        }
-                        _ => {}
-                    };
+                if parts.method == Method::POST {
+                    if is_describe_table {
+                        node_counter.describe_tables.fetch_add(1, Ordering::Relaxed);
+                    } else if !is_topology_scan {
+                        node_counter.posts.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if parts.method == Method::GET {
+                    node_counter.gets.fetch_add(1, Ordering::Relaxed);
                 }
-                proxy::forward_on_request(req, send).await
+                let (parts, body) = proxy::collect_received_response(parts, body, send).await;
+                if is_topology_scan {
+                    node_counter.topology_scans.fetch_add(1, Ordering::Relaxed);
+                }
+                proxy::build_response(parts, body)
             }
         },
         Some(on_connect),
@@ -420,4 +442,29 @@ pub(crate) async fn wait_until_requests_routed_to(
             POLLING_TIMEOUT, expected_ips, last_observed
         )
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_only_system_topology_scans() {
+        for table_name in [SYSTEM_LOCAL_TABLE, SYSTEM_PEERS_TABLE] {
+            let body = format!(r#"{{"TableName":"{table_name}"}}"#);
+            assert!(is_topology_scan(
+                Some(DYNAMODB_SCAN_TARGET),
+                body.as_bytes()
+            ));
+        }
+
+        assert!(!is_topology_scan(
+            Some(DYNAMODB_SCAN_TARGET),
+            br#"{"TableName":"user_table"}"#,
+        ));
+        assert!(!is_topology_scan(
+            Some("DynamoDB_20120810.DescribeTable"),
+            br#"{"TableName":".scylla.alternator.system.local"}"#,
+        ));
+    }
 }

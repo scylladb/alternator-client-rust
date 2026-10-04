@@ -33,8 +33,8 @@ fn redirect_target_node(cluster: &Cluster) -> Node {
 }
 
 // This proxy is used in tests where we check if calls are made to a node that is down.
-// Redirecting calls to a different node allows us to count calls to the stopped node,
-// while also allowing the client to use it for discovery without connection errors.
+// Redirecting calls to a different node allows us to count calls to the stopped node
+// while keeping its topology scans and data requests observable and successful.
 async fn start_redirecting_proxy(from: &Node, to: &Node, request_counter: Arc<NodeCounter>) {
     let listen_addr = format!("{}:{}", from.ip.clone(), from.alternator_port);
     let connect_addr = format!("{}:{}", to.ip.clone(), ALTERNATOR_PORT);
@@ -117,36 +117,6 @@ async fn update_item(client: &AlternatorClient, table_name: &str, item: &str, ne
         )
         .send()
         .await;
-}
-
-fn create_client_with_scope_and_seed_hosts(
-    cluster: &Cluster,
-    scope: RoutingScope,
-    seed_hosts: Vec<String>,
-) -> AlternatorClient {
-    AlternatorClient::from_conf(
-        minimal_builder()
-            .scheme("http")
-            .port(cluster.nodes()[0].alternator_port)
-            .seed_hosts(seed_hosts)
-            .routing_scope(scope)
-            .build(),
-    )
-}
-
-fn first_working_seed_per_datacenter(cluster: &Cluster) -> Vec<String> {
-    cluster
-        .datacenters()
-        .iter()
-        .filter_map(|datacenter| {
-            datacenter
-                .racks()
-                .iter()
-                .flat_map(|rack| rack.nodes().iter())
-                .find(|node| node.is_up)
-                .map(|node| node.ip.clone())
-        })
-        .collect()
 }
 
 fn create_client_with_scope_and_affinity(
@@ -638,7 +608,7 @@ async fn calls_correct_rack_scope_test() {
 
 #[tokio::test]
 #[cfg_attr(not(ccm_tests), ignore)]
-async fn calls_correct_cluster_scope_test() {
+async fn single_seed_discovers_all_datacenters_test() {
     let mut guard = get_cluster().await;
     let cluster = &mut *guard;
 
@@ -646,19 +616,15 @@ async fn calls_correct_cluster_scope_test() {
     start_proxies(cluster, PROXY_PORT, &request_counter).await;
 
     let scope = RoutingScope::from_cluster();
-    let client = create_client_with_scope_and_seed_hosts(
-        cluster,
-        scope.clone(),
-        first_working_seed_per_datacenter(cluster),
-    );
-    let live_node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
+    let client = create_client_with_scope(cluster, scope.clone());
+    let topology_node_ips = scope_utils::ips_in_scope(cluster, &scope);
 
-    wait_until_requests_routed_to(&client, &request_counter, live_node_ips.clone()).await;
+    wait_until_requests_routed_to(&client, &request_counter, topology_node_ips.clone()).await;
 
     request_counter.reset();
-    make_n_calls(&client, live_node_ips.len()).await;
+    make_n_calls(&client, topology_node_ips.len()).await;
 
-    assert_round_robin_counts(&request_counter, &live_node_ips, "cluster scope");
+    assert_round_robin_counts(&request_counter, &topology_node_ips, "cluster scope");
 }
 
 #[tokio::test]
@@ -688,9 +654,8 @@ async fn dns_entrypoint_discovers_live_cluster_nodes_test() {
     });
     start_proxies(cluster, proxy_port, &request_counter).await;
 
-    let entrypoint_scope = scope_utils::datacenter_scope_from_index(cluster, 0);
-    let discovered_node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &entrypoint_scope);
     let scope = RoutingScope::from_cluster();
+    let discovered_node_ips = scope_utils::ips_in_scope(cluster, &scope);
     let client = AlternatorClient::from_conf(
         minimal_builder()
             .scheme("http")
@@ -713,7 +678,7 @@ async fn dns_entrypoint_discovers_live_cluster_nodes_test() {
 
 #[tokio::test]
 #[cfg_attr(not(ccm_tests), ignore)]
-async fn node_shut_down_test() {
+async fn stopped_topology_member_remains_in_scope_test() {
     let mut guard = get_cluster().await;
     let cluster = &mut *guard;
 
@@ -723,32 +688,44 @@ async fn node_shut_down_test() {
 
     let client = create_client_with_scope(cluster, scope.clone());
 
-    loop {
-        let working_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
-        if working_ips.is_empty() {
-            break;
-        }
+    wait_until_requests_routed_to(
+        &client,
+        &request_counter,
+        scope_utils::ips_in_scope(cluster, &scope),
+    )
+    .await;
 
-        wait_until_requests_routed_to(&client, &request_counter, working_ips.clone()).await;
-
-        request_counter.reset_posts();
-        make_n_calls(&client, 10).await;
-        assert_eq!(
-            request_counter.get_posts_to_other_ips(&working_ips),
-            0,
-            "requests still reached an out-of-scope or stopped node; counters: {request_counter:?}"
-        );
-
+    let topology_scans_before_shutdown = request_counter.total_topology_scans();
+    {
         let node = scope_utils::scope_first_working_node_mut(cluster, &scope).unwrap();
         Ccm::stop_node(node).unwrap();
     }
+
+    // system.local/system.peers describe membership, not instantaneous
+    // liveness. Observe enough completed scans to include a full refresh after
+    // shutdown, then verify the unavailable member remains in the scope.
+    tokio::time::timeout(POLLING_TIMEOUT, async {
+        while request_counter.total_topology_scans() < topology_scans_before_shutdown + 4 {
+            tokio::time::sleep(POLLING_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("topology did not refresh after node shutdown");
+
+    let topology_node_ips = scope_utils::ips_in_scope(cluster, &scope);
+    wait_until_requests_routed_to(&client, &request_counter, topology_node_ips.clone()).await;
+
+    request_counter.reset_posts();
+    make_n_calls(&client, topology_node_ips.len()).await;
+    assert_round_robin_counts(
+        &request_counter,
+        &topology_node_ips,
+        "scope containing a stopped topology member",
+    );
 }
 
-// In this test we check that when the scope fails during client work,
-// the client starts using only the fallback scope.
-// This tests fallback behavior when localnodes returns an empty list.
-// Here every call to every node is redirected to the redirect node, because we want to monitor both calls to
-// working and not working nodes.
+// A fallback is selected when no discovered topology member matches the
+// preferred scope.
 #[tokio::test]
 #[cfg_attr(not(ccm_tests), ignore)]
 async fn scope_fallback_test() {
@@ -756,17 +733,16 @@ async fn scope_fallback_test() {
     let cluster = &mut *guard;
 
     let request_counter = RequestCounter::from_cluster(cluster);
-
-    start_redirecting_proxies(cluster, PROXY_PORT, &request_counter).await;
+    start_proxies(cluster, PROXY_PORT, &request_counter).await;
 
     let fallback_scope = scope_utils::datacenter_scope_from_index(cluster, 1);
-    let scope =
-        scope_utils::rack_scope_from_index(cluster, 1, 1).with_fallback(fallback_scope.clone());
+    let scope = RoutingScope::from_rack(
+        fallback_scope.dc().unwrap().to_string(),
+        "missing_rack".to_string(),
+    )
+    .with_fallback(fallback_scope.clone());
 
     let client = create_client_with_scope(cluster, scope.clone());
-    make_n_calls(&client, 5).await;
-
-    scope_utils::shut_down_scope(cluster, &scope);
     wait_until_requests_routed_to(
         &client,
         &request_counter,
@@ -778,15 +754,16 @@ async fn scope_fallback_test() {
 
     let n = 20;
     make_n_calls(&client, n).await;
-    let ips = scope_utils::working_nodes_ips_in_scope(cluster, &fallback_scope);
-    assert!(request_counter.get_posts_to_ips(ips.as_slice()) >= n);
+    let ips = scope_utils::ips_in_scope(cluster, &fallback_scope);
+    assert_eq!(request_counter.get_posts_to_ips(ips.as_slice()), n);
     assert_eq!(request_counter.get_posts_to_other_ips(ips.as_slice()), 0);
 }
 
-// Test if client switches to higher priority fallback once it starts working.
+// An unavailable primary scope still has topology members, so it must not
+// activate a fallback scope.
 #[tokio::test]
 #[cfg_attr(not(ccm_tests), ignore)]
-async fn primary_scope_recover_test() {
+async fn unavailable_primary_scope_does_not_trigger_fallback_test() {
     let mut guard = get_cluster().await;
     let cluster = &mut *guard;
 
@@ -803,7 +780,7 @@ async fn primary_scope_recover_test() {
     wait_until_requests_routed_to(
         &client,
         &request_counter,
-        scope_utils::working_nodes_ips_in_scope(cluster, &fallback_scope),
+        scope_utils::ips_in_scope(cluster, &scope),
     )
     .await;
     request_counter.reset_posts();
@@ -811,22 +788,9 @@ async fn primary_scope_recover_test() {
     let n = 20;
     make_n_calls(&client, n).await;
 
-    let ips = scope_utils::ips_in_scope(cluster, &fallback_scope);
-    assert!(request_counter.get_posts_to_ips(ips.as_slice()) >= n);
+    let ips = scope_utils::ips_in_scope(cluster, &scope);
+    assert_eq!(request_counter.get_posts_to_ips(ips.as_slice()), n);
     assert_eq!(request_counter.get_posts_to_other_ips(ips.as_slice()), 0);
-
-    // Start one node in main scope.
-    let mut nodes = scope_utils::nodes_in_scope_mut(cluster, &scope);
-    let node_to_start = &mut nodes[0];
-    Ccm::start_node(node_to_start).unwrap();
-    wait_until_requests_routed_to(&client, &request_counter, vec![node_to_start.ip.as_str()]).await;
-
-    request_counter.reset();
-    make_n_calls(&client, n).await;
-
-    let ip = node_to_start.ip.as_str();
-    assert!(request_counter.get_posts_to_ips(&[ip]) >= n);
-    assert_eq!(request_counter.get_posts_to_other_ips(&[ip]), 0);
 }
 
 // If a bad scope is given, the client should call only the seed node.
