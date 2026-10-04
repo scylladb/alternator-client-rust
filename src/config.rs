@@ -37,7 +37,7 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) port: Option<u16>,
     pub(crate) seed_hosts: Option<Vec<String>>,
     /// Whether to send every request straight to the configured seed host
-    /// instead of discovering live cluster nodes through it.
+    /// instead of discovering cluster topology through it.
     pub(crate) without_discovery: bool,
     pub(crate) key_route_affinity: Option<KeyRouteAffinityConfig>,
     pub(crate) stalled_stream_protection_explicitly_unset: bool,
@@ -245,10 +245,11 @@ impl AlternatorConfig {
     ///
     /// A routing scope can have a fallback scope set by [RoutingScope::with_fallback], which is used if no nodes are available in the preferred scope.
     /// This function can be used multiple times to create a chain of fallback scopes.
-    /// Requests will always be routed to the most preferred scope in the chain with available nodes.
+    /// Requests are routed to the most preferred scope containing discovered nodes.
     ///
-    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across live nodes in all discovered datacenters.
-    /// Cluster scope requires at least one working seed host from every datacenter that should receive traffic.
+    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across topology nodes in all discovered datacenters.
+    /// One working seed can discover the full cluster topology; additional
+    /// seeds provide startup and refresh resilience.
     ///
     /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
     /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
@@ -291,7 +292,7 @@ impl AlternatorConfig {
 
     /// The URL the AWS SDK is pointed at, derived from the first seed host.
     ///
-    /// With discovery on, requests are rewritten to the live node chosen for
+    /// With discovery on, requests are rewritten to the topology node chosen for
     /// them, so this only decides where a request goes when routing is turned
     /// off through [`AlternatorBuilder::without_discovery`].
     pub fn endpoint_url(&self) -> Option<String> {
@@ -618,10 +619,11 @@ impl AlternatorBuilder {
     ///
     /// A routing scope can have a fallback scope set by [RoutingScope::with_fallback], which is used if no nodes are available in the preferred scope.
     /// This function can be used multiple times to create a chain of fallback scopes.
-    /// Requests will always be routed to the most preferred scope in the chain with available nodes.
+    /// Requests are routed to the most preferred scope containing discovered nodes.
     ///
-    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across live nodes in all discovered datacenters.
-    /// Cluster scope requires at least one working seed host from every datacenter that should receive traffic.
+    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across topology nodes in all discovered datacenters.
+    /// One working seed can discover the full cluster topology; additional
+    /// seeds provide startup and refresh resilience.
     ///
     /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
     /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
@@ -639,10 +641,11 @@ impl AlternatorBuilder {
     ///
     /// A routing scope can have a fallback scope set by [RoutingScope::with_fallback], which is used if no nodes are available in the preferred scope.
     /// This function can be used multiple times to create a chain of fallback scopes.
-    /// Requests will always be routed to the most preferred scope in the chain with available nodes.
+    /// Requests are routed to the most preferred scope containing discovered nodes.
     ///
-    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across live nodes in all discovered datacenters.
-    /// Cluster scope requires at least one working seed host from every datacenter that should receive traffic.
+    /// If this is not provided, the client will use the cluster scope, meaning load balancing will happen across topology nodes in all discovered datacenters.
+    /// One working seed can discover the full cluster topology; additional
+    /// seeds provide startup and refresh resilience.
     ///
     /// Keep in mind that subsequent fallback scope should ideally be broader than or equal to the
     /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
@@ -729,13 +732,13 @@ impl AlternatorBuilder {
     }
 
     /// Send every request straight to the configured seed host instead of
-    /// discovering live cluster nodes through it.
+    /// discovering cluster topology through it.
     ///
     /// Use this when a proxy or an external load balancer sits in front of the
     /// cluster and is the only address this client should talk to. Requests go
     /// to the first seed host, with the configured
     /// [`scheme`](AlternatorBuilder::scheme) and [`port`](AlternatorBuilder::port),
-    /// and no `/localnodes` discovery runs. Without a seed host to send them
+    /// and no system-table discovery runs. Without a seed host to send them
     /// to, building a client fails rather than routing anywhere unintended.
     pub fn without_discovery(mut self) -> Self {
         self.set_without_discovery(true);
@@ -803,7 +806,7 @@ impl AlternatorConfig {
     }
 
     /// Returns the HTTP client used for both Alternator API requests and
-    /// live-node discovery.
+    /// topology discovery.
     pub fn http_client(&self) -> Option<aws_sdk_dynamodb::config::SharedHttpClient> {
         self.dynamodb_config.http_client()
     }
@@ -977,10 +980,10 @@ impl AlternatorBuilder {
     }
 
     /// Configures the HTTP client used for both Alternator API requests and
-    /// live-node discovery.
+    /// topology discovery.
     ///
     /// This lets custom transport settings, including TLS trust stores and
-    /// client certificates, apply consistently to `/localnodes` requests.
+    /// client certificates, apply consistently to topology discovery scans.
     pub fn http_client(
         mut self,
         http_client: impl aws_sdk_dynamodb::config::HttpClient + 'static,
@@ -990,7 +993,7 @@ impl AlternatorBuilder {
     }
 
     /// Sets the HTTP client used for both Alternator API requests and
-    /// live-node discovery.
+    /// topology discovery.
     pub fn set_http_client(
         &mut self,
         http_client: Option<aws_sdk_dynamodb::config::SharedHttpClient>,
@@ -1621,14 +1624,14 @@ mod test {
             direct.endpoint_url().as_deref(),
             Some("https://load-balancer.example.com:8043/")
         );
-        assert!(LiveNodes::try_new(&direct).unwrap().is_none());
+        assert!(LiveNodes::try_new_for_test(&direct).unwrap().is_none());
 
         // Without a seed host there is nothing to send requests to, so the
         // client fails closed instead of falling back to an AWS endpoint.
         let no_target = AlternatorConfig::builder().without_discovery().build();
 
         assert_eq!(no_target.endpoint_url(), None);
-        assert!(LiveNodes::try_new(&no_target).is_err());
+        assert!(LiveNodes::try_new_for_test(&no_target).is_err());
     }
 
     #[test]
@@ -1657,7 +1660,7 @@ mod test {
                 discovery.seed_hosts(),
                 Some(vec!["node-1".to_string(), "node-2".to_string()])
             );
-            assert!(LiveNodes::try_new(&discovery).unwrap().is_some());
+            assert!(LiveNodes::try_new_for_test(&discovery).unwrap().is_some());
         }
     }
 

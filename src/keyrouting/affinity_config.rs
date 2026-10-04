@@ -21,7 +21,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum KeyRouteAffinityType {
-    /// Standard round-robin load balancing across all live nodes. No
+    /// Standard round-robin load balancing across all discovered nodes. No
     /// affinity is applied to any request. This is the default.
     #[default]
     None,

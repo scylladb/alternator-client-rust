@@ -15,8 +15,8 @@
 //! Shared HTTPS test context.
 //!
 //! Each test gets a TLS-terminating proxy in front of the real Alternator HTTP port.
-//! The generated CA is published through `SSL_CERT_FILE` so both the SDK path and
-//! the reqwest-based discovery path trust the proxy certificate.
+//! The generated CA is published through `SSL_CERT_FILE` so the SDK API and
+//! topology-discovery paths trust the proxy certificate.
 
 use crate::https_test::proxy::forward_on_request;
 use crate::https_test::proxy::*;
@@ -172,10 +172,6 @@ impl HttpsTestContext {
     {
         *self.on_request.lock().await =
             Box::new(move |request, sender| new(request, sender).boxed());
-    }
-
-    pub fn get_proxy_address(&self) -> String {
-        self.proxy_address.clone()
     }
 
     /// Host part of the proxy address, for use as a seed host.

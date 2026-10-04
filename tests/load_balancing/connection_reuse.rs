@@ -18,7 +18,7 @@
 //! instead of reopening them. Counting proxies sit between the client and the
 //! cluster nodes and record accepted (`connects`) and closed (`disconnects`)
 //! connections via the proxy's `on_client_connect` / `on_client_disconnect`
-//! hooks, alongside GET/POST request counts.
+//! hooks, alongside request counts.
 //!
 //! Two scenarios:
 //!
@@ -26,13 +26,11 @@
 //!   no discovery, so a single data connection carries everything and the
 //!   assertion can be made directly after the calls.
 //!
-//! - Load balancing **on**: background `/localnodes` discovery runs alongside
-//!   operations. Each node then sees at most one data connection (POSTs) plus
-//!   one discovery connection (GETs).
-//!   Invariant to verify: `(posts > 0) + (gets > 0) == connects`.
-//!   Discovery bumps `connects` at accept-time slightly before its
-//!   GET is counted, so that equality is polled until it settles (within
-//!   `POLLING_TIMEOUT`).
+//! - Load balancing **on**: background DynamoDB `Scan` requests against the
+//!   system topology tables run alongside user operations. The proxy parses
+//!   the Scan table name so those POSTs are not mistaken for user traffic.
+//!   A node may use one shared connection or one connection per request class,
+//!   but must not open a new connection per request.
 
 use crate::ccm_wrapper::cluster::*;
 use crate::load_balancing::cluster_utils::*;
@@ -188,9 +186,8 @@ async fn connection_reconnects_once_after_pool_expiry_test() {
 }
 
 /// With load balancing and discovery enabled, repeated operations should keep
-/// succeeding while background `/localnodes` polling runs, without opening a new
-/// connection per GET or POST: each node ends up with at most one data
-/// connection (POSTs) plus one discovery connection (GETs).
+/// succeeding while background system-table scans run, without opening a new
+/// connection per request.
 #[tokio::test]
 #[cfg_attr(not(ccm_tests), ignore)]
 async fn connection_reused_across_discovery_test() {
@@ -202,10 +199,10 @@ async fn connection_reused_across_discovery_test() {
 
     let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
 
-    // Short discovery interval so the GET threshold below is reached quickly.
+    // Short discovery interval so the Scan threshold below is reached quickly.
     let client =
         create_client_with_scope_and_interval(cluster, scope.clone(), Duration::from_millis(5));
-    let target_gets_number = 10;
+    let target_topology_scans = 20;
 
     wait_until_requests_routed_to(
         &client,
@@ -216,19 +213,27 @@ async fn connection_reused_across_discovery_test() {
 
     make_n_calls(&client, REQUESTS).await;
 
-    // Each in-scope node should hold at most one data connection (if it got
-    // POSTs) plus one discovery connection (if it was polled).
-    // Discovery bumps `connects` at accept-time a touch
-    // before its GET is counted, so poll until the steady state settles.
-    let in_scope_ips = scope_utils::ips_in_scope(cluster, &scope);
+    // The topology and main clients share an HTTP transport, so their traffic
+    // may use one connection. Concurrent requests may briefly need one per
+    // request class, but repeated requests must reuse those connections.
+    // Accept accounting happens before request classification, so poll until
+    // the steady state settles.
+    let node_ips: Vec<&str> = cluster
+        .nodes()
+        .iter()
+        .map(|node| node.ip.as_str())
+        .collect();
 
     tokio::time::timeout(POLLING_TIMEOUT, async {
         loop {
-            let settled = in_scope_ips.iter().all(|ip| {
+            let settled = node_ips.iter().all(|ip| {
                 let c = request_counter.get(ip);
-                (c.posts() > 0) as usize + (c.gets() > 0) as usize == c.connects()
+                let active_request_classes =
+                    (c.posts() > 0) as usize + (c.topology_scans() > 0) as usize;
+                c.connects() == 0
+                    || (active_request_classes > 0 && c.connects() <= active_request_classes)
             });
-            if settled && request_counter.total_gets() >= target_gets_number {
+            if settled && request_counter.total_topology_scans() >= target_topology_scans {
                 break;
             }
             tokio::time::sleep(POLLING_INTERVAL).await;
@@ -236,15 +241,15 @@ async fn connection_reused_across_discovery_test() {
     })
     .await
     .unwrap_or_else(|_| {
-        let detail: Vec<String> = in_scope_ips
+        let detail: Vec<String> = node_ips
             .iter()
             .map(|ip| {
                 let c = request_counter.get(ip);
                 format!(
-                    "{}: posts={} gets={} connects={}",
+                    "{}: user_posts={} topology_scans={} connects={}",
                     ip,
                     c.posts(),
-                    c.gets(),
+                    c.topology_scans(),
                     c.connects()
                 )
             })
@@ -259,7 +264,7 @@ async fn connection_reused_across_discovery_test() {
     // Sanity: the operations actually flowed through the proxies.
     assert!(
         request_counter.total_posts() >= REQUESTS,
-        "expected at least {} POSTs through the proxies, got {}",
+        "expected at least {} user POSTs through the proxies, got {}",
         REQUESTS,
         request_counter.total_posts()
     );

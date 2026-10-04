@@ -18,7 +18,7 @@ RUSTDOC_TOOLCHAIN ?= nightly-2026-06-23
 RUSTC ?= rustc
 SCYLLA_ALTERNATOR_HTTP_COMPRESSION ?= true
 EXPECTED_RUST_HOST ?=
-EXPECTED_LIB_TESTS ?= 223
+EXPECTED_LIB_TESTS ?= 227
 EXPECTED_DOCTESTS ?= 14
 CANDIDATE_CRATE ?=
 PACKAGE_NAME ?= $(shell awk -F '"' '/^name = "/ { print $$2; exit }' Cargo.toml)
@@ -44,7 +44,8 @@ ready=false
 started=$$SECONDS
 deadline=$$((started + $(ALTERNATOR_READY_TIMEOUT)))
 while (( SECONDS < deadline )); do
-	if $(CURL) -sf --connect-timeout 1 --max-time 1 "http://$(ALTERNATOR_TEST_ADDRESS)/localnodes" >/dev/null 2>&1; then
+	if $(CURL) -sf --connect-timeout 1 --max-time 1 \
+		"http://$(ALTERNATOR_TEST_ADDRESS)/" >/dev/null 2>&1; then
 		echo "Alternator is ready (waited $$((SECONDS - started))s)"
 		ready=true
 		break
