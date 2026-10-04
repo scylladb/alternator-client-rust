@@ -524,11 +524,18 @@ impl Drop for DiscoveryTaskGuard {
         if let Some(live_nodes) = self.live_nodes.upgrade() {
             // Clear only this task's exact registration so cleanup can never
             // erase a newer registration.
-            drop(
-                live_nodes
-                    .discovery_runtime
-                    .compare_and_swap(&self.runtime, None),
-            );
+            let previous = live_nodes
+                .discovery_runtime
+                .compare_and_swap(&self.runtime, None);
+            if previous
+                .as_ref()
+                .is_some_and(|runtime| Arc::ptr_eq(runtime, &self.runtime))
+            {
+                // A request waiting for initial discovery may be running on a
+                // different runtime. Wake it so that runtime can take over
+                // discovery without waiting for the readiness deadline.
+                live_nodes.initial_discovery_notify.notify_waiters();
+            }
         }
     }
 }
@@ -724,9 +731,10 @@ impl LiveNodes {
 
         if current.as_ref() != &partial {
             self.live_nodes.store(Arc::new(partial));
+            // Only real candidate growth extends the readiness budget.
+            self.initial_discovery_notify.notify_waiters();
         }
         state.latest_published_generation = generation;
-        self.initial_discovery_notify.notify_waiters();
     }
 
     async fn discover_cluster_live_nodes_from(
@@ -896,25 +904,80 @@ impl LiveNodes {
     /// so the deterministic coordinator is derived from every rack rather
     /// than from whichever bootstrap seeds one client happened to receive.
     pub(crate) async fn wait_for_initial_discovery(self: &Arc<Self>) -> bool {
-        self.ensure_discovery_started();
+        self.wait_for_initial_discovery_with_timeouts(
+            DISCOVERY_HTTP_OPERATION_TIMEOUT,
+            INITIAL_DISCOVERY_WAIT_SLACK,
+        )
+        .await
+    }
+
+    async fn wait_for_initial_discovery_with_timeouts(
+        self: &Arc<Self>,
+        request_timeout: Duration,
+        scheduling_slack: Duration,
+    ) -> bool {
+        let started = tokio::time::Instant::now();
+        let mut observed_live_count = self.live_nodes.load().len();
+        let mut deadline = started
+            + self.initial_discovery_wait_timeout_for_live_count(
+                observed_live_count,
+                request_timeout,
+                scheduling_slack,
+            );
 
         loop {
             let notified = self.initial_discovery_notify.notified();
+            // Register for owner-exit notifications before checking ownership,
+            // then retry on every wake so this runtime can take over from an
+            // owner that stopped during the wait.
+            self.ensure_discovery_started();
             if self.initial_discovery_complete.load(Ordering::Acquire) {
                 return true;
             }
-            if tokio::time::timeout(self.initial_discovery_wait_timeout(), notified)
-                .await
-                .is_err()
-            {
+
+            let timed_out = tokio::time::timeout_at(deadline, notified).await.is_err();
+            if self.initial_discovery_complete.load(Ordering::Acquire) {
+                return true;
+            }
+
+            let live_count = self.live_nodes.load().len();
+            let made_progress = live_count > observed_live_count;
+            if made_progress {
+                observed_live_count = live_count;
+                // Anchor every revision to the original start. Newly found
+                // candidates add only their own request allowance; repeated
+                // notifications cannot roll the full timeout forward.
+                deadline = started
+                    + self.initial_discovery_wait_timeout_for_live_count(
+                        observed_live_count,
+                        request_timeout,
+                        scheduling_slack,
+                    );
+            }
+
+            if tokio::time::Instant::now() >= deadline || (timed_out && !made_progress) {
                 return false;
             }
         }
     }
 
+    #[cfg(test)]
     fn initial_discovery_wait_timeout(&self) -> Duration {
+        self.initial_discovery_wait_timeout_for_live_count(
+            self.live_nodes.load().len(),
+            DISCOVERY_HTTP_OPERATION_TIMEOUT,
+            INITIAL_DISCOVERY_WAIT_SLACK,
+        )
+    }
+
+    fn initial_discovery_wait_timeout_for_live_count(
+        &self,
+        live_count: usize,
+        request_timeout: Duration,
+        scheduling_slack: Duration,
+    ) -> Duration {
         let seed_count = u32::try_from(self.seed_urls.len()).unwrap_or(u32::MAX);
-        let live_count = u32::try_from(self.live_nodes.load().len()).unwrap_or(u32::MAX);
+        let live_count = u32::try_from(live_count).unwrap_or(u32::MAX);
         let scope_count = u32::try_from(
             std::iter::successors(Some(&self.routing_scope), |scope| scope.fallback()).count(),
         )
@@ -928,26 +991,9 @@ impl LiveNodes {
         let request_budget = candidate_budget
             .saturating_mul(2)
             .saturating_add(scope_count);
-        DISCOVERY_HTTP_OPERATION_TIMEOUT
+        request_timeout
             .saturating_mul(request_budget)
-            .saturating_add(INITIAL_DISCOVERY_WAIT_SLACK)
-    }
-
-    #[cfg(test)]
-    async fn wait_for_initial_discovery_with_timeout(self: &Arc<Self>, timeout: Duration) -> bool {
-        self.ensure_discovery_started();
-
-        tokio::time::timeout(timeout, async {
-            loop {
-                let notified = self.initial_discovery_notify.notified();
-                if self.initial_discovery_complete.load(Ordering::Acquire) {
-                    return;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .is_ok()
+            .saturating_add(scheduling_slack)
     }
 
     /// Returns a list of all current live nodes and updates the last activity timestamp.
@@ -1195,7 +1241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_discovery_wait_is_bounded() {
+    async fn initial_discovery_wait_deadline_does_not_roll_on_notifications() {
         let config = AlternatorConfig::builder()
             .seed_hosts(["127.0.0.1"])
             .port(1)
@@ -1203,11 +1249,28 @@ mod tests {
             .build();
         let nodes = LiveNodes::new(&config).expect("live nodes");
 
-        assert!(
-            !nodes
-                .wait_for_initial_discovery_with_timeout(Duration::from_millis(10))
-                .await
-        );
+        let notifier = tokio::spawn({
+            let nodes = nodes.clone();
+            async move {
+                for _ in 0..200 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    nodes.initial_discovery_notify.notify_waiters();
+                }
+            }
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            nodes.wait_for_initial_discovery_with_timeouts(
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("duplicate notifications must not roll the readiness deadline");
+        notifier.abort();
+
+        assert!(!result);
     }
 
     #[test]
@@ -1497,6 +1560,83 @@ mod tests {
         }
 
         server.join().unwrap();
+    }
+
+    #[test]
+    fn initial_discovery_waiter_takes_over_after_owner_runtime_stops() {
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(1)
+            .active_interval(Duration::from_secs(60 * 60))
+            .idle_interval(Duration::from_secs(60 * 60))
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        let first_runtime = tokio::runtime::Runtime::new().unwrap();
+        first_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+            tokio::task::yield_now().await;
+        });
+        let first_owner = nodes.discovery_runtime.load_full().unwrap();
+
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(0);
+        let shutdown = std::thread::spawn(move || {
+            shutdown_rx.recv().unwrap();
+            first_runtime.shutdown_background();
+        });
+
+        let replacement_runtime = tokio::runtime::Runtime::new().unwrap();
+        let replacement_id = replacement_runtime.handle().id();
+        replacement_runtime.block_on(async {
+            let waiter = tokio::spawn({
+                let nodes = nodes.clone();
+                async move {
+                    nodes
+                        .wait_for_initial_discovery_with_timeouts(
+                            Duration::from_secs(1),
+                            Duration::ZERO,
+                        )
+                        .await
+                }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if first_owner
+                        .shutdown_probe
+                        .lock()
+                        .unwrap()
+                        .last_started
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("waiter did not check the original discovery owner");
+            shutdown_tx.send(()).unwrap();
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if nodes
+                        .discovery_runtime
+                        .load()
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.id == replacement_id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("waiting runtime did not take over discovery after owner exit");
+
+            waiter.abort();
+            let _ = waiter.await;
+        });
+        shutdown.join().unwrap();
     }
 
     #[test]

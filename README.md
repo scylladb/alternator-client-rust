@@ -271,6 +271,19 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
+Key-route affinity is an intentional exception to rack-local routing. When it
+is enabled with a rack scope, requests for which the client can build an
+affinity plan select from every live node in the rack's datacenter. This lets
+clients in different racks choose the same coordinator, but the selected node
+may be in another rack even while the local rack is healthy, adding cross-zone
+latency and bandwidth. Reads and other requests without an affinity plan keep
+using the configured rack scope and fallback chain.
+
+Before sending the first cross-rack affinity plan, the client waits for a
+completed datacenter-wide topology refresh. If discovery cannot complete
+within its bounded attempt budget, the request fails instead of routing from
+an incomplete topology.
+
 ### Scope fallbacks
 
 A scope can be narrow enough that no nodes match it — for example, a specific rack that has no live nodes at the moment. In that case the client uses the configured fallback scope instead. Fallbacks are explicit and chainable:

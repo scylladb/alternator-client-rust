@@ -60,6 +60,10 @@ impl RoutingScope {
 
     /// Routes requests to nodes in `rack` within `dc`.
     ///
+    /// When key-route affinity is enabled, requests with an affinity plan use
+    /// every live node in `dc` so clients in different racks derive the same
+    /// coordinator. Other requests remain restricted to `rack`.
+    ///
     /// An empty datacenter name is treated as [`Self::from_cluster`]. An empty
     /// rack name is treated as [`Self::from_datacenter`].
     pub fn from_rack(dc: String, rack: String) -> Self {
