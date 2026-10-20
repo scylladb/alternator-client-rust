@@ -927,7 +927,7 @@ impl LiveNodes {
         }
     }
 
-    fn publish_live_nodes(&self, generation: u64, new_nodes: Vec<Arc<Url>>) {
+    pub(crate) fn publish_live_nodes(&self, generation: u64, new_nodes: Vec<Arc<Url>>) {
         let mut state = self
             .refresh_state
             .lock()

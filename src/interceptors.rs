@@ -445,6 +445,7 @@ impl AffinityQueryPlanInterceptor {
         Some(QueryPlan::new_with_preferred_nodes(
             self.live_nodes.clone(),
             preferred_nodes,
+            affinity_nodes,
         ))
     }
 
