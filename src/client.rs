@@ -64,6 +64,30 @@ use aws_smithy_types::config_bag::ConfigBag;
 pub struct AlternatorClient {
     dynamodb_client: aws_sdk_dynamodb::Client,
     config: AlternatorConfig,
+    discovery: std::sync::Arc<ClientDiscovery>,
+}
+
+#[derive(Debug, Default)]
+struct ClientDiscovery {
+    topology: Vec<std::sync::Arc<LiveNodes>>,
+    partition_keys: Option<std::sync::Arc<keyrouting::resolver::PartitionKeyResolver>>,
+}
+
+impl ClientDiscovery {
+    fn stop(&self) {
+        for nodes in &self.topology {
+            nodes.tasks.stop();
+        }
+        if let Some(resolver) = &self.partition_keys {
+            resolver.tasks.stop();
+        }
+    }
+}
+
+impl Drop for ClientDiscovery {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Error returned when an [`AlternatorClient`] cannot be constructed safely.
@@ -406,7 +430,6 @@ impl AlternatorClient {
         ));
 
         let live_nodes = LiveNodes::try_new(&config)?;
-
         // With discovery off nothing rewrites the request, so the transport
         // is decided by the scheme configured for the seed host itself.
         let direct_scheme = live_nodes
@@ -453,9 +476,10 @@ impl AlternatorClient {
 
         validate_sdk_default_config(stalled_stream_protection_explicitly_unset)?;
 
+        let mut partition_keys = None;
         let routing_interceptor: Option<aws_sdk_dynamodb::config::SharedInterceptor> = match (
             live_nodes.as_ref(),
-            config.key_route_affinity().filter(|c| c.is_enabled()),
+            config.key_route_affinity().filter(|cfg| cfg.is_enabled()),
         ) {
             (None, _) => None,
             (Some(nodes), None) => Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
@@ -466,7 +490,7 @@ impl AlternatorClient {
                 // to make DescribeTable calls. Using the main client for that would create a
                 // cycle: main client -> affinity interceptor -> resolver -> DescribeTable
                 // -> main client. Build a separate discovery client from the same base config
-                // but with round-robin routing only..
+                // but with round-robin routing only.
                 let pk_discovery_client = try_dynamodb_client_from_conf(
                     builder
                         .clone()
@@ -478,6 +502,7 @@ impl AlternatorClient {
                         pk_discovery_client,
                         cfg.pk_info_per_table.clone(),
                     ));
+                partition_keys = Some(resolver.clone());
                 Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
                     AffinityQueryPlanInterceptor::new(cfg.clone(), nodes.clone(), resolver),
                 ))
@@ -499,7 +524,32 @@ impl AlternatorClient {
         Ok(Self {
             dynamodb_client,
             config,
+            discovery: std::sync::Arc::new(ClientDiscovery {
+                topology: live_nodes.into_iter().collect(),
+                partition_keys,
+            }),
         })
+    }
+
+    /// Stops and joins topology and partition-key discovery for this client
+    /// and every clone. Concurrent or repeated calls are safe, including after
+    /// a previous shutdown future was cancelled. New discovery stays disabled.
+    ///
+    /// This does not shut down the Tokio runtime or cancel user operations.
+    /// Operation builders, paginators, and waiters remain usable with the last
+    /// known topology and cached partition keys. Dropping the last client clone
+    /// also stops discovery, even if these SDK objects outlive it; their topology
+    /// and partition-key metadata will no longer refresh. Call this method when
+    /// task completion must be awaited. Keep the runtimes running discovery
+    /// driven until this method returns.
+    pub async fn shutdown(&self) {
+        self.discovery.stop();
+        for nodes in &self.discovery.topology {
+            nodes.tasks.shutdown().await;
+        }
+        if let Some(resolver) = &self.discovery.partition_keys {
+            resolver.tasks.shutdown().await;
+        }
     }
 
     /// Returns the configuration used to construct this client.

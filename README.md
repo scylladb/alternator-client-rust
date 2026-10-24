@@ -244,7 +244,18 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
-The refresh task runs in the background for the lifetime of the client. It terminates automatically when the client is dropped.
+Discovery is shared by clones of a client. Call `client.shutdown().await` to
+stop topology and partition-key discovery and wait for all discovery tasks to
+finish. Shutdown interrupts discovery I/O and retry delays, prevents new
+discovery, and is safe to repeat or call concurrently from multiple clones.
+Dropping the final client clone also stops discovery without waiting for task
+completion. Keep discovery's Tokio runtimes running until awaited shutdown
+finishes. Other clients and the Tokio runtime keep running.
+
+Shutdown leaves operation builders, paginators, and waiters usable with the last
+discovered topology and cached partition keys; it does not cancel user requests.
+These also remain usable if they outlive the final client clone, but discovery
+has stopped, so their topology and partition-key metadata will no longer refresh.
 
 ### Routing scope
 

@@ -61,13 +61,9 @@ impl FailureRecord {
 ///
 /// # Resource management
 ///
-/// Discovery tasks are spawned on the ambient tokio runtime via
-/// [`tokio::spawn`] and detached. There is no explicit shutdown: when the
-/// runtime is dropped, in-flight discoveries are cancelled at their next
-/// `.await` point and any RAII guards (e.g. the in-progress marker) run on
-/// drop. PK discovery is an optimization, so cancellation mid-flight is safe
-/// — the affected request falls back to round-robin and the next call to
-/// [`trigger_discovery`] respawns.
+/// Discovery tasks are owned and cancelled by the client's shared lifecycle.
+/// Shutdown interrupts both SDK I/O and retry sleeps and joins every task.
+/// Subsequent cache misses fall back to round-robin without starting discovery.
 ///
 /// # Concurrency
 ///
@@ -81,6 +77,7 @@ impl FailureRecord {
 /// [`PERMANENT_FAILURE_COOLDOWN_MS`]: self::PERMANENT_FAILURE_COOLDOWN_MS
 #[derive(Debug)]
 pub struct PartitionKeyResolver {
+    pub(crate) tasks: crate::discovery::DiscoveryTasks,
     client: aws_sdk_dynamodb::Client,
     cache: PkCache,
     in_progress: Arc<DashSet<String>>,
@@ -94,6 +91,7 @@ impl PartitionKeyResolver {
             cache.insert(k, Arc::from(v));
         }
         Self {
+            tasks: crate::discovery::DiscoveryTasks::default(),
             client,
             cache,
             in_progress: Arc::new(DashSet::new()),
@@ -105,11 +103,11 @@ impl PartitionKeyResolver {
     ///
     /// No-op if the table is already cached, if discovery is currently in
     /// progress, or if the table is in failure cooldown. Otherwise spawns a
-    /// detached task on the ambient tokio runtime that calls `DescribeTable`,
+    /// owned task on the ambient Tokio runtime that calls `DescribeTable`,
     /// retries transient failures with exponential backoff, and writes the
     /// result to the cache on success.
     pub fn trigger_discovery(self: &Arc<Self>, table_name: &str) {
-        if self.cache.contains_key(table_name) {
+        if self.tasks.is_stopped() || self.cache.contains_key(table_name) {
             return;
         }
 
@@ -120,9 +118,9 @@ impl PartitionKeyResolver {
         }
 
         // If no Tokio runtime is available, we can't spawn the discovery task.
-        if tokio::runtime::Handle::try_current().is_err() {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
-        }
+        };
 
         if !self.in_progress.insert(table_name.to_string()) {
             return;
@@ -136,9 +134,19 @@ impl PartitionKeyResolver {
 
         self.failed_tables.remove(table_name);
 
+        // Clean up the in_progress marker no matter how this function exits
+        struct InProgressCleanup(Arc<DashSet<String>>, String);
+        impl Drop for InProgressCleanup {
+            fn drop(&mut self) {
+                self.0.remove(&self.1);
+            }
+        }
+        let cleanup = InProgressCleanup(self.in_progress.clone(), table_name.to_owned());
+
         let resolver = Arc::clone(self);
         let name = table_name.to_string();
-        tokio::spawn(async move {
+        self.tasks.spawn(&runtime, async move {
+            let _cleanup = cleanup;
             resolver.discover_with_retry(name).await;
         });
     }
@@ -154,23 +162,14 @@ impl PartitionKeyResolver {
         let mut attempt = 0;
         let mut delay = INITIAL_RETRY_DELAY_MS;
 
-        // Clean up the in_progress marker no matter how this function exits
-        struct InProgressCleanup(Arc<DashSet<String>>, String);
-        impl Drop for InProgressCleanup {
-            fn drop(&mut self) {
-                self.0.remove(&self.1);
-            }
-        }
-        let _cleanup = InProgressCleanup(self.in_progress.clone(), table_name.clone());
-
         loop {
-            match self
+            let response = self
                 .client
                 .describe_table()
                 .table_name(&table_name)
                 .send()
-                .await
-            {
+                .await;
+            match response {
                 Ok(response) => {
                     if let Some(table) = response.table
                         && let Some(schema) = table.key_schema
@@ -280,6 +279,46 @@ mod tests {
     const DESCRIBE_TABLE_RESPONSE: &str =
         r#"{"Table":{"KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}]}}"#;
 
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_partition_key_retry_sleep_and_clears_marker() {
+        let mut http = MockDynamoHttp::new();
+        Arc::get_mut(&mut http.state).unwrap().fail_describes = true;
+        let client = aws_sdk_dynamodb::Client::from_conf(
+            aws_sdk_dynamodb::Config::builder()
+                .behavior_version(crate::config::ALTERNATOR_BEHAVIOR_VERSION())
+                .region(Region::new("us-east-1"))
+                .allow_no_auth()
+                .endpoint_url("http://127.0.0.1:8000")
+                .http_client(http.clone())
+                .retry_config(aws_smithy_types::retry::RetryConfig::disabled())
+                .build(),
+        );
+        let resolver = Arc::new(PartitionKeyResolver::new(client, HashMap::new()));
+        resolver.trigger_discovery("users");
+        for _ in 0..1000 {
+            if http.describe_tables() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(http.describe_tables(), 1);
+        // The ready connector completes in the same poll as error parsing and
+        // registration of the resolver's retry sleep. Paused time cannot elapse
+        // while this test remains runnable.
+        assert!(resolver.in_progress.contains("users"));
+        let before = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(1), resolver.tasks.shutdown())
+            .await
+            .expect("shutdown must interrupt the partition-key retry sleep and join its cleanup");
+        assert_eq!(tokio::time::Instant::now(), before);
+        assert!(resolver.in_progress.is_empty());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        resolver.trigger_discovery("users");
+        tokio::task::yield_now().await;
+        assert_eq!(http.describe_tables(), 1);
+        assert!(resolver.in_progress.is_empty());
+    }
+
     // ----- Test helpers -----
 
     /// Builds a real but unused dynamodb client. The synchronous tests in
@@ -308,6 +347,7 @@ mod tests {
         describe_tables: AtomicUsize,
         data_requests: AtomicUsize,
         hold_first_describe: bool,
+        fail_describes: bool,
         first_describe_release: watch::Sender<bool>,
     }
 
@@ -333,6 +373,7 @@ mod tests {
                     describe_tables: AtomicUsize::new(0),
                     data_requests: AtomicUsize::new(0),
                     hold_first_describe,
+                    fail_describes: false,
                     first_describe_release,
                 }),
             }
@@ -394,6 +435,13 @@ mod tests {
                                 .await
                                 .expect("release sender must outlive first DescribeTable");
                         }
+                    }
+                    if state.fail_describes {
+                        let mut response =
+                            json_response(r#"{"__type":"InternalServerError","message":"retry"}"#);
+                        *response.status_mut() =
+                            aws_smithy_runtime_api::http::StatusCode::try_from(500).unwrap();
+                        return Ok(response);
                     }
                     Ok(json_response(DESCRIBE_TABLE_RESPONSE))
                 });
