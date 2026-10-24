@@ -32,6 +32,7 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) allow_no_auth: bool,
     pub(crate) active_interval: Option<std::time::Duration>,
     pub(crate) idle_interval: Option<std::time::Duration>,
+    pub(crate) discovery_timeout: Option<std::time::Duration>,
     pub(crate) routing_scope: Option<RoutingScope>,
     pub(crate) scheme: Option<String>,
     pub(crate) port: Option<u16>,
@@ -236,6 +237,14 @@ impl AlternatorConfig {
     /// The default value is 1 minute.
     pub fn idle_interval(&self) -> Option<std::time::Duration> {
         self.alternator_ext.idle_interval
+    }
+
+    /// Returns the explicit deadline for each discovery request or `None` for legacy defaults.
+    ///
+    /// The default topology deadline is 5 seconds. With no explicit setting,
+    /// partition-key discovery retains the SDK timeout configuration.
+    pub fn discovery_timeout(&self) -> Option<std::time::Duration> {
+        self.alternator_ext.discovery_timeout
     }
 
     /// Get the client's routing scope.
@@ -554,6 +563,26 @@ impl AlternatorBuilder {
         response_compression: ResponseCompression,
     ) -> &mut Self {
         self.alternator_ext.response_compression = Some(response_compression);
+        self
+    }
+
+    /// Sets the deadline for each `/localnodes` request and each partition-key
+    /// discovery request. Connection establishment for
+    /// topology requests is bounded by 2 seconds or this deadline, whichever is
+    /// shorter.
+    ///
+    /// Must be positive and fit the runtime clock. Invalid values are rejected
+    /// by `AlternatorClient::try_from_conf` before discovery starts.
+    pub fn discovery_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.set_discovery_timeout(Some(timeout));
+        self
+    }
+
+    /// Sets an explicit discovery request deadline, or clears it with `None`.
+    /// With no explicit setting, topology requests retain their 5-second deadline
+    /// and partition-key discovery inherits the SDK timeout configuration.
+    pub fn set_discovery_timeout(&mut self, timeout: Option<std::time::Duration>) -> &mut Self {
+        self.alternator_ext.discovery_timeout = timeout;
         self
     }
 
@@ -1415,6 +1444,26 @@ mod test {
     use itertools::Itertools;
 
     use super::*;
+
+    #[test]
+    fn discovery_timeout_round_trips_and_clears() {
+        let timeout = std::time::Duration::from_secs(12);
+        let config = AlternatorConfig::builder()
+            .discovery_timeout(timeout)
+            .build();
+        assert_eq!(config.discovery_timeout(), Some(timeout));
+        assert_eq!(
+            config.clone().to_builder().build().discovery_timeout(),
+            Some(timeout)
+        );
+        let mut builder = config.to_builder();
+        builder.set_discovery_timeout(None);
+        assert_eq!(builder.build().discovery_timeout(), None);
+        assert_eq!(
+            AlternatorConfig::builder().build().discovery_timeout(),
+            None
+        );
+    }
 
     #[test]
     fn config_remembers_builder_and_vice_versa() {
