@@ -46,6 +46,7 @@ if [[ -n "$matched_tag" ]]; then
         exit 1
     }
     rc_tag=$matched_tag
+    python3 "$script_dir/signing.py" verify-tag "$rc_tag"
 else
     max_rc=0
     while IFS= read -r tag; do
@@ -57,14 +58,13 @@ else
     rc_number=$((max_rc + 1))
     rc_tag="v$version-rc.$rc_number"
 
-    git config user.name "github-actions[bot]"
-    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
     bash "$script_dir/check-release-blockers.sh"
-    git tag -a "$rc_tag" "$commit_sha" -m "Release candidate $rc_tag
+    git tag -s "$rc_tag" "$commit_sha" -m "Release candidate $rc_tag
 
 workflow-run: $run_id
 workflow-attempt-created: $run_attempt
 commit: $commit_sha"
+    python3 "$script_dir/signing.py" verify-tag "$rc_tag"
     git push origin "refs/tags/$rc_tag"
 fi
 

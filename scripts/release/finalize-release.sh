@@ -62,6 +62,8 @@ GITHUB_OUTPUT="$state_file" scripts/release/registry-state.sh \
 }
 
 git fetch --force origin --tags
+python3 "$script_dir/signing.py" verify-commit "$commit_sha"
+python3 "$script_dir/signing.py" verify-tag "$rc_tag"
 [[ "$(git rev-list -n 1 "$rc_tag")" == "$commit_sha" ]] || {
     echo "RC tag no longer resolves to the manifest commit" >&2
     exit 1
@@ -77,16 +79,17 @@ if git rev-parse -q --verify "refs/tags/$final_tag" >/dev/null; then
         exit 1
     }
 else
-    git config user.name "github-actions[bot]"
-    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
     bash "$script_dir/check-release-blockers.sh"
-    git tag -a "$final_tag" "$commit_sha" -m "Release $package_name $version
+    git tag -s "$final_tag" "$commit_sha" -m "Release $package_name $version
 
 Promoted from: $rc_tag
 crate-sha256: $(jq -er '.crate.sha256' "$manifest")
 commit: $commit_sha"
+    python3 "$script_dir/signing.py" verify-tag "$final_tag"
     git push origin "refs/tags/$final_tag"
 fi
+
+python3 "$script_dir/signing.py" verify-tag "$final_tag"
 
 remote_final_commit=$(git ls-remote origin "refs/tags/$final_tag^{}" | awk '{ print $1 }')
 [[ "$remote_final_commit" == "$commit_sha" ]] || {
@@ -130,9 +133,23 @@ release_body=$(mktemp)
 jq '.[0]' "$release_list" >"$release_body"
 release_id=$(jq -er '.id' "$release_body")
 
-expected_names=$(printf '%s\n' \
-    "$crate_file" SHA256SUMS "$sbom_file" release-manifest.json test-evidence.json \
-    | LC_ALL=C sort)
+# Keep candidate bytes and the four-file candidate contract unchanged. Recover
+# existing signatures before signing so an interrupted draft can be resumed.
+release_assets=$(mktemp -d)
+cp "$candidate_dir/"* "$release_assets/"
+cp "$evidence_file" "$release_assets/test-evidence.json"
+for asset in "$crate_file.asc" SHA256SUMS.asc "$sbom_file.asc" release-manifest.json.asc test-evidence.json.asc; do
+    if jq -e --arg name "$asset" '.assets[] | select(.name == $name and .state == "uploaded")' "$release_body" >/dev/null; then
+        gh release download "$final_tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$release_assets"
+    fi
+done
+python3 "$script_dir/signing.py" sign-files \
+    "$release_assets/$crate_file" "$release_assets/SHA256SUMS" \
+    "$release_assets/$sbom_file" "$release_assets/release-manifest.json" "$release_assets/test-evidence.json"
+
+assets=("$crate_file" SHA256SUMS "$sbom_file" release-manifest.json test-evidence.json
+        "$crate_file.asc" SHA256SUMS.asc "$sbom_file.asc" release-manifest.json.asc test-evidence.json.asc)
+expected_names=$(printf '%s\n' "${assets[@]}" | LC_ALL=C sort)
 
 if jq -e '.draft == false' "$release_body" >/dev/null; then
     jq -e '.immutable == true' "$release_body" >/dev/null || {
@@ -147,9 +164,10 @@ if jq -e '.draft == false' "$release_body" >/dev/null; then
     }
     verify_dir=$(mktemp -d)
     gh release download "$final_tag" --repo "$GITHUB_REPOSITORY" --dir "$verify_dir"
-    for asset in "$crate_file" SHA256SUMS "$sbom_file" release-manifest.json test-evidence.json; do
+    for asset in "${assets[@]}"; do
         source_file="$candidate_dir/$asset"
         [[ "$asset" == test-evidence.json ]] && source_file=$evidence_file
+        [[ "$asset" == *.asc ]] && source_file="$release_assets/$asset"
         [[ -f "$verify_dir/$asset" ]] && cmp -s "$source_file" "$verify_dir/$asset" || {
             echo "published release asset $asset is missing or differs" >&2
             exit 1
@@ -183,9 +201,10 @@ unexpected_names=$(comm -23 \
     exit 1
 }
 
-for asset in "$crate_file" SHA256SUMS "$sbom_file" release-manifest.json test-evidence.json; do
+for asset in "${assets[@]}"; do
     source_file="$candidate_dir/$asset"
     [[ "$asset" == test-evidence.json ]] && source_file=$evidence_file
+    [[ "$asset" == *.asc ]] && source_file="$release_assets/$asset"
     asset_id=$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .id' "$release_body")
     if [[ -n "$asset_id" ]]; then
         asset_state=$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .state' "$release_body")
@@ -229,9 +248,10 @@ jq -e '[.assets[].state] | all(. == "uploaded")' "$release_body" >/dev/null || {
     exit 1
 }
 
-for asset in "$crate_file" SHA256SUMS "$sbom_file" release-manifest.json test-evidence.json; do
+for asset in "${assets[@]}"; do
     source_file="$candidate_dir/$asset"
     [[ "$asset" == test-evidence.json ]] && source_file=$evidence_file
+    [[ "$asset" == *.asc ]] && source_file="$release_assets/$asset"
     asset_id=$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .id' "$release_body")
     uploaded_file=$(mktemp)
     curl -fsSL \
@@ -272,9 +292,10 @@ for attempt in $(seq 1 12); do
         }
         verify_dir=$(mktemp -d)
         gh release download "$final_tag" --repo "$GITHUB_REPOSITORY" --dir "$verify_dir"
-        for asset in "$crate_file" SHA256SUMS "$sbom_file" release-manifest.json test-evidence.json; do
+        for asset in "${assets[@]}"; do
             source_file="$candidate_dir/$asset"
             [[ "$asset" == test-evidence.json ]] && source_file=$evidence_file
+            [[ "$asset" == *.asc ]] && source_file="$release_assets/$asset"
             [[ -f "$verify_dir/$asset" ]] && cmp -s "$source_file" "$verify_dir/$asset" || {
                 echo "immutable release asset $asset is missing or differs" >&2
                 exit 1
