@@ -120,6 +120,7 @@ use url::Url;
 
 const DEFAULT_ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const DISCOVERY_HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// An error encountered while constructing live-node discovery state.
 #[derive(Debug)]
@@ -243,11 +244,12 @@ fn unusable_native_roots_message(errors: Vec<String>) -> String {
 
 fn build_default_discovery_http_client(
     scheme: &str,
+    request_timeout: Duration,
 ) -> Result<(DiscoveryHttpClient, bool), LiveNodesBuildError> {
     let (builder, native_roots_usable) = discovery_http_client_builder_with_root_status(scheme)?;
     let client = builder
-        .timeout(Duration::from_secs(5))
-        .connect_timeout(Duration::from_secs(2))
+        .timeout(request_timeout)
+        .connect_timeout(Duration::from_secs(2).min(request_timeout))
         .build()
         .map_err(LiveNodesBuildError::HttpClient)?;
     Ok((DiscoveryHttpClient::Reqwest(client), native_roots_usable))
@@ -266,7 +268,12 @@ fn build_discovery_http_client(
             },
             false,
         )),
-        None => build_default_discovery_http_client(scheme),
+        None => build_default_discovery_http_client(
+            scheme,
+            config
+                .discovery_timeout()
+                .unwrap_or(DISCOVERY_HTTP_OPERATION_TIMEOUT),
+        ),
     }
 }
 
@@ -281,7 +288,7 @@ enum DiscoveryHttpClient {
 }
 
 impl DiscoveryHttpClient {
-    async fn get_live_nodes(&self, url: &Url) -> Option<Vec<String>> {
+    async fn get_live_nodes(&self, url: &Url, request_timeout: Duration) -> Option<Vec<String>> {
         match self {
             Self::Reqwest(client) => client
                 .get(url.clone())
@@ -307,8 +314,8 @@ impl DiscoveryHttpClient {
                     .no_retry()
                     .timeout_config(
                         TimeoutConfig::builder()
-                            .connect_timeout(Duration::from_secs(2))
-                            .operation_timeout(Duration::from_secs(5))
+                            .connect_timeout(Duration::from_secs(2).min(request_timeout))
+                            .operation_timeout(request_timeout)
                             .build(),
                     )
                     .with_connection_poisoning();
@@ -341,6 +348,7 @@ pub(crate) struct LiveNodes {
     routing_scope: RoutingScope,
     active_interval: Duration,
     idle_interval: Duration,
+    discovery_timeout: Option<Duration>,
     counter: Arc<AtomicUsize>,
     live_nodes: ArcSwap<Vec<Arc<Url>>>,
     refresh_state: Mutex<RefreshState>,
@@ -557,6 +565,7 @@ impl LiveNodes {
             routing_scope,
             active_interval,
             idle_interval,
+            discovery_timeout: config.discovery_timeout(),
             counter: Arc::new(AtomicUsize::new(0)),
             live_nodes: ArcSwap::from_pointee(seed_urls.clone()),
             refresh_state: Mutex::new(RefreshState::default()),
@@ -590,7 +599,15 @@ impl LiveNodes {
         node_addr: &Url,
     ) -> Option<Vec<Arc<Url>>> {
         let url = scope.build_localnodes_url(node_addr.clone());
-        let mut nodes = self.client.get_live_nodes(&url).await?;
+        let request_timeout = self
+            .discovery_timeout
+            .unwrap_or(DISCOVERY_HTTP_OPERATION_TIMEOUT);
+        let mut nodes = tokio::time::timeout(
+            request_timeout,
+            self.client.get_live_nodes(&url, request_timeout),
+        )
+        .await
+        .ok()??;
 
         nodes.sort();
         Some(
@@ -1337,6 +1354,7 @@ mod tests {
         entered: Arc<tokio::sync::Semaphore>,
         dropped: Arc<tokio::sync::Semaphore>,
         following: DiscoveryResponseHttpClient,
+        connect_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
     }
 
     struct DropPermit(Arc<tokio::sync::Semaphore>);
@@ -1349,9 +1367,13 @@ mod tests {
     impl HttpClient for HeldFirstTopology {
         fn http_connector(
             &self,
-            _: &HttpConnectorSettings,
+            settings: &HttpConnectorSettings,
             _: &RuntimeComponents,
         ) -> SharedHttpConnector {
+            self.connect_timeouts
+                .lock()
+                .unwrap()
+                .push(settings.connect_timeout());
             SharedHttpConnector::new(self.clone())
         }
     }
@@ -1392,6 +1414,7 @@ mod tests {
             entered: Arc::new(tokio::sync::Semaphore::new(0)),
             dropped: Arc::new(tokio::sync::Semaphore::new(0)),
             following: DiscoveryResponseHttpClient(Arc::default()),
+            connect_timeouts: Arc::default(),
         };
         let config = AlternatorConfig::builder()
             .seed_hosts(["127.0.0.1"])
@@ -1487,6 +1510,149 @@ mod tests {
                 .unwrap();
         });
         assert_eq!(nodes.tasks.active_task_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn topology_deadlines_apply_short_long_and_default_discovery_timeouts() {
+        for configured in [
+            Some(Duration::from_millis(250)),
+            Some(Duration::from_secs(10)),
+            None,
+        ] {
+            let http = HeldFirstTopology {
+                requests: Arc::default(),
+                entered: Arc::new(tokio::sync::Semaphore::new(0)),
+                dropped: Arc::new(tokio::sync::Semaphore::new(0)),
+                connect_timeouts: Arc::default(),
+                following: DiscoveryResponseHttpClient(Arc::default()),
+            };
+            let mut builder = AlternatorConfig::builder()
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
+                .http_client(http.clone())
+                .timeout_config(
+                    TimeoutConfig::builder()
+                        .operation_timeout(Duration::from_millis(100))
+                        .operation_attempt_timeout(Duration::from_millis(100))
+                        .build(),
+                );
+            builder.set_discovery_timeout(configured);
+            let nodes = LiveNodes::new(&builder.build()).unwrap();
+            let started = tokio::time::Instant::now();
+            let request = tokio::spawn(async move {
+                nodes
+                    .fetch_live_nodes_for_scope(&nodes.routing_scope, &nodes.seed_urls[0])
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), http.entered.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+            let effective = configured.unwrap_or(Duration::from_secs(5));
+            let before_deadline = if effective > Duration::from_secs(5) {
+                Duration::from_secs(6)
+            } else {
+                effective / 2
+            };
+            tokio::time::advance(before_deadline).await;
+            assert!(
+                !request.is_finished(),
+                "discovery deadline must not be silently capped"
+            );
+            assert_eq!(http.dropped.available_permits(), 0);
+            tokio::time::advance(effective - before_deadline).await;
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), request)
+                    .await
+                    .expect("localnodes request must complete at its discovery deadline")
+                    .unwrap()
+                    .is_none()
+            );
+            let elapsed = started.elapsed();
+            // Awaiting the task may auto-advance paused time. Permit only the
+            // millisecond granularity of Tokio's timers beyond the deadline.
+            assert!(
+                elapsed <= effective + Duration::from_millis(1),
+                "localnodes request exceeded discovery deadline: {elapsed:?} > {effective:?}"
+            );
+            assert_eq!(http.dropped.available_permits(), 1);
+            let settings = http.connect_timeouts.lock().unwrap();
+            assert!(!settings.is_empty());
+            assert!(
+                settings
+                    .iter()
+                    .all(|timeout| *timeout == Some(Duration::from_secs(2).min(effective)))
+            );
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DelayedTopology {
+        entered: Arc<tokio::sync::Semaphore>,
+        following: DiscoveryResponseHttpClient,
+    }
+
+    impl HttpClient for DelayedTopology {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    impl HttpConnector for DelayedTopology {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let entered = self.entered.clone();
+            let response = self.following.call(request);
+            HttpConnectorFuture::new(async move {
+                entered.add_permits(1);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                response.await
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_topology_deadline_ignores_short_data_attempt_timeout() {
+        let http = DelayedTopology {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            following: DiscoveryResponseHttpClient(Arc::default()),
+        };
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .http_client(http.clone())
+            .timeout_config(
+                TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_millis(250))
+                    .operation_attempt_timeout(Duration::from_millis(250))
+                    .build(),
+            )
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        assert_eq!(nodes.discovery_timeout, None);
+        let request = tokio::spawn(async move {
+            nodes
+                .fetch_live_nodes_for_scope(&nodes.routing_scope, &nodes.seed_urls[0])
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), http.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(!request.is_finished());
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let discovered = request
+            .await
+            .unwrap()
+            .expect("discovery has its own five-second default deadline");
+        assert_eq!(discovered[0].host_str(), Some("127.0.0.2"));
+        assert_eq!(http.following.0.lock().unwrap().len(), 1);
     }
 
     #[test]
