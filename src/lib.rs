@@ -26,6 +26,7 @@ mod compression;
 mod config;
 mod customize;
 mod decompression;
+mod discovery;
 mod interceptors;
 mod keyrouting;
 mod live_nodes;

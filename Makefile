@@ -18,7 +18,7 @@ RUSTDOC_TOOLCHAIN ?= nightly-2026-06-23
 RUSTC ?= rustc
 SCYLLA_ALTERNATOR_HTTP_COMPRESSION ?= true
 EXPECTED_RUST_HOST ?=
-EXPECTED_LIB_TESTS ?= 223
+EXPECTED_LIB_TESTS ?= 224
 EXPECTED_DOCTESTS ?= 14
 CANDIDATE_CRATE ?=
 PACKAGE_NAME ?= $(shell awk -F '"' '/^name = "/ { print $$2; exit }' Cargo.toml)
@@ -150,7 +150,7 @@ test-doctests:
 	$(CARGO) test --locked --doc
 
 test-hermetic:
-	$(CARGO) test --locked --test non_success_connection_reuse_tests
+	$(CARGO) test --locked --test non_success_connection_reuse_tests --test discovery_shutdown
 
 test-dynamodb-compatibility:
 	RUSTDOC_TOOLCHAIN="$(RUSTDOC_TOOLCHAIN)" $(CARGO) test --locked --test dynamodb_compatibility
