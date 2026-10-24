@@ -20,7 +20,7 @@
 use crate::keyrouting::deterministic_rng::DeterministicRng;
 use crate::live_nodes::LiveNodes;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
@@ -43,13 +43,11 @@ enum QueryPlanState {
     Affinity {
         seed: i64,
         rng: DeterministicRng,
-        remaining_nodes: Option<Vec<Arc<Url>>>,
+        nodes: Vec<Arc<Url>>,
+        remaining_nodes: Vec<Arc<Url>>,
     },
     /// Deterministic order with selected nodes before the rest.
-    PreferredNodes {
-        preferred_nodes: Vec<Arc<Url>>,
-        remaining_nodes: Option<VecDeque<Arc<Url>>>,
-    },
+    PreferredNodes { nodes: Vec<Arc<Url>>, next: usize },
 }
 
 impl Storable for QueryPlan {
@@ -69,27 +67,38 @@ impl QueryPlan {
 
     /// Creates a seeded deterministic affinity query plan.
     pub fn new_with_hash(live_nodes: Arc<LiveNodes>, seed: u64) -> Self {
+        let nodes = Self::sorted_affinity_nodes(&live_nodes).nodes;
         Self {
             live_nodes,
             state: Mutex::new(QueryPlanState::Affinity {
                 seed: seed as i64,
                 rng: DeterministicRng::new(seed as i64),
-                remaining_nodes: None,
+                remaining_nodes: nodes.clone(),
+                nodes,
             }),
         }
     }
 
-    /// Creates a query plan that tries `preferred_nodes` first, then the
-    /// remaining live nodes in sorted order.
+    /// Tries the voted coordinators first using the same membership that
+    /// produced those votes, then the remaining nodes in sorted order.
     pub(crate) fn new_with_preferred_nodes(
         live_nodes: Arc<LiveNodes>,
         preferred_nodes: Vec<Arc<Url>>,
+        snapshot: SortedAffinityNodes,
     ) -> Self {
+        let mut nodes = snapshot.nodes;
+        let mut ordered = Vec::with_capacity(nodes.len());
+        for preferred_node in preferred_nodes {
+            if let Some(index) = nodes.iter().position(|node| node == &preferred_node) {
+                ordered.push(nodes.remove(index));
+            }
+        }
+        ordered.extend(nodes);
         Self {
             live_nodes,
             state: Mutex::new(QueryPlanState::PreferredNodes {
-                preferred_nodes,
-                remaining_nodes: None,
+                nodes: ordered,
+                next: 0,
             }),
         }
     }
@@ -120,11 +129,7 @@ impl QueryPlan {
                 remaining_nodes,
                 ..
             } => {
-                let remaining = remaining_nodes.get_or_insert_with(|| {
-                    let mut nodes = self.live_nodes.get_live_nodes();
-                    sort_node_urls(&mut nodes);
-                    nodes
-                });
+                let remaining = remaining_nodes;
 
                 if remaining.is_empty() {
                     return None;
@@ -140,25 +145,10 @@ impl QueryPlan {
 
                 Some(selected_node)
             }
-            QueryPlanState::PreferredNodes {
-                preferred_nodes,
-                remaining_nodes,
-            } => {
-                let remaining = remaining_nodes.get_or_insert_with(|| {
-                    let mut nodes = self.live_nodes.get_live_nodes();
-                    sort_node_urls(&mut nodes);
-
-                    let mut ordered = VecDeque::with_capacity(nodes.len());
-                    for preferred_node in preferred_nodes.iter() {
-                        if let Some(index) = nodes.iter().position(|node| node == preferred_node) {
-                            ordered.push_back(nodes.remove(index));
-                        }
-                    }
-                    ordered.extend(nodes);
-                    ordered
-                });
-
-                remaining.pop_front()
+            QueryPlanState::PreferredNodes { nodes, next } => {
+                let node = nodes.get(*next)?.clone();
+                *next += 1;
+                Some(node)
             }
         }
     }
@@ -191,16 +181,15 @@ impl QueryPlan {
             QueryPlanState::Affinity {
                 seed,
                 rng,
+                nodes,
                 remaining_nodes,
             } => {
                 // Re-seeding repeats the deterministic affinity order and
                 // puts the preferred coordinator first again.
                 *rng = DeterministicRng::new(*seed);
-                *remaining_nodes = None;
+                *remaining_nodes = nodes.clone();
             }
-            QueryPlanState::PreferredNodes {
-                remaining_nodes, ..
-            } => *remaining_nodes = None,
+            QueryPlanState::PreferredNodes { next, .. } => *next = 0,
         }
     }
 }
@@ -391,7 +380,11 @@ mod tests {
             .into_iter()
             .find(|node| node.host_str() == Some("node5.example.com"))
             .expect("preferred node exists");
-        let plan = QueryPlan::new_with_preferred_nodes(live_nodes, vec![preferred_3, preferred_5]);
+        let plan = QueryPlan::new_with_preferred_nodes(
+            live_nodes.clone(),
+            vec![preferred_3, preferred_5],
+            QueryPlan::sorted_affinity_nodes(&live_nodes),
+        );
 
         assert_eq!(
             sequence(&plan, 5),
@@ -436,6 +429,45 @@ mod tests {
     }
 
     #[test]
+    fn affinity_plan_captures_membership_before_first_attempt_and_restart() {
+        let live = make_live_nodes(3);
+        let expected = sequence(&QueryPlan::new_with_hash(live.clone(), 42), 3);
+        let captured = QueryPlan::new_with_hash(live.clone(), 42);
+        live.publish_live_nodes(
+            1,
+            vec![Arc::new(Url::parse("http://replacement.test/").unwrap())],
+        );
+        assert_eq!(sequence(&captured, 3), expected);
+        assert_eq!(restarting_sequence(&captured, 3), expected);
+        let later = QueryPlan::new_with_hash(live, 42);
+        assert_eq!(short_name(&later.next_node().unwrap()), "replacement.test");
+    }
+
+    #[test]
+    fn preferred_plan_uses_voting_snapshot_through_topology_changes_and_restart() {
+        let live = make_live_nodes(3);
+        let snapshot = QueryPlan::sorted_affinity_nodes(&live);
+        let preferred = snapshot.preferred_node_for_hash(42).unwrap();
+        live.publish_live_nodes(
+            1,
+            vec![Arc::new(Url::parse("http://replacement.test/").unwrap())],
+        );
+        let plan =
+            QueryPlan::new_with_preferred_nodes(live.clone(), vec![preferred.clone()], snapshot);
+        let first = sequence(&plan, 3);
+        assert_eq!(first[0], short_name(&preferred));
+        assert!(first.iter().all(|name| name.starts_with("node")));
+        assert_eq!(restarting_sequence(&plan, 3), first);
+        assert_eq!(
+            QueryPlan::sorted_affinity_nodes(&live)
+                .preferred_node_for_hash(42)
+                .unwrap()
+                .host_str(),
+            Some("replacement.test")
+        );
+    }
+
+    #[test]
     fn restarted_affinity_plan_repeats_its_node_order() {
         let plan = QueryPlan::new_with_hash(make_live_nodes(6), 42);
         let first_pass = sequence(&plan, 6);
@@ -457,7 +489,11 @@ mod tests {
             .into_iter()
             .find(|node| node.host_str() == Some("node5.example.com"))
             .expect("preferred node exists");
-        let plan = QueryPlan::new_with_preferred_nodes(live_nodes, vec![preferred_3, preferred_5]);
+        let plan = QueryPlan::new_with_preferred_nodes(
+            live_nodes.clone(),
+            vec![preferred_3, preferred_5],
+            QueryPlan::sorted_affinity_nodes(&live_nodes),
+        );
         let first_pass = sequence(&plan, 5);
         assert_eq!(first_pass, ["node3", "node5", "node1", "node2", "node4"]);
 

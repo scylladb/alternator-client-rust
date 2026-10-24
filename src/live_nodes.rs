@@ -268,7 +268,7 @@ fn build_discovery_http_client(
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum DiscoveryHttpClient {
     Reqwest(reqwest::Client),
     Smithy {
@@ -345,6 +345,9 @@ pub(crate) struct LiveNodes {
     alternator_scheme: String,
     port: Option<u16>,
     client: DiscoveryHttpClient,
+    /// Auxiliary access starts and marks activity on the ordinary owner.
+    ordinary_nodes: Option<Weak<LiveNodes>>,
+    affinity_nodes: Mutex<Weak<LiveNodes>>,
     native_roots_usable: bool,
     last_activity: Arc<Mutex<Instant>>,
     notify: Arc<tokio::sync::Notify>,
@@ -382,6 +385,7 @@ struct ShutdownProbe {
 #[derive(Debug, Default)]
 struct DiscoveryTaskState {
     active_task: Option<tokio::task::AbortHandle>,
+    affinity_task: Option<tokio::task::JoinHandle<()>>,
     /// Probes that outlived their ownership registration. Keeping their join
     /// handles lets us prevent the same runtime from queuing another probe
     /// until the blocking pool has removed the original one.
@@ -410,6 +414,11 @@ struct RefreshState {
     next_generation: u64,
     latest_published_generation: u64,
 }
+
+// Identity includes the generated scope parameters and cluster aggregation.
+// Only completed successful operations are reusable; a failed host is not an
+// empty scope. The store is moved into this attempt's optional affinity task.
+type DiscoveryOutcomes = HashMap<crate::routing_scope::DiscoveryOperation, Vec<Arc<Url>>>;
 
 impl DiscoveryRuntime {
     #[cfg(test)]
@@ -621,12 +630,48 @@ impl LiveNodes {
             alternator_scheme,
             port,
             client,
+            ordinary_nodes: None,
+            affinity_nodes: Mutex::new(Weak::new()),
             native_roots_usable,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             notify: Arc::new(tokio::sync::Notify::new()),
             discovery_tasks: Mutex::new(DiscoveryTaskState::default()),
             discovery_runtime: ArcSwapOption::empty(),
         })))
+    }
+
+    /// Derives the affinity view once from the initialized ordinary view.
+    /// Identical scopes share the ordinary state. A distinct view shares its
+    /// transport and owner, but retains its own membership and fallback chain.
+    pub(crate) fn affinity_view(self: &Arc<Self>) -> Arc<Self> {
+        if !self.routing_scope.has_rack_restriction() {
+            return self.clone();
+        }
+        let mut affinity = self.affinity_nodes.lock().unwrap();
+        if let Some(view) = affinity.upgrade() {
+            return view;
+        }
+        let view = Arc::new(Self {
+            routing_scope: self.routing_scope.without_rack(),
+            active_interval: self.active_interval,
+            idle_interval: self.idle_interval,
+            counter: Arc::new(AtomicUsize::new(0)),
+            live_nodes: ArcSwap::from_pointee(self.seed_urls.clone()),
+            refresh_state: Mutex::new(RefreshState::default()),
+            seed_urls: self.seed_urls.clone(),
+            alternator_scheme: self.alternator_scheme.clone(),
+            port: self.port,
+            client: self.client.clone(),
+            ordinary_nodes: Some(Arc::downgrade(self)),
+            affinity_nodes: Mutex::new(Weak::new()),
+            native_roots_usable: self.native_roots_usable,
+            last_activity: self.last_activity.clone(),
+            notify: self.notify.clone(),
+            discovery_tasks: Mutex::new(DiscoveryTaskState::default()),
+            discovery_runtime: ArcSwapOption::empty(),
+        });
+        *affinity = Arc::downgrade(&view);
+        view
     }
 
     pub(crate) fn scheme(&self) -> &str {
@@ -658,9 +703,10 @@ impl LiveNodes {
         )
     }
 
-    fn cluster_discovery_candidates(&self) -> Vec<Arc<Url>> {
+    fn cluster_discovery_candidates(&self, additional_candidates: &[Arc<Url>]) -> Vec<Arc<Url>> {
         let mut candidates = self.live_nodes.load().as_ref().clone();
         candidates.extend(self.seed_urls.iter().cloned());
+        candidates.extend(additional_candidates.iter().cloned());
         candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         candidates.dedup_by(|a, b| a.as_str() == b.as_str());
         candidates.shuffle(&mut rand::rng());
@@ -677,11 +723,6 @@ impl LiveNodes {
             .checked_add(1)
             .expect("live-node refresh generation overflowed");
         state.next_generation
-    }
-
-    async fn discover_cluster_live_nodes(&self, generation: u64) -> Option<Vec<Arc<Url>>> {
-        self.discover_cluster_live_nodes_from(generation, self.cluster_discovery_candidates())
-            .await
     }
 
     fn publish_partial_cluster_live_nodes(&self, generation: u64, discovered: &[Arc<Url>]) {
@@ -749,6 +790,12 @@ impl LiveNodes {
     /// but takes ownership when a probe confirms that the old runtime has shut
     /// down or cannot service the probe within the bounded interval.
     pub(crate) fn ensure_discovery_started(self: &Arc<Self>) {
+        if let Some(owner) = &self.ordinary_nodes {
+            if let Some(ordinary) = owner.upgrade() {
+                ordinary.ensure_discovery_started();
+            }
+            return;
+        }
         let Ok(handle) = Handle::try_current() else {
             return;
         };
@@ -796,6 +843,9 @@ impl LiveNodes {
         if let Some(old_task) = discovery_tasks.active_task.take() {
             old_task.abort();
         }
+        if let Some(task) = discovery_tasks.affinity_task.take() {
+            task.abort();
+        }
 
         // If no serviceable owner remains, restart immediately even when this
         // runtime has an unresolved retired probe. Reattach it to the new
@@ -828,7 +878,8 @@ impl LiveNodes {
                         break;
                     };
 
-                    strong_self.update_live_nodes().await;
+                    let outcomes = strong_self.update_live_nodes().await;
+                    strong_self.start_affinity_refresh(outcomes, &runtime);
 
                     let last = *strong_self.last_activity.lock().unwrap();
                     (
@@ -852,6 +903,10 @@ impl LiveNodes {
     }
 
     fn mark_activity(&self) {
+        if let Some(ordinary) = self.ordinary_nodes.as_ref().and_then(Weak::upgrade) {
+            ordinary.mark_activity();
+            return;
+        }
         let now = Instant::now();
         let mut last = self.last_activity.lock().unwrap();
         let was_idle = now.duration_since(*last) > self.idle_interval;
@@ -901,46 +956,99 @@ impl LiveNodes {
         None
     }
 
-    async fn update_live_nodes(&self) {
+    async fn update_live_nodes(&self) -> DiscoveryOutcomes {
+        let mut outcomes = DiscoveryOutcomes::new();
+        self.update_live_nodes_from(&mut outcomes, &[]).await;
+        outcomes
+    }
+
+    fn start_affinity_refresh(
+        &self,
+        mut outcomes: DiscoveryOutcomes,
+        runtime: &Arc<DiscoveryRuntime>,
+    ) {
+        let Some(affinity) = self.affinity_nodes.lock().unwrap().upgrade() else {
+            return;
+        };
+        let mut tasks = self
+            .discovery_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A cancelled old loop may finish an ordinary refresh concurrently
+        // with handoff. It must not install optional work after the transfer.
+        if !self
+            .discovery_runtime
+            .load()
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, runtime))
+        {
+            return;
+        }
+        if tasks
+            .affinity_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        let ordinary_candidates = self.live_nodes.load().as_ref().clone();
+        tasks.affinity_task = Some(tokio::spawn(async move {
+            affinity
+                .update_live_nodes_from(&mut outcomes, &ordinary_candidates)
+                .await;
+        }));
+    }
+
+    async fn update_live_nodes_from(
+        &self,
+        outcomes: &mut DiscoveryOutcomes,
+        additional_candidates: &[Arc<Url>],
+    ) {
         let generation = self.begin_refresh();
         let mut scope = &self.routing_scope;
-        // Live nodes in a random order.
+        // Keep ordinary candidate and seed recovery order unchanged. Ordinary
+        // rack hosts are also valid probes for a distinct affinity DC query.
         let mut nodes = self.live_nodes.load().as_ref().clone();
         nodes.shuffle(&mut rand::rng());
+        for candidate in additional_candidates {
+            if !nodes.contains(candidate) {
+                nodes.push(candidate.clone());
+            }
+        }
         let mut candidates: VecDeque<Arc<Url>> = nodes.into();
         let mut using_seeds = false;
 
         while let Some(node_addr) = candidates.pop_front() {
-            if scope.is_cluster() {
-                let Some(new_nodes) = self.discover_cluster_live_nodes(generation).await else {
-                    return;
-                };
+            let key = scope.discovery_operation();
+            // Only the auxiliary view reuses outcomes. Ordinary discovery keeps
+            // querying its configured scope chain, including repeated scopes.
+            let result = if let Some(cached) = self
+                .ordinary_nodes
+                .as_ref()
+                .and_then(|_| outcomes.get(&key))
+            {
+                Some(cached.clone())
+            } else if scope.is_cluster() {
+                let cluster_candidates = self.cluster_discovery_candidates(additional_candidates);
+                self.discover_cluster_live_nodes_from(generation, cluster_candidates)
+                    .await
+            } else {
+                self.fetch_live_nodes_for_scope(scope, &node_addr).await
+            };
 
-                if new_nodes.is_empty() {
-                    let Some(fallback) = scope.fallback() else {
-                        return;
-                    };
-                    scope = fallback;
-                    candidates.push_back(node_addr);
-                    continue;
-                }
-
-                self.publish_live_nodes(generation, new_nodes);
-                return;
-            }
-
-            let result = self.fetch_live_nodes_for_scope(scope, &node_addr).await;
-
-            // Request failed: try the next candidate, or fall back to seeds.
+            // Failed probes do not stand for an empty scope and are not cached.
             let Some(new_nodes) = result else {
+                if scope.is_cluster() {
+                    return;
+                }
                 if candidates.is_empty() && !using_seeds {
                     using_seeds = true;
                     candidates = self.seed_urls.clone().into();
                 }
                 continue;
             };
+            outcomes.insert(key, new_nodes.clone());
 
-            // Empty result: retry under a fallback scope if one exists.
             if new_nodes.is_empty() {
                 let Some(fallback) = scope.fallback() else {
                     return;
@@ -955,7 +1063,7 @@ impl LiveNodes {
         }
     }
 
-    fn publish_live_nodes(&self, generation: u64, new_nodes: Vec<Arc<Url>>) {
+    pub(crate) fn publish_live_nodes(&self, generation: u64, new_nodes: Vec<Arc<Url>>) {
         let mut state = self
             .refresh_state
             .lock()
@@ -1022,10 +1130,13 @@ fn node_is_in_list(node: &Url, nodes: &[Arc<Url>]) -> bool {
 
 impl Drop for LiveNodes {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.discovery_tasks.lock()
-            && let Some(task) = state.active_task.take()
-        {
-            task.abort();
+        if let Ok(mut state) = self.discovery_tasks.lock() {
+            if let Some(task) = state.active_task.take() {
+                task.abort();
+            }
+            if let Some(task) = state.affinity_task.take() {
+                task.abort();
+            }
         }
     }
 }
@@ -2422,5 +2533,706 @@ mod tests {
                 .unwrap(),
         );
         nodes
+    }
+    #[derive(Clone, Debug)]
+    struct ScopedDiscoveryHttpClient {
+        responses: Arc<Mutex<HashMap<String, &'static str>>>,
+        requests: Arc<Mutex<Vec<String>>>,
+        hosts: Arc<Mutex<Vec<String>>>,
+        failed_hosts: Arc<Mutex<std::collections::HashSet<String>>>,
+        delays: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    }
+
+    impl HttpClient for ScopedDiscoveryHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    impl HttpConnector for ScopedDiscoveryHttpClient {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            assert_eq!(request.method(), "GET");
+            let url = Url::parse(request.uri()).unwrap();
+            assert_eq!(url.path(), "/localnodes");
+            let query = url.query().unwrap_or_default().to_string();
+            self.requests.lock().unwrap().push(query.clone());
+            let body = self
+                .responses
+                .lock()
+                .unwrap()
+                .get(&query)
+                .copied()
+                .unwrap_or("invalid response");
+            let host = url.host_str().unwrap().to_string();
+            self.hosts.lock().unwrap().push(host.clone());
+            let body = if self.failed_hosts.lock().unwrap().contains(&host) {
+                "invalid response"
+            } else {
+                body
+            };
+            let delay = self.delays.lock().unwrap().get(&query).cloned();
+            HttpConnectorFuture::new(async move {
+                if let Some(delay) = delay {
+                    delay.notified().await;
+                }
+                Ok(HttpResponse::new(
+                    StatusCode::try_from(200).unwrap(),
+                    SdkBody::from(body),
+                ))
+            })
+        }
+    }
+
+    fn scoped_discovery_config(
+        scope: RoutingScope,
+    ) -> (AlternatorConfig, ScopedDiscoveryHttpClient) {
+        let transport = ScopedDiscoveryHttpClient {
+            responses: Arc::new(Mutex::new(HashMap::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            hosts: Arc::new(Mutex::new(Vec::new())),
+            failed_hosts: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            delays: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["seed.test"])
+            .active_interval(Duration::from_secs(3600))
+            .idle_interval(Duration::from_secs(3600))
+            .routing_scope(scope)
+            .http_client(transport.clone())
+            .build();
+        (config, transport)
+    }
+
+    #[tokio::test]
+    async fn affinity_discovery_widens_each_fallback_and_reuses_the_selected_scope() {
+        let scope = RoutingScope::from_rack("dc1".into(), "rack1".into())
+            .with_fallback(RoutingScope::from_rack("dc2".into(), "rack2".into()))
+            .with_fallback(RoutingScope::from_datacenter("dc2".into()))
+            .with_fallback(RoutingScope::from_cluster());
+        let (config, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=rack1".into(), "[]"),
+            ("dc=dc2&rack=rack2".into(), "[]"),
+            ("dc=dc1".into(), "[]"),
+            ("dc=dc2".into(), r#"["dc2-rack1.test","dc2-rack2.test"]"#),
+        ]);
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        let mut outcomes = ordinary.update_live_nodes().await;
+        transport.requests.lock().unwrap().clear();
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        // The preferred DC is tried first. The selected DC2 snapshot then satisfies
+        // the affinity fallback, so its endpoint is not queried a second time.
+        assert_eq!(*transport.requests.lock().unwrap(), ["dc=dc1"]);
+        assert_eq!(
+            affinity.live_nodes.load().as_ref(),
+            ordinary.live_nodes.load().as_ref()
+        );
+
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=rack1".into(), r#"["dc1-rack1.test"]"#),
+            ("dc=dc1".into(), r#"["dc1-rack1.test","dc1-rack2.test"]"#),
+        ]);
+        let mut outcomes = ordinary.update_live_nodes().await;
+        transport.requests.lock().unwrap().clear();
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(*transport.requests.lock().unwrap(), ["dc=dc1"]);
+        assert_eq!(affinity.live_nodes.load().len(), 2);
+        assert!(
+            affinity
+                .live_nodes
+                .load()
+                .iter()
+                .all(|node| node.host_str().unwrap().starts_with("dc1-"))
+        );
+        assert_eq!(ordinary.live_nodes.load().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn affinity_refresh_is_independent_after_ordinary_failure_and_recovers_to_reuse() {
+        let scope = RoutingScope::from_rack("dc1".into(), "missing".into())
+            .with_fallback(RoutingScope::from_datacenter("dc1".into()));
+        let (config, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=missing".into(), "[]"),
+            ("dc=dc1".into(), r#"["first.test"]"#),
+        ]);
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        let mut outcomes = ordinary.update_live_nodes().await;
+        transport.requests.lock().unwrap().clear();
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert!(transport.requests.lock().unwrap().is_empty());
+
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=missing".into(), "invalid response"),
+            ("dc=dc1".into(), r#"["recovered.test"]"#),
+        ]);
+        let mut outcomes = ordinary.update_live_nodes().await;
+        assert_eq!(ordinary.live_nodes.load()[0].host_str(), Some("first.test"));
+        transport.requests.lock().unwrap().clear();
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(*transport.requests.lock().unwrap(), ["dc=dc1"]);
+        assert_eq!(
+            affinity.live_nodes.load()[0].host_str(),
+            Some("recovered.test")
+        );
+
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .insert("dc=dc1&rack=missing".into(), "[]");
+        let mut outcomes = ordinary.update_live_nodes().await;
+        transport.requests.lock().unwrap().clear();
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert!(transport.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            ordinary.live_nodes.load().as_ref(),
+            affinity.live_nodes.load().as_ref()
+        );
+
+        // Failure of the distinct DC refresh cannot clear either view or replace
+        // its last successful DC membership with an ordinary rack snapshot.
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=missing".into(), r#"["rack.test"]"#),
+            ("dc=dc1".into(), "invalid response"),
+        ]);
+        let mut outcomes = ordinary.update_live_nodes().await;
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(ordinary.live_nodes.load()[0].host_str(), Some("rack.test"));
+        assert_eq!(
+            affinity.live_nodes.load()[0].host_str(),
+            Some("recovered.test")
+        );
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .insert("dc=dc1".into(), r#"["dc-recovered.test"]"#);
+        let mut outcomes = ordinary.update_live_nodes().await;
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(
+            affinity.live_nodes.load()[0].host_str(),
+            Some("dc-recovered.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_empty_outcomes_expire_before_the_next_attempt() {
+        let scope = RoutingScope::from_rack("dc1".into(), "r1".into())
+            .with_fallback(RoutingScope::from_datacenter("dc1".into()))
+            .with_fallback(RoutingScope::from_rack("dc1".into(), "r2".into()))
+            .with_fallback(RoutingScope::from_datacenter("dc2".into()));
+        let (config, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=r1".into(), "[]"),
+            ("dc=dc1&rack=r2".into(), "[]"),
+            ("dc=dc1".into(), "[]"),
+            ("dc=dc2".into(), r#"["dc2.test"]"#),
+        ]);
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        let mut outcomes = ordinary.update_live_nodes().await;
+        let before = transport.requests.lock().unwrap().len();
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(transport.requests.lock().unwrap().len(), before);
+        assert_eq!(affinity.live_nodes.load()[0].host_str(), Some("dc2.test"));
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .insert("dc=dc1".into(), r#"["dc1.test"]"#);
+        let mut outcomes = ordinary.update_live_nodes().await;
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(affinity.live_nodes.load()[0].host_str(), Some("dc1.test"));
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|query| query.as_str() == "dc=dc1")
+                .count(),
+            2
+        );
+    }
+    async fn wait_for_discovery(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("discovery made no progress");
+    }
+
+    #[tokio::test]
+    async fn delayed_matching_discovery_is_shared_only_with_its_own_attempt() {
+        let scope = RoutingScope::from_rack("dc1".into(), "missing".into())
+            .with_fallback(RoutingScope::from_datacenter("dc1".into()));
+        let (config, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=missing".into(), "[]"),
+            ("dc=dc1".into(), r#"["fresh.test"]"#),
+        ]);
+        let release = Arc::new(tokio::sync::Notify::new());
+        transport
+            .delays
+            .lock()
+            .unwrap()
+            .insert("dc=dc1".into(), release.clone());
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        affinity.ensure_discovery_started();
+        wait_for_discovery(|| {
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|query| query == "dc=dc1")
+        })
+        .await;
+        assert_eq!(
+            *transport.requests.lock().unwrap(),
+            ["dc=dc1&rack=missing", "dc=dc1"]
+        );
+        assert!(affinity.discovery_runtime.load().is_none());
+        transport.delays.lock().unwrap().remove("dc=dc1");
+        release.notify_waiters();
+        wait_for_discovery(|| affinity.live_nodes.load()[0].host_str() == Some("fresh.test")).await;
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|query| query.as_str() == "dc=dc1")
+                .count(),
+            1
+        );
+        let mut outcomes = ordinary.update_live_nodes().await;
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|query| query.as_str() == "dc=dc1")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_affinity_uses_learned_ordinary_hosts_when_seeds_fail() {
+        let scope = RoutingScope::from_rack("dc1".into(), "r1".into());
+        let (config, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=r1".into(), r#"["learned.test"]"#),
+            ("dc=dc1".into(), r#"["learned.test","other-rack.test"]"#),
+        ]);
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        let mut outcomes = ordinary.update_live_nodes().await;
+        transport
+            .failed_hosts
+            .lock()
+            .unwrap()
+            .insert("seed.test".into());
+        transport.hosts.lock().unwrap().clear();
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(
+            *transport.hosts.lock().unwrap(),
+            ["seed.test", "learned.test"]
+        );
+        assert_eq!(ordinary.live_nodes.load().len(), 1);
+        assert_eq!(affinity.live_nodes.load().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stalled_affinity_does_not_delay_ordinary_or_overlap_and_is_cancelled_on_drop() {
+        let scope = RoutingScope::from_rack("dc1".into(), "r1".into());
+        let (_, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=r1".into(), r#"["rack.test"]"#),
+            ("dc=dc1".into(), r#"["dc.test"]"#),
+        ]);
+        transport
+            .delays
+            .lock()
+            .unwrap()
+            .insert("dc=dc1".into(), Arc::new(tokio::sync::Notify::new()));
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["seed.test"])
+            .routing_scope(scope.clone())
+            .http_client(transport.clone())
+            .active_interval(Duration::from_millis(20))
+            .idle_interval(Duration::from_secs(3600))
+            .build();
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        affinity.ensure_discovery_started();
+        wait_for_discovery(|| {
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|query| query.as_str() == "dc=dc1&rack=r1")
+                .count()
+                >= 3
+        })
+        .await;
+        assert_eq!(ordinary.live_nodes.load()[0].host_str(), Some("rack.test"));
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|query| query.as_str() == "dc=dc1")
+                .count(),
+            1
+        );
+        let task = ordinary
+            .discovery_tasks
+            .lock()
+            .unwrap()
+            .affinity_task
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        let weak_owner = Arc::downgrade(&ordinary);
+        drop(ordinary);
+        wait_for_discovery(|| task.is_finished() && weak_owner.upgrade().is_none()).await;
+        assert!(affinity.discovery_runtime.load().is_none());
+        assert_eq!(affinity.live_nodes.load()[0].host_str(), Some("seed.test"));
+    }
+    #[test]
+    fn runtime_handoff_cancels_the_old_affinity_task_and_keeps_the_new_one() {
+        let scope = RoutingScope::from_rack("dc1".into(), "r1".into());
+        let (config, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=r1".into(), r#"["rack.test"]"#),
+            ("dc=dc1".into(), r#"["dc.test"]"#),
+        ]);
+        transport
+            .delays
+            .lock()
+            .unwrap()
+            .insert("dc=dc1".into(), Arc::new(tokio::sync::Notify::new()));
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        let first = tokio::runtime::Runtime::new().unwrap();
+        first.block_on(async {
+            affinity.ensure_discovery_started();
+            wait_for_discovery(|| {
+                transport
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|query| query == "dc=dc1")
+            })
+            .await;
+        });
+        let old_task = ordinary
+            .discovery_tasks
+            .lock()
+            .unwrap()
+            .affinity_task
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        // Exercise the same ownership transfer selected by the bounded runtime
+        // liveness probe, while the old runtime can still drop its guard.
+        ordinary
+            .discovery_runtime
+            .load()
+            .as_ref()
+            .unwrap()
+            .handoff_required
+            .store(true, Ordering::Release);
+        let second = tokio::runtime::Runtime::new().unwrap();
+        second.block_on(async {
+            affinity.ensure_discovery_started();
+            wait_for_discovery(|| {
+                old_task.is_finished()
+                    && transport
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|query| query.as_str() == "dc=dc1")
+                        .count()
+                        == 2
+            })
+            .await;
+            assert_eq!(
+                ordinary.discovery_runtime.load().as_ref().unwrap().id,
+                second.handle().id()
+            );
+            assert!(
+                !ordinary
+                    .discovery_tasks
+                    .lock()
+                    .unwrap()
+                    .affinity_task
+                    .as_ref()
+                    .unwrap()
+                    .is_finished()
+            );
+            assert!(affinity.discovery_runtime.load().is_none());
+        });
+    }
+
+    #[tokio::test]
+    async fn a_stale_refresh_cannot_launch_affinity_after_registration_changes() {
+        let scope = RoutingScope::from_rack("dc1".into(), "r1".into());
+        let (config, _) = scoped_discovery_config(scope.clone());
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let _affinity = ordinary.affinity_view();
+        let handle = Handle::current();
+        let old_registration = Arc::new(DiscoveryRuntime::new(handle.id(), handle.clone()));
+        // A runtime can become owner again after an intervening transfer. Even
+        // matching runtime IDs do not make the old registration current.
+        let current_registration = Arc::new(DiscoveryRuntime::new(handle.id(), handle));
+        ordinary
+            .discovery_runtime
+            .store(Some(current_registration.clone()));
+        ordinary.start_affinity_refresh(DiscoveryOutcomes::new(), &old_registration);
+        assert!(
+            ordinary
+                .discovery_tasks
+                .lock()
+                .unwrap()
+                .affinity_task
+                .is_none()
+        );
+        ordinary.start_affinity_refresh(DiscoveryOutcomes::new(), &current_registration);
+        assert!(
+            ordinary
+                .discovery_tasks
+                .lock()
+                .unwrap()
+                .affinity_task
+                .is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn affinity_activity_wakes_the_idle_ordinary_owner() {
+        let scope = RoutingScope::from_rack("dc1".into(), "r1".into());
+        let (_, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=r1".into(), r#"["rack.test"]"#),
+            ("dc=dc1".into(), r#"["dc.test"]"#),
+        ]);
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["seed.test"])
+            .routing_scope(scope.clone())
+            .http_client(transport.clone())
+            .active_interval(Duration::from_secs(30))
+            .idle_interval(Duration::from_secs(30))
+            .build();
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        ordinary.ensure_discovery_started();
+        // Startup marks activity. Age it only after startup, before the queued
+        // task first runs, so no prior idle notification can satisfy the wake.
+        *ordinary.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        wait_for_discovery(|| {
+            ordinary.live_nodes.load()[0].host_str() == Some("rack.test")
+                && affinity.live_nodes.load()[0].host_str() == Some("dc.test")
+                && ordinary
+                    .discovery_tasks
+                    .lock()
+                    .unwrap()
+                    .affinity_task
+                    .as_ref()
+                    .is_some_and(|task| task.is_finished())
+        })
+        .await;
+        // Immediate responses on this current-thread runtime let the ordinary
+        // loop reach its idle wait before the auxiliary task completes.
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|query| query.as_str() == "dc=dc1&rack=r1")
+                .count(),
+            1
+        );
+        affinity.get_live_nodes();
+        wait_for_discovery(|| {
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|query| query.as_str() == "dc=dc1&rack=r1")
+                .count()
+                == 2
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn affinity_cluster_fallback_uses_learned_hosts_when_seeds_fail() {
+        let scope = RoutingScope::from_rack("dc1".into(), "r1".into())
+            .with_fallback(RoutingScope::from_cluster());
+        let (config, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=r1".into(), r#"["learned.test"]"#),
+            ("dc=dc1".into(), "[]"),
+            ("".into(), r#"["learned.test","other-dc.test"]"#),
+        ]);
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        let mut outcomes = ordinary.update_live_nodes().await;
+        transport
+            .failed_hosts
+            .lock()
+            .unwrap()
+            .insert("seed.test".into());
+        transport.requests.lock().unwrap().clear();
+        transport.hosts.lock().unwrap().clear();
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(
+            ordinary.live_nodes.load()[0].host_str(),
+            Some("learned.test")
+        );
+        assert_eq!(
+            affinity
+                .live_nodes
+                .load()
+                .iter()
+                .map(|node| node.host_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["learned.test", "other-dc.test"]
+        );
+        let queries = transport.requests.lock().unwrap();
+        let hosts = transport.hosts.lock().unwrap();
+        assert!(
+            queries
+                .iter()
+                .zip(hosts.iter())
+                .any(|(query, host)| { query.is_empty() && host == "learned.test" })
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_cluster_fallback_reuses_the_ordinary_attempt_outcome() {
+        let scope = RoutingScope::from_rack("dc1".into(), "r1".into())
+            .with_fallback(RoutingScope::from_cluster());
+        let (config, transport) = scoped_discovery_config(scope.clone());
+        transport.responses.lock().unwrap().extend([
+            ("dc=dc1&rack=r1".into(), "[]"),
+            ("dc=dc1".into(), "[]"),
+            ("".into(), r#"["cluster-a.test","cluster-b.test"]"#),
+        ]);
+        let ordinary = LiveNodes::new(&config).unwrap();
+        let affinity = ordinary.affinity_view();
+        let mut outcomes = ordinary.update_live_nodes().await;
+        assert!(
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|query| query.is_empty())
+        );
+        transport.requests.lock().unwrap().clear();
+        affinity
+            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .await;
+        assert_eq!(*transport.requests.lock().unwrap(), ["dc=dc1"]);
+        assert_eq!(
+            affinity.live_nodes.load().as_ref(),
+            ordinary.live_nodes.load().as_ref()
+        );
+        assert_eq!(affinity.live_nodes.load().len(), 2);
+    }
+
+    #[test]
+    fn closed_runtime_startup_returns_and_can_restart_with_or_without_affinity() {
+        for affinity_enabled in [false, true] {
+            let (done, completed) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let handle = runtime.handle().clone();
+                drop(runtime);
+                let scope = RoutingScope::from_rack("dc1".into(), "r1".into());
+                let (config, _) = scoped_discovery_config(scope.clone());
+                let ordinary = LiveNodes::new(&config).unwrap();
+                let affinity = affinity_enabled.then(|| ordinary.affinity_view());
+                let _entered = handle.enter();
+                affinity
+                    .as_ref()
+                    .unwrap_or(&ordinary)
+                    .ensure_discovery_started();
+                done.send((ordinary, affinity)).unwrap();
+            });
+            // Bound a synchronous mutex deadlock too: an async timeout cannot
+            // run when the entered runtime has already been shut down.
+            let (ordinary, affinity) = completed
+                .recv_timeout(Duration::from_secs(2))
+                .expect("closed-runtime discovery startup must return");
+            worker.join().unwrap();
+            assert!(ordinary.discovery_runtime.load().is_none());
+            let replacement = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            replacement.block_on(async {
+                assert!(
+                    !affinity
+                        .as_ref()
+                        .unwrap_or(&ordinary)
+                        .get_live_nodes()
+                        .is_empty()
+                );
+                assert_eq!(
+                    ordinary.discovery_runtime.load().as_ref().unwrap().id,
+                    replacement.handle().id()
+                );
+            });
+        }
     }
 }

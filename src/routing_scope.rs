@@ -29,6 +29,35 @@ pub struct RoutingScope {
     fallback: Option<Box<RoutingScope>>,
 }
 
+/// Identifies a discovery query together with its seed aggregation policy.
+/// Scoped queries use the first usable response; cluster queries aggregate.
+/// Both affinity-chain deduplication and per-refresh reuse use this identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum DiscoveryOperation {
+    Cluster,
+    Datacenter(String),
+    Rack { dc: String, rack: String },
+}
+
+impl DiscoveryOperation {
+    fn build_localnodes_url(&self, mut base_url: url::Url) -> url::Url {
+        base_url.set_path("/localnodes");
+        match self {
+            Self::Cluster => {}
+            Self::Datacenter(dc) => {
+                base_url.query_pairs_mut().append_pair("dc", dc);
+            }
+            Self::Rack { dc, rack } => {
+                base_url
+                    .query_pairs_mut()
+                    .append_pair("dc", dc)
+                    .append_pair("rack", rack);
+            }
+        }
+        base_url
+    }
+}
+
 impl RoutingScope {
     /// Routes across the whole cluster.
     ///
@@ -59,6 +88,11 @@ impl RoutingScope {
     }
 
     /// Routes requests to nodes in `rack` within `dc`.
+    ///
+    /// Eligible key-affinity requests use all racks in the selected datacenter.
+    /// Rack restrictions in configured fallbacks widen to their datacenters.
+    /// Equivalent widened scopes collapse to their first occurrence, preserving
+    /// fallback order. Other requests retain the configured rack scope.
     ///
     /// An empty datacenter name is treated as [`Self::from_cluster`]. An empty
     /// rack name is treated as [`Self::from_datacenter`].
@@ -97,22 +131,52 @@ impl RoutingScope {
 
     /// Appends the datacenter and rack parameters to the given URL as query parameters, if they are set in the scope.
     /// append_pair performs URL encoding.
-    pub(crate) fn build_localnodes_url(&self, mut base_url: url::Url) -> url::Url {
-        base_url.set_path("/localnodes");
-        if self.dc.is_some() {
-            let mut query = base_url.query_pairs_mut();
-            if let Some(dc) = &self.dc {
-                query.append_pair("dc", dc);
-            }
-            if let Some(rack) = &self.rack {
-                query.append_pair("rack", rack);
-            }
-        }
-        base_url
+    pub(crate) fn build_localnodes_url(&self, base_url: url::Url) -> url::Url {
+        self.discovery_operation().build_localnodes_url(base_url)
     }
 
     pub(crate) fn is_cluster(&self) -> bool {
         self.dc.is_none() && self.rack.is_none()
+    }
+
+    pub(crate) fn discovery_operation(&self) -> DiscoveryOperation {
+        match (&self.dc, &self.rack) {
+            (Some(dc), Some(rack)) => DiscoveryOperation::Rack {
+                dc: dc.clone(),
+                rack: rack.clone(),
+            },
+            (Some(dc), None) => DiscoveryOperation::Datacenter(dc.clone()),
+            (None, _) => DiscoveryOperation::Cluster,
+        }
+    }
+
+    /// Returns whether this scope or any fallback restricts routing to a rack.
+    pub(crate) fn has_rack_restriction(&self) -> bool {
+        std::iter::successors(Some(self), |scope| scope.fallback())
+            .any(|scope| scope.rack.is_some())
+    }
+
+    /// Returns the same scope and fallback chain without rack restrictions.
+    ///
+    /// Key-route affinity needs every rack in each selected datacenter so
+    /// clients in different racks derive the same coordinator for a partition.
+    /// Datacenter locality is unchanged. Equivalent widened scopes collapse to
+    /// their first occurrence, preserving the remaining fallback order.
+    pub(crate) fn without_rack(&self) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let mut resolved = None;
+        let mut tail = &mut resolved;
+        for current in std::iter::successors(Some(self), |scope| scope.fallback()) {
+            let widened = Self {
+                dc: current.dc.clone(),
+                rack: None,
+                fallback: None,
+            };
+            if seen.insert(widened.discovery_operation()) {
+                tail = &mut tail.insert(Box::new(widened)).fallback;
+            }
+        }
+        *resolved.expect("a routing chain contains its first scope")
     }
 
     /// Returns the next scope in the fallback chain, if one is configured.
@@ -146,6 +210,69 @@ mod tests {
             scope.build_localnodes_url(url).as_str(),
             "http://localhost/localnodes"
         );
+    }
+
+    #[test]
+    fn without_rack_keeps_first_equivalent_operation_and_explicit_order() {
+        let scope = RoutingScope::from_rack("A".into(), "r1".into())
+            .with_fallback(RoutingScope::from_rack("A".into(), "r1".into()))
+            .with_fallback(RoutingScope::from_datacenter("A".into()))
+            .with_fallback(RoutingScope::from_rack("B".into(), "r2".into()))
+            .with_fallback(RoutingScope::from_cluster())
+            .with_fallback(RoutingScope::from_datacenter("B".into()));
+        let widened = scope.without_rack();
+        let operations = std::iter::successors(Some(&widened), |scope| scope.fallback())
+            .map(|scope| (scope.dc(), scope.rack(), scope.is_cluster()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            [
+                (Some("A"), None, false),
+                (Some("B"), None, false),
+                (None, None, true)
+            ]
+        );
+        assert_eq!(scope.rack(), Some("r1"));
+        assert_eq!(
+            std::iter::successors(Some(&scope), |scope| scope.fallback()).count(),
+            6
+        );
+    }
+
+    #[test]
+    fn without_rack_widens_every_scope_and_preserves_datacenters() {
+        let scope = RoutingScope::from_rack("dc1".to_string(), "rack1".to_string())
+            .with_fallback(RoutingScope::from_rack(
+                "dc2".to_string(),
+                "rack2".to_string(),
+            ))
+            .with_fallback(RoutingScope::from_cluster());
+
+        assert!(scope.has_rack_restriction());
+
+        let widened = scope.without_rack();
+
+        assert_eq!(widened.dc(), Some("dc1"));
+        assert_eq!(widened.rack(), None);
+        let dc2 = widened
+            .fallback()
+            .expect("datacenter fallback is preserved");
+        assert_eq!(dc2.dc(), Some("dc2"));
+        assert_eq!(dc2.rack(), None);
+        let cluster = dc2.fallback().expect("cluster fallback is preserved");
+        assert_eq!(cluster.dc(), None);
+        assert_eq!(cluster.rack(), None);
+        assert!(!widened.has_rack_restriction());
+    }
+
+    #[test]
+    fn rack_restriction_is_detected_in_a_fallback() {
+        let scope = RoutingScope::from_datacenter("dc1".to_string()).with_fallback(
+            RoutingScope::from_rack("dc2".to_string(), "rack2".to_string()),
+        );
+
+        assert!(scope.has_rack_restriction());
+        assert!(!scope.without_rack().has_rack_restriction());
     }
 
     #[test]
