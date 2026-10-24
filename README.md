@@ -244,6 +244,14 @@ let config = AlternatorConfig::builder()
     .build();
 ```
 
+Use `.discovery_timeout(Duration::from_secs(10))` to set a deadline for each
+`/localnodes` request and each partition-key discovery request.
+Topology connection establishment takes at most 2 seconds or
+the configured deadline, whichever is shorter. Without this setting, topology
+requests retain their 5-second deadline and partition-key discovery inherits the
+SDK timeout configuration. `set_discovery_timeout(None)` restores those defaults.
+Zero and unrepresentable durations are rejected during client construction.
+
 Discovery is shared by clones of a client. Call `client.shutdown().await` to
 stop topology and partition-key discovery and wait for all discovery tasks to
 finish. Shutdown interrupts discovery I/O and retry delays, prevents new

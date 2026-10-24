@@ -396,6 +396,15 @@ impl AlternatorClient {
     /// Tries to construct a client after validating required SDK and routing
     /// configuration.
     pub fn try_from_conf(config: AlternatorConfig) -> Result<Self, AlternatorClientBuildError> {
+        if let Some(timeout) = config.discovery_timeout()
+            && (timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none())
+        {
+            return Err(AlternatorClientBuildError {
+                kind: AlternatorClientBuildErrorKind::SdkConfiguration(
+                    "discovery_timeout must be positive and fit the runtime clock".to_owned(),
+                ),
+            });
+        }
         let dynamodb_config = config.dynamodb_config.clone();
         let extensions = config.alternator_ext.clone();
         let stalled_stream_protection_explicitly_unset =
@@ -491,17 +500,30 @@ impl AlternatorClient {
                 // cycle: main client -> affinity interceptor -> resolver -> DescribeTable
                 // -> main client. Build a separate discovery client from the same base config
                 // but with round-robin routing only.
-                let pk_discovery_client = try_dynamodb_client_from_conf(
-                    builder
-                        .clone()
-                        .interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()))
-                        .build(),
-                )?;
-                let resolver =
-                    std::sync::Arc::new(keyrouting::resolver::PartitionKeyResolver::new(
+                let mut pk_builder = builder
+                    .clone()
+                    .interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()));
+                if let Some(timeout) = config.discovery_timeout() {
+                    let timeouts = config
+                        .timeout_config()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            aws_smithy_types::timeout::TimeoutConfig::builder().build()
+                        })
+                        .to_builder()
+                        .operation_timeout(timeout)
+                        .operation_attempt_timeout(timeout)
+                        .build();
+                    pk_builder = pk_builder.timeout_config(timeouts);
+                }
+                let pk_discovery_client = try_dynamodb_client_from_conf(pk_builder.build())?;
+                let resolver = std::sync::Arc::new(
+                    keyrouting::resolver::PartitionKeyResolver::new_with_timeout(
                         pk_discovery_client,
                         cfg.pk_info_per_table.clone(),
-                    ));
+                        config.discovery_timeout(),
+                    ),
+                );
                 partition_keys = Some(resolver.clone());
                 Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
                     AffinityQueryPlanInterceptor::new(cfg.clone(), nodes.clone(), resolver),
