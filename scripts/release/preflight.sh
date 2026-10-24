@@ -31,10 +31,12 @@ package_name=alternator-client
     echo "release workflow must be dispatched from main" >&2
     exit 1
 }
-[[ -n "${GITHUB_SHA:-}" && "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]] || {
-    echo "workflow SHA does not match the checkout" >&2
+commit_sha=$(git rev-parse HEAD)
+[[ -n "${GITHUB_SHA:-}" && "$(git show -s --format=%P "$commit_sha")" == "$GITHUB_SHA" ]] || {
+    echo "release commit must be a direct child of the dispatch commit" >&2
     exit 1
 }
+python3 "$(dirname "${BASH_SOURCE[0]}")/signing.py" verify-commit "$commit_sha"
 
 git fetch --force --tags origin '+refs/heads/main:refs/remotes/origin/main'
 main_sha=$(git rev-parse refs/remotes/origin/main)
@@ -50,7 +52,7 @@ while IFS= read -r tag; do
 done < <(git tag -l "v$version-rc.*")
 
 if [[ -n "$current_run_rc" ]]; then
-    [[ "$(git rev-list -n 1 "$current_run_rc")" == "$GITHUB_SHA" ]] || {
+    [[ "$(git rev-list -n 1 "$current_run_rc")" == "$commit_sha" ]] || {
         echo "$current_run_rc does not point to this workflow's commit" >&2
         exit 1
     }
@@ -98,7 +100,7 @@ awk -v prefix="## [$version] - " '
 }
 
 if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-    if [[ -z "$current_run_rc" || "$(git rev-list -n 1 "v$version")" != "$GITHUB_SHA" ]]; then
+    if [[ -z "$current_run_rc" || "$(git rev-list -n 1 "v$version")" != "$commit_sha" ]]; then
         echo "final tag v$version already exists outside this run's recovery state" >&2
         exit 1
     fi
@@ -137,4 +139,4 @@ elif [[ "$index_status" != 200 && "$index_status" != 404 ]]; then
     exit 1
 fi
 
-echo "release preflight passed for $package_name $version at $GITHUB_SHA"
+echo "release preflight passed for $package_name $version at $commit_sha"

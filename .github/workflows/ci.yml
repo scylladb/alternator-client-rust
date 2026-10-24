@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,6 +24,11 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Test release blocker enforcement
       run: bash scripts/release/test-check-release-blockers.sh
+    - name: Test release preparation, signing, and credential boundaries
+      run: |
+        python3 -m venv "$RUNNER_TEMP/release-tests"
+        "$RUNNER_TEMP/release-tests/bin/pip" install PyYAML==6.0.3
+        "$RUNNER_TEMP/release-tests/bin/python" -m unittest discover -s scripts/release -p 'test_*.py' -v
     - name: Install Rust 1.94.1
       run: |
         rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy --no-self-update
