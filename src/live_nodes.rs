@@ -62,9 +62,9 @@
 //!
 //!  # Lifetime
 //!
-//! The background task holds a [`Weak`] reference to its [`LiveNodes`], so it
-//! terminates on its own once the last owning [`Arc`] is dropped. [`Drop`]
-//! additionally aborts the task to avoid waiting out the current sleep. The
+//! The background task holds a [`Weak`] reference to its discovery manager,
+//! so it terminates once the last ordinary owning handle is dropped. The
+//! manager's [`Drop`] also aborts the task to avoid waiting out the current sleep. The
 //! client lifecycle owns all discovery tasks and
 //! explicitly stops and joins them when the client is shut down.
 //!
@@ -93,14 +93,14 @@
 //! [`Notify`]: tokio::sync::Notify
 //! [`Weak`]: std::sync::Weak
 //! [`Arc`]: std::sync::Arc
-//! [`active_interval`]: LiveNodes::active_interval
-//! [`idle_interval`]: LiveNodes::idle_interval
-//! [`mark_activity`]: LiveNodes::mark_activity
+//! [`active_interval`]: DiscoveryManager::active_interval
+//! [`idle_interval`]: DiscoveryManager::idle_interval
+//! [`mark_activity`]: DiscoveryManager::mark_activity
 //! [`ensure_discovery_started`]: LiveNodes::ensure_discovery_started
-//! [`update_live_nodes`]: LiveNodes::update_live_nodes
+//! [`update_live_nodes`]: DiscoveryManager::update_live_nodes
 //! [`get_next_node_round_robin`]: LiveNodes::get_next_node_round_robin
 //! [`get_live_nodes`]: LiveNodes::get_live_nodes
-//! [`live_nodes`]: LiveNodes::live_nodes
+//! [`live_nodes`]: NodeView::live_nodes
 //! [`from_conf`]: crate::client::AlternatorClient::from_conf
 
 use crate::routing_scope::RoutingScope;
@@ -335,24 +335,48 @@ impl DiscoveryHttpClient {
     }
 }
 
+/// A routing view and its discovery owner. Ordinary handles retain ownership;
+/// auxiliary handles may outlive the owner without keeping discovery alive.
 #[derive(Debug)]
 pub(crate) struct LiveNodes {
-    pub(crate) tasks: Arc<crate::discovery::DiscoveryTasks>,
+    view: Arc<NodeView>,
+    owner: DiscoveryOwner,
+}
+
+#[derive(Debug)]
+enum DiscoveryOwner {
+    Ordinary(Arc<DiscoveryManager>),
+    Auxiliary(Weak<DiscoveryManager>),
+}
+
+#[derive(Debug)]
+struct NodeView {
     routing_scope: RoutingScope,
-    active_interval: Duration,
-    idle_interval: Duration,
-    counter: Arc<AtomicUsize>,
+    counter: AtomicUsize,
     live_nodes: ArcSwap<Vec<Arc<Url>>>,
     refresh_state: Mutex<RefreshState>,
+}
+
+/// Immutable I/O inputs can outlive the manager while optional work is being
+/// cancelled, without extending discovery ownership.
+#[derive(Debug)]
+struct DiscoveryInputs {
     seed_urls: Vec<Arc<Url>>,
     alternator_scheme: String,
     port: Option<u16>,
     client: DiscoveryHttpClient,
-    /// Auxiliary access starts and marks activity on the ordinary owner.
-    ordinary_nodes: Option<Weak<LiveNodes>>,
-    affinity_nodes: Mutex<Weak<LiveNodes>>,
     native_roots_usable: bool,
-    last_activity: Arc<Mutex<Instant>>,
+}
+
+#[derive(Debug)]
+struct DiscoveryManager {
+    tasks: Arc<crate::discovery::DiscoveryTasks>,
+    ordinary: Arc<NodeView>,
+    inputs: Arc<DiscoveryInputs>,
+    affinity_nodes: Mutex<Weak<NodeView>>,
+    active_interval: Duration,
+    idle_interval: Duration,
+    last_activity: Mutex<Instant>,
     notify: Arc<tokio::sync::Notify>,
     discovery_tasks: Mutex<DiscoveryTaskState>,
     discovery_runtime: ArcSwapOption<DiscoveryRuntime>,
@@ -467,17 +491,17 @@ impl DiscoveryRuntime {
 }
 
 struct DiscoveryTaskGuard {
-    live_nodes: Weak<LiveNodes>,
+    manager: Weak<DiscoveryManager>,
     runtime: Arc<DiscoveryRuntime>,
 }
 
 impl Drop for DiscoveryTaskGuard {
     fn drop(&mut self) {
         self.runtime.stopped.store(true, Ordering::Release);
-        if let Some(live_nodes) = self.live_nodes.upgrade() {
+        if let Some(manager) = self.manager.upgrade() {
             // Clear only this task's registration, preserving any replacement.
             drop(
-                live_nodes
+                manager
                     .discovery_runtime
                     .compare_and_swap(&self.runtime, None),
             );
@@ -566,71 +590,125 @@ impl LiveNodes {
         let (client, native_roots_usable) =
             build_discovery_http_client(config, seed_urls[0].scheme())?;
 
-        Ok(Some(Arc::new(Self {
+        let view = Arc::new(NodeView::new(routing_scope, seed_urls.clone()));
+        let manager = Arc::new(DiscoveryManager {
             tasks: Arc::default(),
-            routing_scope,
+            ordinary: view.clone(),
+            inputs: Arc::new(DiscoveryInputs {
+                seed_urls,
+                alternator_scheme,
+                port,
+                client,
+                native_roots_usable,
+            }),
+            affinity_nodes: Mutex::new(Weak::new()),
             active_interval,
             idle_interval,
-            counter: Arc::new(AtomicUsize::new(0)),
-            live_nodes: ArcSwap::from_pointee(seed_urls.clone()),
-            refresh_state: Mutex::new(RefreshState::default()),
-            seed_urls,
-            alternator_scheme,
-            port,
-            client,
-            ordinary_nodes: None,
-            affinity_nodes: Mutex::new(Weak::new()),
-            native_roots_usable,
-            last_activity: Arc::new(Mutex::new(Instant::now())),
+            last_activity: Mutex::new(Instant::now()),
             notify: Arc::new(tokio::sync::Notify::new()),
             discovery_tasks: Mutex::new(DiscoveryTaskState::default()),
             discovery_runtime: ArcSwapOption::empty(),
+        });
+        Ok(Some(Arc::new(Self {
+            view,
+            owner: DiscoveryOwner::Ordinary(manager),
         })))
     }
 
-    /// Derives the affinity view once from the initialized ordinary view.
-    /// Identical scopes share the ordinary state. A distinct view shares its
-    /// transport and owner, but retains its own membership and fallback chain.
-    pub(crate) fn affinity_view(self: &Arc<Self>) -> Arc<Self> {
-        if !self.routing_scope.has_rack_restriction() {
-            return self.clone();
+    fn manager(&self) -> Option<Arc<DiscoveryManager>> {
+        match &self.owner {
+            DiscoveryOwner::Ordinary(manager) => Some(manager.clone()),
+            DiscoveryOwner::Auxiliary(manager) => manager.upgrade(),
         }
-        let mut affinity = self.affinity_nodes.lock().unwrap();
-        if let Some(view) = affinity.upgrade() {
-            return view;
-        }
-        let view = Arc::new(Self {
-            tasks: self.tasks.clone(),
-            routing_scope: self.routing_scope.without_rack(),
-            active_interval: self.active_interval,
-            idle_interval: self.idle_interval,
-            counter: Arc::new(AtomicUsize::new(0)),
-            live_nodes: ArcSwap::from_pointee(self.seed_urls.clone()),
-            refresh_state: Mutex::new(RefreshState::default()),
-            seed_urls: self.seed_urls.clone(),
-            alternator_scheme: self.alternator_scheme.clone(),
-            port: self.port,
-            client: self.client.clone(),
-            ordinary_nodes: Some(Arc::downgrade(self)),
-            affinity_nodes: Mutex::new(Weak::new()),
-            native_roots_usable: self.native_roots_usable,
-            last_activity: self.last_activity.clone(),
-            notify: self.notify.clone(),
-            discovery_tasks: Mutex::new(DiscoveryTaskState::default()),
-            discovery_runtime: ArcSwapOption::empty(),
-        });
-        *affinity = Arc::downgrade(&view);
-        view
     }
 
-    pub(crate) fn scheme(&self) -> &str {
-        self.seed_urls[0].scheme()
+    /// Derives the affinity view once from the initialized ordinary view.
+    pub(crate) fn affinity_view(self: &Arc<Self>) -> Arc<Self> {
+        if !self.view.routing_scope.has_rack_restriction() {
+            return self.clone();
+        }
+        let Some(manager) = self.manager() else {
+            return self.clone();
+        };
+        let mut affinity = manager.affinity_nodes.lock().unwrap();
+        let view = affinity.upgrade().unwrap_or_else(|| {
+            let view = Arc::new(NodeView::new(
+                self.view.routing_scope.without_rack(),
+                manager.inputs.seed_urls.clone(),
+            ));
+            *affinity = Arc::downgrade(&view);
+            view
+        });
+        Arc::new(Self {
+            view,
+            owner: DiscoveryOwner::Auxiliary(Arc::downgrade(&manager)),
+        })
+    }
+
+    pub(crate) fn tasks(&self) -> Arc<crate::discovery::DiscoveryTasks> {
+        self.manager()
+            .expect("ordinary discovery owner")
+            .tasks
+            .clone()
+    }
+
+    pub(crate) fn uses_http(&self) -> bool {
+        self.manager()
+            .is_some_and(|manager| manager.inputs.seed_urls[0].scheme() == "http")
     }
 
     pub(crate) fn has_usable_native_roots(&self) -> bool {
-        self.native_roots_usable
+        self.manager()
+            .is_some_and(|manager| manager.inputs.native_roots_usable)
     }
 
+    pub(crate) fn ensure_discovery_started(self: &Arc<Self>) {
+        if let Some(manager) = self.manager() {
+            manager.ensure_discovery_started();
+        }
+    }
+
+    fn access(self: &Arc<Self>) {
+        if let Some(manager) = self.manager() {
+            manager.ensure_discovery_started();
+            manager.mark_activity();
+        }
+    }
+
+    /// Returns the current membership and records activity on its owner.
+    pub(crate) fn get_live_nodes(self: &Arc<Self>) -> Vec<Arc<Url>> {
+        self.access();
+        self.view.live_nodes.load().as_ref().clone()
+    }
+
+    /// Returns the next unused node in the current round-robin membership.
+    pub(crate) fn get_next_node_round_robin(
+        self: &Arc<Self>,
+        used_nodes: &std::collections::HashSet<Arc<Url>>,
+    ) -> Option<Arc<Url>> {
+        self.access();
+        let live_nodes = self.view.live_nodes.load();
+        let len = live_nodes.len();
+        if len == 0 || live_nodes.iter().all(|node| used_nodes.contains(node)) {
+            return None;
+        }
+        let start = self.view.counter.fetch_add(1, Ordering::Relaxed) % len;
+        for i in 0..len {
+            let node = &live_nodes[(start + i) % len];
+            if !used_nodes.contains(node) {
+                return Some(node.clone());
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_live_nodes(&self, generation: u64, new_nodes: Vec<Arc<Url>>) {
+        self.view.publish_live_nodes(generation, new_nodes);
+    }
+}
+
+impl DiscoveryInputs {
     fn host_to_uri(&self, addr: &str) -> Result<Url, url::ParseError> {
         build_node_url(&self.alternator_scheme, addr, self.port)
     }
@@ -651,10 +729,25 @@ impl LiveNodes {
                 .collect(),
         )
     }
+}
 
-    fn cluster_discovery_candidates(&self, additional_candidates: &[Arc<Url>]) -> Vec<Arc<Url>> {
+impl NodeView {
+    fn new(routing_scope: RoutingScope, nodes: Vec<Arc<Url>>) -> Self {
+        Self {
+            routing_scope,
+            counter: AtomicUsize::new(0),
+            live_nodes: ArcSwap::from_pointee(nodes),
+            refresh_state: Mutex::new(RefreshState::default()),
+        }
+    }
+
+    fn cluster_discovery_candidates(
+        &self,
+        inputs: &DiscoveryInputs,
+        additional_candidates: &[Arc<Url>],
+    ) -> Vec<Arc<Url>> {
         let mut candidates = self.live_nodes.load().as_ref().clone();
-        candidates.extend(self.seed_urls.iter().cloned());
+        candidates.extend(inputs.seed_urls.iter().cloned());
         candidates.extend(additional_candidates.iter().cloned());
         candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         candidates.dedup_by(|a, b| a.as_str() == b.as_str());
@@ -698,6 +791,7 @@ impl LiveNodes {
 
     async fn discover_cluster_live_nodes_from(
         &self,
+        inputs: &DiscoveryInputs,
         generation: u64,
         candidates: Vec<Arc<Url>>,
     ) -> Option<Vec<Arc<Url>>> {
@@ -710,7 +804,7 @@ impl LiveNodes {
                 continue;
             }
 
-            if let Some(mut nodes) = self.fetch_live_nodes_for_scope(&scope, &node_addr).await {
+            if let Some(mut nodes) = inputs.fetch_live_nodes_for_scope(&scope, &node_addr).await {
                 got_response = true;
                 let response_was_nonempty = !nodes.is_empty();
                 new_nodes.append(&mut nodes);
@@ -730,7 +824,9 @@ impl LiveNodes {
         new_nodes.dedup_by(|a, b| a.as_str() == b.as_str());
         Some(new_nodes)
     }
+}
 
+impl DiscoveryManager {
     /// Ensures the background discovery task is running.
     ///
     /// Idempotent and safe to call from any context: returns immediately if
@@ -739,12 +835,6 @@ impl LiveNodes {
     /// but takes ownership when its discovery task exits or cannot acknowledge
     /// a liveness request within the bounded interval.
     pub(crate) fn ensure_discovery_started(self: &Arc<Self>) {
-        if let Some(owner) = &self.ordinary_nodes {
-            if let Some(ordinary) = owner.upgrade() {
-                ordinary.ensure_discovery_started();
-            }
-            return;
-        }
         if self.tasks.is_stopped() {
             return;
         }
@@ -789,7 +879,7 @@ impl LiveNodes {
         let weak_self = Arc::downgrade(self);
         let notify = self.notify.clone();
         let task_guard = DiscoveryTaskGuard {
-            live_nodes: weak_self.clone(),
+            manager: weak_self.clone(),
             runtime: runtime.clone(),
         };
 
@@ -881,10 +971,6 @@ impl LiveNodes {
     }
 
     fn mark_activity(&self) {
-        if let Some(ordinary) = self.ordinary_nodes.as_ref().and_then(Weak::upgrade) {
-            ordinary.mark_activity();
-            return;
-        }
         let now = Instant::now();
         let mut last = self.last_activity.lock().unwrap();
         let was_idle = now.duration_since(*last) > self.idle_interval;
@@ -894,49 +980,11 @@ impl LiveNodes {
         }
     }
 
-    /// Returns a list of all current live nodes and updates the last activity timestamp.
-    pub(crate) fn get_live_nodes(self: &Arc<Self>) -> Vec<Arc<Url>> {
-        self.ensure_discovery_started();
-        self.mark_activity();
-        self.live_nodes.load().as_ref().clone()
-    }
-
-    /// Returns the first live node not in `used_nodes` starting with the next node in round-robin order.
-    /// Used by [`crate::QueryPlan`] round-robin strategy.
-    pub(crate) fn get_next_node_round_robin(
-        self: &Arc<Self>,
-        used_nodes: &std::collections::HashSet<Arc<Url>>,
-    ) -> Option<Arc<Url>> {
-        self.ensure_discovery_started();
-        self.mark_activity();
-        let live_nodes = self.live_nodes.load();
-
-        let len = live_nodes.len();
-        if len == 0 {
-            return None;
-        }
-
-        // Checking an exhausted query plan must not advance the shared
-        // round-robin position. The caller may clear `used_nodes` and retry,
-        // and that retry should consume the next position itself.
-        if live_nodes.iter().all(|node| used_nodes.contains(node)) {
-            return None;
-        }
-
-        let start = self.counter.fetch_add(1, Ordering::Relaxed) % len;
-        for i in 0..len {
-            let idx = (start + i) % len;
-            let node = &live_nodes[idx];
-            if !used_nodes.contains(node) {
-                return Some(node.clone());
-            }
-        }
-        None
-    }
-
     async fn update_live_nodes(&self) -> DiscoveryOutcomes {
         let mut outcomes = DiscoveryOutcomes::new();
-        self.update_live_nodes_from(&mut outcomes, &[]).await;
+        self.ordinary
+            .update_live_nodes_from(&self.inputs, &mut outcomes, &[], false)
+            .await;
         outcomes
     }
 
@@ -945,7 +993,7 @@ impl LiveNodes {
         mut outcomes: DiscoveryOutcomes,
         runtime: &Arc<DiscoveryRuntime>,
     ) {
-        let Some(affinity) = self.affinity_nodes.lock().unwrap().upgrade() else {
+        let Some(view) = self.affinity_nodes.lock().unwrap().upgrade() else {
             return;
         };
         let mut tasks = self
@@ -969,18 +1017,22 @@ impl LiveNodes {
         {
             return;
         }
-        let ordinary_candidates = self.live_nodes.load().as_ref().clone();
+        let ordinary_candidates = self.ordinary.live_nodes.load().as_ref().clone();
+        let inputs = self.inputs.clone();
         tasks.affinity_task = self.tasks.spawn(&Handle::current(), async move {
-            affinity
-                .update_live_nodes_from(&mut outcomes, &ordinary_candidates)
+            view.update_live_nodes_from(&inputs, &mut outcomes, &ordinary_candidates, true)
                 .await;
         });
     }
+}
 
+impl NodeView {
     async fn update_live_nodes_from(
         &self,
+        inputs: &DiscoveryInputs,
         outcomes: &mut DiscoveryOutcomes,
         additional_candidates: &[Arc<Url>],
+        reuse_outcomes: bool,
     ) {
         let generation = self.begin_refresh();
         let mut scope = &self.routing_scope;
@@ -1000,18 +1052,15 @@ impl LiveNodes {
             let key = scope.discovery_operation();
             // Only the auxiliary view reuses outcomes. Ordinary discovery keeps
             // querying its configured scope chain, including repeated scopes.
-            let result = if let Some(cached) = self
-                .ordinary_nodes
-                .as_ref()
-                .and_then(|_| outcomes.get(&key))
-            {
+            let result = if let Some(cached) = outcomes.get(&key).filter(|_| reuse_outcomes) {
                 Some(cached.clone())
             } else if scope.is_cluster() {
-                let cluster_candidates = self.cluster_discovery_candidates(additional_candidates);
-                self.discover_cluster_live_nodes_from(generation, cluster_candidates)
+                let cluster_candidates =
+                    self.cluster_discovery_candidates(inputs, additional_candidates);
+                self.discover_cluster_live_nodes_from(inputs, generation, cluster_candidates)
                     .await
             } else {
-                self.fetch_live_nodes_for_scope(scope, &node_addr).await
+                inputs.fetch_live_nodes_for_scope(scope, &node_addr).await
             };
 
             // Failed probes do not stand for an empty scope and are not cached.
@@ -1021,7 +1070,7 @@ impl LiveNodes {
                 }
                 if candidates.is_empty() && !using_seeds {
                     using_seeds = true;
-                    candidates = self.seed_urls.clone().into();
+                    candidates = inputs.seed_urls.clone().into();
                 }
                 continue;
             };
@@ -1106,7 +1155,7 @@ fn node_is_in_list(node: &Url, nodes: &[Arc<Url>]) -> bool {
     })
 }
 
-impl Drop for LiveNodes {
+impl Drop for DiscoveryManager {
     fn drop(&mut self) {
         if let Ok(mut state) = self.discovery_tasks.lock() {
             if let Some(task) = state.active_task.take() {
@@ -1116,6 +1165,38 @@ impl Drop for LiveNodes {
                 task.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl LiveNodes {
+    fn discovery(&self) -> &Arc<DiscoveryManager> {
+        match &self.owner {
+            DiscoveryOwner::Ordinary(manager) => manager,
+            DiscoveryOwner::Auxiliary(_) => panic!("test expects an ordinary owner"),
+        }
+    }
+
+    fn inputs_mut(&mut self) -> &mut DiscoveryInputs {
+        let DiscoveryOwner::Ordinary(manager) = &mut self.owner else {
+            panic!("test expects an ordinary owner");
+        };
+        Arc::get_mut(&mut Arc::get_mut(manager).unwrap().inputs).unwrap()
+    }
+
+    async fn update_live_nodes(&self) -> DiscoveryOutcomes {
+        self.manager().unwrap().update_live_nodes().await
+    }
+
+    async fn update_live_nodes_from(
+        &self,
+        outcomes: &mut DiscoveryOutcomes,
+        additional_candidates: &[Arc<Url>],
+    ) {
+        let manager = self.manager().unwrap();
+        self.view
+            .update_live_nodes_from(&manager.inputs, outcomes, additional_candidates, true)
+            .await;
     }
 }
 
@@ -1136,7 +1217,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn discovery_is_running(nodes: &LiveNodes) -> bool {
-        nodes.discovery_runtime.load().is_some()
+        nodes.discovery().discovery_runtime.load().is_some()
     }
 
     fn test_config() -> AlternatorConfig {
@@ -1239,7 +1320,7 @@ mod tests {
             ["GET http://127.0.0.1:8000/localnodes"]
         );
         assert_eq!(
-            nodes.live_nodes.load()[0].as_str(),
+            nodes.view.live_nodes.load()[0].as_str(),
             "http://127.0.0.2:8000/"
         );
     }
@@ -1405,7 +1486,7 @@ mod tests {
         first_runtime.block_on(async {
             nodes.ensure_discovery_started();
         });
-        let original = nodes.discovery_runtime.load_full().unwrap();
+        let original = nodes.discovery().discovery_runtime.load_full().unwrap();
         second_runtime.block_on(async {
             for _ in 0..10 {
                 original.shutdown_probe.lock().unwrap().last_started = None;
@@ -1418,18 +1499,18 @@ mod tests {
                 .await
                 .expect("healthy owner must acknowledge without a blocking-pool probe");
                 assert!(Arc::ptr_eq(
-                    &nodes.discovery_runtime.load_full().unwrap(),
+                    &nodes.discovery().discovery_runtime.load_full().unwrap(),
                     &original
                 ));
                 tokio::time::timeout(Duration::from_secs(1), async {
-                    while nodes.tasks.active_task_count() != 1 {
+                    while nodes.discovery().tasks.active_task_count() != 1 {
                         tokio::task::yield_now().await;
                     }
                 })
                 .await
                 .expect("acknowledgement must cancel the observer's follow-up");
             }
-            tokio::time::timeout(Duration::from_secs(1), nodes.tasks.shutdown())
+            tokio::time::timeout(Duration::from_secs(1), nodes.discovery().tasks.shutdown())
                 .await
                 .expect("shutdown must join discovery on its healthy owner");
         });
@@ -1521,7 +1602,7 @@ mod tests {
         owner.block_on(async {
             nodes.ensure_discovery_started();
         });
-        let original = nodes.discovery_runtime.load_full().unwrap();
+        let original = nodes.discovery().discovery_runtime.load_full().unwrap();
         observer.block_on(async {
             tokio::time::timeout(Duration::from_secs(1), http.entered.acquire())
                 .await
@@ -1563,14 +1644,14 @@ mod tests {
             let cached = nodes.get_live_nodes();
             assert_eq!(cached[0].host_str(), Some("127.0.0.1"));
             tokio::time::timeout(Duration::from_secs(1), async {
-                while nodes.live_nodes.load()[0].host_str() != Some("127.0.0.2") {
+                while nodes.view.live_nodes.load()[0].host_str() != Some("127.0.0.2") {
                     tokio::task::yield_now().await;
                 }
             })
             .await
             .expect("one observing access must restart discovery without later demand");
         });
-        let replacement = nodes.discovery_runtime.load_full().unwrap();
+        let replacement = nodes.discovery().discovery_runtime.load_full().unwrap();
         assert_eq!(replacement.id, observer.handle().id());
         drop(release);
         observer.block_on(async {
@@ -1590,20 +1671,23 @@ mod tests {
             .await
             .unwrap();
             assert!(Arc::ptr_eq(
-                &nodes.discovery_runtime.load_full().unwrap(),
+                &nodes.discovery().discovery_runtime.load_full().unwrap(),
                 &replacement
             ));
-            assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("127.0.0.2"));
+            assert_eq!(
+                nodes.view.live_nodes.load()[0].host_str(),
+                Some("127.0.0.2")
+            );
             assert_eq!(
                 http.requests.load(Ordering::SeqCst),
                 2,
                 "cancelled old refresh must not resume discovery or publish"
             );
-            tokio::time::timeout(Duration::from_secs(1), nodes.tasks.shutdown())
+            tokio::time::timeout(Duration::from_secs(1), nodes.discovery().tasks.shutdown())
                 .await
                 .unwrap();
         });
-        assert_eq!(nodes.tasks.active_task_count(), 0);
+        assert_eq!(nodes.discovery().tasks.active_task_count(), 0);
     }
 
     #[test]
@@ -1632,27 +1716,27 @@ mod tests {
             nodes.ensure_discovery_started();
             tokio::task::yield_now().await;
         });
-        let registration = nodes.discovery_runtime.load_full().unwrap();
+        let registration = nodes.discovery().discovery_runtime.load_full().unwrap();
         let started = Instant::now();
         assert!(!registration.should_handoff_at(started));
         assert!(registration.should_handoff_at(started + SHUTDOWN_PROBE_INTERVAL));
         observer.block_on(async {
             nodes.ensure_discovery_started();
             assert_eq!(
-                nodes.discovery_runtime.load_full().unwrap().id,
+                nodes.discovery().discovery_runtime.load_full().unwrap().id,
                 observer.handle().id()
             );
             // Tokio cannot destroy an aborted task on a current-thread runtime
             // which is not being driven. Its join remains owned and pending.
-            assert!(nodes.tasks.shutdown().now_or_never().is_none());
+            assert!(nodes.discovery().tasks.shutdown().now_or_never().is_none());
         });
         owner.block_on(tokio::task::yield_now());
         observer.block_on(async {
-            tokio::time::timeout(Duration::from_secs(1), nodes.tasks.shutdown())
+            tokio::time::timeout(Duration::from_secs(1), nodes.discovery().tasks.shutdown())
                 .await
                 .unwrap();
         });
-        assert_eq!(nodes.tasks.active_task_count(), 0);
+        assert_eq!(nodes.discovery().tasks.active_task_count(), 0);
     }
 
     #[test]
@@ -1671,7 +1755,7 @@ mod tests {
             tokio::task::yield_now().await;
         });
         for index in 0..8 {
-            let previous = nodes.discovery_runtime.load_full().unwrap();
+            let previous = nodes.discovery().discovery_runtime.load_full().unwrap();
             let (next, old) = if index % 2 == 0 {
                 (&second, &first)
             } else {
@@ -1686,9 +1770,11 @@ mod tests {
                         });
                     }
                 });
-                assert_eq!(nodes.tasks.active_task_count(), 2);
+                assert_eq!(nodes.discovery().tasks.active_task_count(), 2);
                 tokio::time::timeout(Duration::from_secs(1), async {
-                    while nodes.discovery_runtime.load_full().unwrap().id != next.handle().id() {
+                    while nodes.discovery().discovery_runtime.load_full().unwrap().id
+                        != next.handle().id()
+                    {
                         tokio::task::yield_now().await;
                     }
                 })
@@ -1697,35 +1783,35 @@ mod tests {
             });
             old.block_on(tokio::task::yield_now());
             assert_eq!(
-                nodes.discovery_runtime.load_full().unwrap().id,
+                nodes.discovery().discovery_runtime.load_full().unwrap().id,
                 next.handle().id()
             );
             assert!(previous.stopped.load(Ordering::Acquire));
-            assert_eq!(nodes.tasks.active_task_count(), 1);
+            assert_eq!(nodes.discovery().tasks.active_task_count(), 1);
             // Completed tasks leave the tracker without a later spawn.
-            assert!(nodes.tasks.registered_task_count() <= 3);
+            assert!(nodes.discovery().tasks.registered_task_count() <= 3);
         }
-        let last_owner = nodes.discovery_runtime.load_full().unwrap();
+        let last_owner = nodes.discovery().discovery_runtime.load_full().unwrap();
         second.block_on(async {
             for _ in 0..8 {
                 nodes.ensure_discovery_started();
             }
-            assert_eq!(nodes.tasks.active_task_count(), 2);
-            assert!(nodes.tasks.shutdown().now_or_never().is_none());
+            assert_eq!(nodes.discovery().tasks.active_task_count(), 2);
+            assert!(nodes.discovery().tasks.shutdown().now_or_never().is_none());
             tokio::time::sleep(SHUTDOWN_PROBE_INTERVAL * 2).await;
             assert!(Arc::ptr_eq(
-                &nodes.discovery_runtime.load_full().unwrap(),
+                &nodes.discovery().discovery_runtime.load_full().unwrap(),
                 &last_owner
             ));
-            assert_eq!(nodes.tasks.active_task_count(), 1);
+            assert_eq!(nodes.discovery().tasks.active_task_count(), 1);
         });
         first.block_on(tokio::task::yield_now());
         first.block_on(async {
-            tokio::time::timeout(Duration::from_secs(1), nodes.tasks.shutdown())
+            tokio::time::timeout(Duration::from_secs(1), nodes.discovery().tasks.shutdown())
                 .await
                 .unwrap();
         });
-        assert_eq!(nodes.tasks.active_task_count(), 0);
+        assert_eq!(nodes.discovery().tasks.active_task_count(), 0);
     }
 
     #[test]
@@ -1736,23 +1822,29 @@ mod tests {
         let first = Arc::new(DiscoveryRuntime::new(first_runtime.handle().id()));
         let second = Arc::new(DiscoveryRuntime::new(second_runtime.handle().id()));
 
-        nodes.discovery_runtime.store(Some(first.clone()));
+        nodes
+            .discovery()
+            .discovery_runtime
+            .store(Some(first.clone()));
         let stale_guard = DiscoveryTaskGuard {
-            live_nodes: Arc::downgrade(&nodes),
+            manager: Arc::downgrade(nodes.discovery()),
             runtime: first,
         };
-        nodes.discovery_runtime.store(Some(second.clone()));
+        nodes
+            .discovery()
+            .discovery_runtime
+            .store(Some(second.clone()));
 
         drop(stale_guard);
 
-        let active = nodes.discovery_runtime.load_full().unwrap();
+        let active = nodes.discovery().discovery_runtime.load_full().unwrap();
         assert!(Arc::ptr_eq(&active, &second));
 
         drop(DiscoveryTaskGuard {
-            live_nodes: Arc::downgrade(&nodes),
+            manager: Arc::downgrade(nodes.discovery()),
             runtime: second,
         });
-        assert!(nodes.discovery_runtime.load().is_none());
+        assert!(nodes.discovery().discovery_runtime.load().is_none());
     }
 
     #[test]
@@ -1944,10 +2036,16 @@ mod tests {
             .seed_hosts(["::1"])
             .build();
         let nodes = LiveNodes::new(&config).unwrap();
-        assert_eq!(nodes.seed_urls[0].scheme(), "http");
-        assert_eq!(nodes.seed_urls[0].host_str(), Some("[::1]"));
-        assert_eq!(nodes.seed_urls[0].port(), Some(8000));
-        assert_eq!(nodes.seed_urls[0].to_string(), "http://[::1]:8000/");
+        assert_eq!(nodes.discovery().inputs.seed_urls[0].scheme(), "http");
+        assert_eq!(
+            nodes.discovery().inputs.seed_urls[0].host_str(),
+            Some("[::1]")
+        );
+        assert_eq!(nodes.discovery().inputs.seed_urls[0].port(), Some(8000));
+        assert_eq!(
+            nodes.discovery().inputs.seed_urls[0].to_string(),
+            "http://[::1]:8000/"
+        );
     }
 
     #[test]
@@ -1959,8 +2057,14 @@ mod tests {
             .build();
         let nodes = LiveNodes::new(&config).unwrap();
 
-        assert_eq!(nodes.seed_urls[0].host_str(), Some("[::1]"));
-        assert_eq!(nodes.seed_urls[0].to_string(), "http://[::1]:8000/");
+        assert_eq!(
+            nodes.discovery().inputs.seed_urls[0].host_str(),
+            Some("[::1]")
+        );
+        assert_eq!(
+            nodes.discovery().inputs.seed_urls[0].to_string(),
+            "http://[::1]:8000/"
+        );
     }
 
     #[tokio::test]
@@ -1977,7 +2081,7 @@ mod tests {
 
         server.await.unwrap();
         assert_eq!(
-            nodes.live_nodes.load()[0].as_str(),
+            nodes.view.live_nodes.load()[0].as_str(),
             format!("http://[::1]:{port}/")
         );
     }
@@ -1997,7 +2101,7 @@ mod tests {
         nodes.update_live_nodes().await;
 
         server.await.unwrap();
-        let snapshot = nodes.live_nodes.load();
+        let snapshot = nodes.view.live_nodes.load();
         let hosts = snapshot
             .iter()
             .map(|url| url.host_str().unwrap().to_string())
@@ -2021,7 +2125,7 @@ mod tests {
         nodes.update_live_nodes().await;
 
         server.await.unwrap();
-        let snapshot = nodes.live_nodes.load();
+        let snapshot = nodes.view.live_nodes.load();
         let hosts_and_ports = snapshot
             .iter()
             .map(|url| (url.host_str().unwrap().to_string(), url.port()))
@@ -2082,13 +2186,18 @@ mod tests {
         let nodes = LiveNodes::new(&config).unwrap();
         let stale = Arc::new(Url::parse("http://stale.test/").unwrap());
         let healthy = Arc::new(Url::parse("http://healthy.test/").unwrap());
-        nodes.live_nodes.store(Arc::new(vec![stale.clone()]));
-        let candidates = vec![nodes.seed_urls[0].clone(), stale.clone()];
-        let generation = nodes.begin_refresh();
+        nodes.view.live_nodes.store(Arc::new(vec![stale.clone()]));
+        let candidates = vec![nodes.discovery().inputs.seed_urls[0].clone(), stale.clone()];
+        let generation = nodes.view.begin_refresh();
         let discovery_nodes = nodes.clone();
         let discovery = tokio::spawn(async move {
             discovery_nodes
-                .discover_cluster_live_nodes_from(generation, candidates)
+                .view
+                .discover_cluster_live_nodes_from(
+                    &discovery_nodes.discovery().inputs,
+                    generation,
+                    candidates,
+                )
                 .await
         });
 
@@ -2100,7 +2209,7 @@ mod tests {
             "cluster discovery unexpectedly finished while a candidate was stalled"
         );
         assert_eq!(
-            nodes.live_nodes.load().as_ref(),
+            nodes.view.live_nodes.load().as_ref(),
             &[healthy.clone(), stale.clone()],
             "partial publication must add newly validated nodes without dropping last-known-good nodes"
         );
@@ -2168,7 +2277,7 @@ mod tests {
             .unwrap();
         first_update.await.unwrap();
 
-        let snapshot = nodes.live_nodes.load();
+        let snapshot = nodes.view.live_nodes.load();
         let hosts = snapshot
             .iter()
             .map(|node| node.host_str().unwrap())
@@ -2183,13 +2292,13 @@ mod tests {
     #[test]
     fn newer_refresh_without_a_result_does_not_suppress_older_result() {
         let nodes = LiveNodes::new(&test_config()).unwrap();
-        let older_generation = nodes.begin_refresh();
-        let _newer_generation = nodes.begin_refresh();
+        let older_generation = nodes.view.begin_refresh();
+        let _newer_generation = nodes.view.begin_refresh();
         let older_result = vec![Arc::new(Url::parse("http://127.0.0.2:1/").unwrap())];
 
         nodes.publish_live_nodes(older_generation, older_result.clone());
 
-        assert_eq!(nodes.live_nodes.load().as_ref(), &older_result);
+        assert_eq!(nodes.view.live_nodes.load().as_ref(), &older_result);
     }
 
     #[tokio::test]
@@ -2204,7 +2313,7 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
             ],
         );
-        Arc::get_mut(&mut nodes).unwrap().client = DiscoveryHttpClient::Reqwest(
+        Arc::get_mut(&mut nodes).unwrap().inputs_mut().client = DiscoveryHttpClient::Reqwest(
             discovery_http_client_builder("http")
                 .unwrap()
                 .timeout(Duration::from_millis(200))
@@ -2224,7 +2333,10 @@ mod tests {
             .await
             .expect("discovery must not hang when both address families are unavailable");
 
-        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("dual.test"));
+        assert_eq!(
+            nodes.view.live_nodes.load()[0].host_str(),
+            Some("dual.test")
+        );
     }
 
     #[tokio::test]
@@ -2236,7 +2348,7 @@ mod tests {
             .seed_hosts(["::1"])
             .build();
         let nodes = LiveNodes::new(&config).unwrap();
-        nodes.live_nodes.store(Arc::new(vec![Arc::new(
+        nodes.view.live_nodes.store(Arc::new(vec![Arc::new(
             Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
         )]));
 
@@ -2244,7 +2356,7 @@ mod tests {
 
         server.await.unwrap();
         assert_eq!(
-            nodes.live_nodes.load()[0].as_str(),
+            nodes.view.live_nodes.load()[0].as_str(),
             format!("http://[::1]:{port}/")
         );
     }
@@ -2261,7 +2373,7 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
             ],
         );
-        nodes.live_nodes.store(Arc::new(vec![Arc::new(
+        nodes.view.live_nodes.store(Arc::new(vec![Arc::new(
             Url::parse(&format!("http://127.0.0.3:{port}/")).unwrap(),
         )]));
 
@@ -2272,7 +2384,7 @@ mod tests {
             .expect("recovery never reached a usable seed address")
             .unwrap();
         assert_eq!(
-            nodes.live_nodes.load()[0].as_str(),
+            nodes.view.live_nodes.load()[0].as_str(),
             format!("http://recovered.internal:{port}/")
         );
     }
@@ -2288,7 +2400,10 @@ mod tests {
             .await
             .expect("discovery never reached a usable seed address")
             .unwrap();
-        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("dual.test"));
+        assert_eq!(
+            nodes.view.live_nodes.load()[0].host_str(),
+            Some("dual.test")
+        );
     }
 
     fn dns_live_nodes(port: u16, resolved_ips: &[IpAddr]) -> Arc<LiveNodes> {
@@ -2302,7 +2417,7 @@ mod tests {
             .iter()
             .map(|ip| SocketAddr::new(*ip, port))
             .collect::<Vec<_>>();
-        Arc::get_mut(&mut nodes).unwrap().client = DiscoveryHttpClient::Reqwest(
+        Arc::get_mut(&mut nodes).unwrap().inputs_mut().client = DiscoveryHttpClient::Reqwest(
             discovery_http_client_builder("http")
                 .unwrap()
                 .timeout(Duration::from_secs(1))
@@ -2316,6 +2431,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct ScopedDiscoveryHttpClient {
         responses: Arc<Mutex<HashMap<String, &'static str>>>,
+        scripted_responses: Arc<Mutex<HashMap<String, VecDeque<&'static str>>>>,
         requests: Arc<Mutex<Vec<String>>>,
         hosts: Arc<Mutex<Vec<String>>>,
         failed_hosts: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -2340,11 +2456,12 @@ mod tests {
             let query = url.query().unwrap_or_default().to_string();
             self.requests.lock().unwrap().push(query.clone());
             let body = self
-                .responses
+                .scripted_responses
                 .lock()
                 .unwrap()
-                .get(&query)
-                .copied()
+                .get_mut(&query)
+                .and_then(VecDeque::pop_front)
+                .or_else(|| self.responses.lock().unwrap().get(&query).copied())
                 .unwrap_or("invalid response");
             let host = url.host_str().unwrap().to_string();
             self.hosts.lock().unwrap().push(host.clone());
@@ -2371,6 +2488,7 @@ mod tests {
     ) -> (AlternatorConfig, ScopedDiscoveryHttpClient) {
         let transport = ScopedDiscoveryHttpClient {
             responses: Arc::new(Mutex::new(HashMap::new())),
+            scripted_responses: Arc::new(Mutex::new(HashMap::new())),
             requests: Arc::new(Mutex::new(Vec::new())),
             hosts: Arc::new(Mutex::new(Vec::new())),
             failed_hosts: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2384,6 +2502,42 @@ mod tests {
             .http_client(transport.clone())
             .build();
         (config, transport)
+    }
+
+    #[tokio::test]
+    async fn repeated_ordinary_scope_retries_after_empty_and_publishes_first_usable_response() {
+        let rack = RoutingScope::from_rack("dc1".into(), "r1".into());
+        let scope = rack
+            .clone()
+            .with_fallback(rack.clone())
+            .with_fallback(RoutingScope::from_datacenter("dc1".into()));
+        let (config, transport) = scoped_discovery_config(scope);
+        transport
+            .scripted_responses
+            .lock()
+            .unwrap()
+            .insert("dc=dc1&rack=r1".into(), ["[]", r#"["usable.test"]"#].into());
+        transport
+            .responses
+            .lock()
+            .unwrap()
+            .insert("dc=dc1".into(), r#"["later-fallback.test"]"#);
+        let ordinary = LiveNodes::new(&config).unwrap();
+
+        let outcomes = ordinary.update_live_nodes().await;
+
+        assert_eq!(
+            *transport.requests.lock().unwrap(),
+            ["dc=dc1&rack=r1", "dc=dc1&rack=r1"]
+        );
+        assert_eq!(
+            ordinary.view.live_nodes.load()[0].host_str(),
+            Some("usable.test")
+        );
+        assert_eq!(
+            outcomes[&rack.discovery_operation()][0].host_str(),
+            Some("usable.test")
+        );
     }
 
     #[tokio::test]
@@ -2404,14 +2558,17 @@ mod tests {
         let mut outcomes = ordinary.update_live_nodes().await;
         transport.requests.lock().unwrap().clear();
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         // The preferred DC is tried first. The selected DC2 snapshot then satisfies
         // the affinity fallback, so its endpoint is not queried a second time.
         assert_eq!(*transport.requests.lock().unwrap(), ["dc=dc1"]);
         assert_eq!(
-            affinity.live_nodes.load().as_ref(),
-            ordinary.live_nodes.load().as_ref()
+            affinity.view.live_nodes.load().as_ref(),
+            ordinary.view.live_nodes.load().as_ref()
         );
 
         transport.responses.lock().unwrap().extend([
@@ -2421,18 +2578,22 @@ mod tests {
         let mut outcomes = ordinary.update_live_nodes().await;
         transport.requests.lock().unwrap().clear();
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert_eq!(*transport.requests.lock().unwrap(), ["dc=dc1"]);
-        assert_eq!(affinity.live_nodes.load().len(), 2);
+        assert_eq!(affinity.view.live_nodes.load().len(), 2);
         assert!(
             affinity
+                .view
                 .live_nodes
                 .load()
                 .iter()
                 .all(|node| node.host_str().unwrap().starts_with("dc1-"))
         );
-        assert_eq!(ordinary.live_nodes.load().len(), 1);
+        assert_eq!(ordinary.view.live_nodes.load().len(), 1);
     }
 
     #[tokio::test]
@@ -2449,7 +2610,10 @@ mod tests {
         let mut outcomes = ordinary.update_live_nodes().await;
         transport.requests.lock().unwrap().clear();
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert!(transport.requests.lock().unwrap().is_empty());
 
@@ -2458,14 +2622,20 @@ mod tests {
             ("dc=dc1".into(), r#"["recovered.test"]"#),
         ]);
         let mut outcomes = ordinary.update_live_nodes().await;
-        assert_eq!(ordinary.live_nodes.load()[0].host_str(), Some("first.test"));
+        assert_eq!(
+            ordinary.view.live_nodes.load()[0].host_str(),
+            Some("first.test")
+        );
         transport.requests.lock().unwrap().clear();
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert_eq!(*transport.requests.lock().unwrap(), ["dc=dc1"]);
         assert_eq!(
-            affinity.live_nodes.load()[0].host_str(),
+            affinity.view.live_nodes.load()[0].host_str(),
             Some("recovered.test")
         );
 
@@ -2477,12 +2647,15 @@ mod tests {
         let mut outcomes = ordinary.update_live_nodes().await;
         transport.requests.lock().unwrap().clear();
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert!(transport.requests.lock().unwrap().is_empty());
         assert_eq!(
-            ordinary.live_nodes.load().as_ref(),
-            affinity.live_nodes.load().as_ref()
+            ordinary.view.live_nodes.load().as_ref(),
+            affinity.view.live_nodes.load().as_ref()
         );
 
         // Failure of the distinct DC refresh cannot clear either view or replace
@@ -2493,11 +2666,17 @@ mod tests {
         ]);
         let mut outcomes = ordinary.update_live_nodes().await;
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
-        assert_eq!(ordinary.live_nodes.load()[0].host_str(), Some("rack.test"));
         assert_eq!(
-            affinity.live_nodes.load()[0].host_str(),
+            ordinary.view.live_nodes.load()[0].host_str(),
+            Some("rack.test")
+        );
+        assert_eq!(
+            affinity.view.live_nodes.load()[0].host_str(),
             Some("recovered.test")
         );
         transport
@@ -2507,10 +2686,13 @@ mod tests {
             .insert("dc=dc1".into(), r#"["dc-recovered.test"]"#);
         let mut outcomes = ordinary.update_live_nodes().await;
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert_eq!(
-            affinity.live_nodes.load()[0].host_str(),
+            affinity.view.live_nodes.load()[0].host_str(),
             Some("dc-recovered.test")
         );
     }
@@ -2533,10 +2715,16 @@ mod tests {
         let mut outcomes = ordinary.update_live_nodes().await;
         let before = transport.requests.lock().unwrap().len();
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert_eq!(transport.requests.lock().unwrap().len(), before);
-        assert_eq!(affinity.live_nodes.load()[0].host_str(), Some("dc2.test"));
+        assert_eq!(
+            affinity.view.live_nodes.load()[0].host_str(),
+            Some("dc2.test")
+        );
         transport
             .responses
             .lock()
@@ -2544,9 +2732,15 @@ mod tests {
             .insert("dc=dc1".into(), r#"["dc1.test"]"#);
         let mut outcomes = ordinary.update_live_nodes().await;
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
-        assert_eq!(affinity.live_nodes.load()[0].host_str(), Some("dc1.test"));
+        assert_eq!(
+            affinity.view.live_nodes.load()[0].host_str(),
+            Some("dc1.test")
+        );
         assert_eq!(
             transport
                 .requests
@@ -2599,10 +2793,14 @@ mod tests {
             *transport.requests.lock().unwrap(),
             ["dc=dc1&rack=missing", "dc=dc1"]
         );
-        assert!(affinity.discovery_runtime.load().is_none());
+        assert!(Arc::ptr_eq(
+            &affinity.manager().unwrap(),
+            ordinary.discovery()
+        ));
         transport.delays.lock().unwrap().remove("dc=dc1");
         release.notify_waiters();
-        wait_for_discovery(|| affinity.live_nodes.load()[0].host_str() == Some("fresh.test")).await;
+        wait_for_discovery(|| affinity.view.live_nodes.load()[0].host_str() == Some("fresh.test"))
+            .await;
         assert_eq!(
             transport
                 .requests
@@ -2615,7 +2813,10 @@ mod tests {
         );
         let mut outcomes = ordinary.update_live_nodes().await;
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert_eq!(
             transport
@@ -2647,14 +2848,17 @@ mod tests {
             .insert("seed.test".into());
         transport.hosts.lock().unwrap().clear();
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert_eq!(
             *transport.hosts.lock().unwrap(),
             ["seed.test", "learned.test"]
         );
-        assert_eq!(ordinary.live_nodes.load().len(), 1);
-        assert_eq!(affinity.live_nodes.load().len(), 2);
+        assert_eq!(ordinary.view.live_nodes.load().len(), 1);
+        assert_eq!(affinity.view.live_nodes.load().len(), 2);
     }
 
     #[tokio::test]
@@ -2692,7 +2896,10 @@ mod tests {
                     >= 3
             })
             .await;
-            assert_eq!(ordinary.live_nodes.load()[0].host_str(), Some("rack.test"));
+            assert_eq!(
+                ordinary.view.live_nodes.load()[0].host_str(),
+                Some("rack.test")
+            );
             assert_eq!(
                 transport
                     .requests
@@ -2704,6 +2911,7 @@ mod tests {
                 1
             );
             let task = ordinary
+                .discovery()
                 .discovery_tasks
                 .lock()
                 .unwrap()
@@ -2712,17 +2920,23 @@ mod tests {
                 .unwrap()
                 .clone();
             if shutdown {
-                tokio::time::timeout(Duration::from_secs(1), ordinary.tasks.shutdown())
-                    .await
-                    .expect("shutdown must join stalled optional affinity discovery");
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    ordinary.discovery().tasks.shutdown(),
+                )
+                .await
+                .expect("shutdown must join stalled optional affinity discovery");
                 assert!(task.is_finished());
-                assert_eq!(ordinary.tasks.registered_task_count(), 0);
+                assert_eq!(ordinary.discovery().tasks.registered_task_count(), 0);
             }
             let weak_owner = Arc::downgrade(&ordinary);
             drop(ordinary);
             wait_for_discovery(|| task.is_finished() && weak_owner.upgrade().is_none()).await;
-            assert!(affinity.discovery_runtime.load().is_none());
-            assert_eq!(affinity.live_nodes.load()[0].host_str(), Some("seed.test"));
+            assert!(affinity.manager().is_none());
+            assert_eq!(
+                affinity.view.live_nodes.load()[0].host_str(),
+                Some("seed.test")
+            );
         }
     }
     #[test]
@@ -2754,6 +2968,7 @@ mod tests {
             .await;
         });
         let old_task = ordinary
+            .discovery()
             .discovery_tasks
             .lock()
             .unwrap()
@@ -2763,7 +2978,7 @@ mod tests {
             .clone();
         // Exercise the same ownership transfer selected by the bounded runtime
         // liveness probe, while the old runtime can still drop its guard.
-        let registration = ordinary.discovery_runtime.load_full().unwrap();
+        let registration = ordinary.discovery().discovery_runtime.load_full().unwrap();
         let started = Instant::now() - SHUTDOWN_PROBE_INTERVAL;
         {
             let mut probe = registration.shutdown_probe.lock().unwrap();
@@ -2786,11 +3001,18 @@ mod tests {
             })
             .await;
             assert_eq!(
-                ordinary.discovery_runtime.load().as_ref().unwrap().id,
+                ordinary
+                    .discovery()
+                    .discovery_runtime
+                    .load()
+                    .as_ref()
+                    .unwrap()
+                    .id,
                 second.handle().id()
             );
             assert!(
                 !ordinary
+                    .discovery()
                     .discovery_tasks
                     .lock()
                     .unwrap()
@@ -2799,7 +3021,10 @@ mod tests {
                     .unwrap()
                     .is_finished()
             );
-            assert!(affinity.discovery_runtime.load().is_none());
+            assert!(Arc::ptr_eq(
+                &affinity.manager().unwrap(),
+                ordinary.discovery()
+            ));
         });
     }
 
@@ -2815,20 +3040,27 @@ mod tests {
         // matching runtime IDs do not make the old registration current.
         let current_registration = Arc::new(DiscoveryRuntime::new(handle.id()));
         ordinary
+            .discovery()
             .discovery_runtime
             .store(Some(current_registration.clone()));
-        ordinary.start_affinity_refresh(DiscoveryOutcomes::new(), &old_registration);
+        ordinary
+            .discovery()
+            .start_affinity_refresh(DiscoveryOutcomes::new(), &old_registration);
         assert!(
             ordinary
+                .discovery()
                 .discovery_tasks
                 .lock()
                 .unwrap()
                 .affinity_task
                 .is_none()
         );
-        ordinary.start_affinity_refresh(DiscoveryOutcomes::new(), &current_registration);
+        ordinary
+            .discovery()
+            .start_affinity_refresh(DiscoveryOutcomes::new(), &current_registration);
         assert!(
             ordinary
+                .discovery()
                 .discovery_tasks
                 .lock()
                 .unwrap()
@@ -2857,11 +3089,13 @@ mod tests {
         ordinary.ensure_discovery_started();
         // Startup marks activity. Age it only after startup, before the queued
         // task first runs, so no prior idle notification can satisfy the wake.
-        *ordinary.last_activity.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        *ordinary.discovery().last_activity.lock().unwrap() =
+            Instant::now() - Duration::from_secs(60);
         wait_for_discovery(|| {
-            ordinary.live_nodes.load()[0].host_str() == Some("rack.test")
-                && affinity.live_nodes.load()[0].host_str() == Some("dc.test")
+            ordinary.view.live_nodes.load()[0].host_str() == Some("rack.test")
+                && affinity.view.live_nodes.load()[0].host_str() == Some("dc.test")
                 && ordinary
+                    .discovery()
                     .discovery_tasks
                     .lock()
                     .unwrap()
@@ -2917,14 +3151,18 @@ mod tests {
         transport.requests.lock().unwrap().clear();
         transport.hosts.lock().unwrap().clear();
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert_eq!(
-            ordinary.live_nodes.load()[0].host_str(),
+            ordinary.view.live_nodes.load()[0].host_str(),
             Some("learned.test")
         );
         assert_eq!(
             affinity
+                .view
                 .live_nodes
                 .load()
                 .iter()
@@ -2965,14 +3203,17 @@ mod tests {
         );
         transport.requests.lock().unwrap().clear();
         affinity
-            .update_live_nodes_from(&mut outcomes, &ordinary.live_nodes.load().as_ref().clone())
+            .update_live_nodes_from(
+                &mut outcomes,
+                &ordinary.view.live_nodes.load().as_ref().clone(),
+            )
             .await;
         assert_eq!(*transport.requests.lock().unwrap(), ["dc=dc1"]);
         assert_eq!(
-            affinity.live_nodes.load().as_ref(),
-            ordinary.live_nodes.load().as_ref()
+            affinity.view.live_nodes.load().as_ref(),
+            ordinary.view.live_nodes.load().as_ref()
         );
-        assert_eq!(affinity.live_nodes.load().len(), 2);
+        assert_eq!(affinity.view.live_nodes.load().len(), 2);
     }
 
     #[test]
@@ -3003,7 +3244,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("closed-runtime discovery startup must return");
             worker.join().unwrap();
-            assert!(ordinary.discovery_runtime.load().is_none());
+            assert!(ordinary.discovery().discovery_runtime.load().is_none());
             let replacement = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -3017,7 +3258,13 @@ mod tests {
                         .is_empty()
                 );
                 assert_eq!(
-                    ordinary.discovery_runtime.load().as_ref().unwrap().id,
+                    ordinary
+                        .discovery()
+                        .discovery_runtime
+                        .load()
+                        .as_ref()
+                        .unwrap()
+                        .id,
                     replacement.handle().id()
                 );
             });

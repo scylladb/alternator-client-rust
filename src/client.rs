@@ -76,7 +76,7 @@ struct ClientDiscovery {
 impl ClientDiscovery {
     fn stop(&self) {
         for nodes in &self.topology {
-            nodes.tasks.stop();
+            nodes.tasks().stop();
         }
         if let Some(resolver) = &self.partition_keys {
             resolver.tasks.stop();
@@ -435,9 +435,7 @@ impl AlternatorClient {
         let direct_scheme = live_nodes
             .is_none()
             .then(|| config.scheme().unwrap_or_else(|| "http".to_string()));
-        let uses_plaintext_transport = live_nodes
-            .as_ref()
-            .is_some_and(|nodes| nodes.scheme() == "http")
+        let uses_plaintext_transport = live_nodes.as_ref().is_some_and(|nodes| nodes.uses_http())
             || direct_scheme
                 .as_deref()
                 .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"));
@@ -551,7 +549,7 @@ impl AlternatorClient {
     pub async fn shutdown(&self) {
         self.discovery.stop();
         for nodes in &self.discovery.topology {
-            nodes.tasks.shutdown().await;
+            nodes.tasks().shutdown().await;
         }
         if let Some(resolver) = &self.discovery.partition_keys {
             resolver.tasks.shutdown().await;
