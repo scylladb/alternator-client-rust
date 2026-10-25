@@ -420,3 +420,102 @@ fn shutdown_does_not_wait_for_an_unrelated_saturated_blocking_pool() {
             .unwrap();
     });
 }
+
+#[tokio::test(start_paused = true)]
+async fn partition_key_discovery_uses_explicit_short_and_long_deadlines() {
+    for discovery_timeout in [Duration::from_millis(250), Duration::from_secs(10)] {
+        let http = DiscoveryHttp::new(false, true);
+        let client = AlternatorClient::from_conf(
+            http.config()
+                .to_builder()
+                .timeout_config(
+                    aws_smithy_types::timeout::TimeoutConfig::builder()
+                        .operation_timeout(Duration::from_secs(1))
+                        .operation_attempt_timeout(Duration::from_secs(1))
+                        .build(),
+                )
+                .discovery_timeout(discovery_timeout)
+                .build(),
+        );
+        put_item(&client, "users").await;
+        http.wait_entered().await;
+        let before_deadline = if discovery_timeout > Duration::from_secs(5) {
+            Duration::from_secs(6)
+        } else {
+            discovery_timeout / 2
+        };
+        tokio::time::advance(before_deadline).await;
+        assert_eq!(
+            http.dropped.available_permits(),
+            0,
+            "explicit discovery deadline must replace inherited data deadline"
+        );
+        assert_eq!(http.describes.load(Ordering::SeqCst), 1);
+        tokio::time::advance(discovery_timeout - before_deadline).await;
+        // Remain runnable so paused time cannot advance through retry backoff.
+        for _ in 0..1000 {
+            if http.dropped.available_permits() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(http.dropped.available_permits(), 1);
+        assert_eq!(http.describes.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(1), client.shutdown())
+            .await
+            .expect("deadline test cleanup must finish");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unset_discovery_timeout_keeps_partition_key_sdk_deadline() {
+    let http = DiscoveryHttp::new(false, true);
+    let client = AlternatorClient::from_conf(
+        http.config()
+            .to_builder()
+            .timeout_config(
+                aws_smithy_types::timeout::TimeoutConfig::builder()
+                    .operation_timeout(Duration::from_secs(8))
+                    .build(),
+            )
+            .build(),
+    );
+    assert_eq!(client.config().discovery_timeout(), None);
+    put_item(&client, "users").await;
+    http.wait_entered().await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert_eq!(
+        http.dropped.available_permits(),
+        0,
+        "legacy PK timeout must not gain topology's default5s cap"
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..1000 {
+        if http.dropped.available_permits() > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(http.dropped.available_permits(), 1);
+    tokio::time::timeout(Duration::from_secs(1), client.shutdown())
+        .await
+        .expect("deadline test cleanup must finish");
+}
+
+#[test]
+fn invalid_discovery_timeouts_fail_before_network() {
+    let http = DiscoveryHttp::new(true, true);
+    for timeout in [Duration::ZERO, Duration::MAX] {
+        let error = AlternatorClient::try_from_conf(
+            http.config()
+                .to_builder()
+                .discovery_timeout(timeout)
+                .build(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("discovery_timeout"));
+    }
+    assert_eq!(http.localnodes_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(http.describes.load(Ordering::SeqCst), 0);
+    assert_eq!(http.entered.available_permits(), 0);
+}
