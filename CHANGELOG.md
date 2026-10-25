@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-25
+
 ### Fixed
 
 - Eligible key-affinity requests use every rack in the selected datacenter while
@@ -22,5 +24,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Request and response compression, custom HTTP clients, and native TLS roots.
 - DynamoDB client, configuration, and builder API compatibility checks.
 
-[Unreleased]: https://github.com/scylladb/alternator-client-rust/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/scylladb/alternator-client-rust/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/scylladb/alternator-client-rust/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/scylladb/alternator-client-rust/releases/tag/v1.0.0
