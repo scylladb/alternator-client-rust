@@ -1174,6 +1174,78 @@ mod tests {
         (port, server)
     }
 
+    #[tokio::test]
+    async fn reqwest_topology_deadlines_cover_delayed_response_bodies() {
+        for deadline in [Duration::from_millis(250), Duration::from_secs(10)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let config = AlternatorConfig::builder()
+                .seed_hosts(["127.0.0.1"])
+                .port(port)
+                .discovery_timeout(deadline)
+                .build();
+            let nodes = LiveNodes::new(&config).unwrap();
+            let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+            let (finished, request_finished) = tokio::sync::oneshot::channel();
+            let long_deadline = deadline > Duration::from_secs(5);
+
+            let server = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut buffer = [0; 512];
+                    let length = stream.read(&mut buffer).await.unwrap();
+                    assert!(length > 0, "request ended before its headers");
+                    request.extend_from_slice(&buffer[..length]);
+                }
+                assert!(request.starts_with(b"GET /localnodes HTTP/1.1\r\n"));
+                let body = r#"["127.0.0.2"]"#;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n[",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                headers_sent.send(()).unwrap();
+                if long_deadline {
+                    // Real time keeps socket readiness independent of Tokio's
+                    // paused-clock auto-advance. Cross the former five-second cap.
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    stream.write_all(&body.as_bytes()[1..]).await.unwrap();
+                }
+                // Keep an incomplete short response open until the client expires.
+                request_finished.await.unwrap();
+            };
+            let fetch = async {
+                let started = Instant::now();
+                let result = nodes
+                    .fetch_live_nodes_for_scope(&nodes.routing_scope, &nodes.seed_urls[0])
+                    .await;
+                let elapsed = started.elapsed();
+                finished.send(()).unwrap();
+                headers_received.await.unwrap();
+                if long_deadline {
+                    let discovered =
+                        result.expect("configured Reqwest deadline must allow a slow body");
+                    assert_eq!(discovered.len(), 1);
+                    assert_eq!(discovered[0].host_str(), Some("127.0.0.2"));
+                    assert!(elapsed >= Duration::from_secs(6));
+                } else {
+                    assert!(result.is_none(), "incomplete response must expire");
+                    assert!(
+                        elapsed >= deadline - Duration::from_millis(5),
+                        "request failed before its deadline: {elapsed:?}"
+                    );
+                }
+            };
+            // Both futures and their sockets are dropped on a timeout or panic.
+            tokio::time::timeout(deadline + Duration::from_secs(2), async {
+                tokio::join!(server, fetch);
+            })
+            .await
+            .expect("loopback discovery exceeded its bounded deadline");
+        }
+    }
+
     fn start_runtime_restart_server() -> (u16, Arc<AtomicUsize>, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
 
