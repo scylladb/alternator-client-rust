@@ -15,13 +15,19 @@
 
 set -euo pipefail
 
-[[ $# -eq 2 ]] || {
-    echo "usage: $0 VERSION COMMIT_SHA" >&2
+dry_run=false
+if [[ "${1:-}" == --dry-run ]]; then
+    dry_run=true
+    shift
+fi
+[[ $# -ge 2 && $# -le 3 ]] || {
+    echo "usage: $0 [--dry-run] VERSION COMMIT_SHA [EXPECTED_RC_TAG]" >&2
     exit 2
 }
 
 version=$1
 commit_sha=$2
+expected_rc_tag=${3:-}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 run_id=${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}
 run_attempt=${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}
@@ -57,7 +63,14 @@ else
     done < <(git tag -l "v$version-rc.*")
     rc_number=$((max_rc + 1))
     rc_tag="v$version-rc.$rc_number"
+fi
 
+[[ -z "$expected_rc_tag" || "$rc_tag" == "$expected_rc_tag" ]] || {
+    echo "RC allocation differs from the verified candidate: $rc_tag" >&2
+    exit 1
+}
+
+if [[ -z "$matched_tag" && "$dry_run" == false ]]; then
     bash "$script_dir/check-release-blockers.sh"
     git tag -s "$rc_tag" "$commit_sha" -m "Release candidate $rc_tag
 

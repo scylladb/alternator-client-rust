@@ -22,8 +22,11 @@ written to a temporary file or included in command-line arguments. Each signing
 step receives its secret explicitly; setup does not write it into `GITHUB_ENV`. Git configuration is job-specific
 and inherited by release-tool clones. Always run `signing.py cleanup` after a CI job.
 
-The release workflow creates the signed version/changelog commit, RC tag, and
-final tag. It receives signing secrets only after `scylladb/drivers` approval.
+The release workflow prepares and tests a reproducible unsigned version/changelog
+commit without signing credentials. After its single `scylladb/drivers` approval,
+it receives signing secrets and creates signed RC and final tags at that exact
+commit, plus detached signatures for the release assets. Signing the commit
+itself at that point would change the SHA embedded in the tested crate.
 Do not duplicate these secrets at repository or organization scope.
 
 For offline signing validation, use an isolated invocation:

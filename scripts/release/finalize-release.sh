@@ -15,16 +15,17 @@
 
 set -euo pipefail
 
-[[ $# -eq 5 ]] || {
-    echo "usage: $0 VERSION RC_TAG COMMIT_SHA CANDIDATE_DIR EVIDENCE_FILE" >&2
+[[ $# -eq 6 && ( "$1" == prepare || "$1" == publish ) ]] || {
+    echo "usage: $0 {prepare|publish} VERSION RC_TAG COMMIT_SHA CANDIDATE_DIR EVIDENCE_FILE" >&2
     exit 2
 }
 
-version=$1
-rc_tag=$2
-commit_sha=$3
-candidate_dir=$4
-evidence_file=$5
+phase=$1
+version=$2
+rc_tag=$3
+commit_sha=$4
+candidate_dir=$5
+evidence_file=$6
 package_name=alternator-client
 final_tag="v$version"
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -56,13 +57,17 @@ jq -e --arg rc_tag "$rc_tag" --arg commit "$commit_sha" '
 state_file=$(mktemp)
 GITHUB_OUTPUT="$state_file" scripts/release/registry-state.sh \
     "$package_name" "$version" "$candidate_dir/$crate_file" >/dev/null
-[[ "$(awk -F= '$1 == "state" { print $2 }' "$state_file")" == exact ]] || {
+registry_state=$(awk -F= '$1 == "state" { print $2 }' "$state_file")
+if [[ "$phase" == prepare && "$registry_state" != absent ]]; then
+    echo "registry version is already published; use publish to verify the existing draft" >&2
+    exit 1
+fi
+[[ "$phase" == prepare || "$registry_state" == exact ]] || {
     echo "crates.io does not serve the tested candidate; refusing to finalize" >&2
     exit 1
 }
 
 git fetch --force origin --tags
-python3 "$script_dir/signing.py" verify-commit "$commit_sha"
 python3 "$script_dir/signing.py" verify-tag "$rc_tag"
 [[ "$(git rev-list -n 1 "$rc_tag")" == "$commit_sha" ]] || {
     echo "RC tag no longer resolves to the manifest commit" >&2
@@ -78,24 +83,13 @@ if git rev-parse -q --verify "refs/tags/$final_tag" >/dev/null; then
         echo "existing final tag points to a different commit" >&2
         exit 1
     }
-else
-    bash "$script_dir/check-release-blockers.sh"
-    git tag -s "$final_tag" "$commit_sha" -m "Release $package_name $version
-
-Promoted from: $rc_tag
-crate-sha256: $(jq -er '.crate.sha256' "$manifest")
-commit: $commit_sha"
     python3 "$script_dir/signing.py" verify-tag "$final_tag"
-    git push origin "refs/tags/$final_tag"
+    remote_final_commit=$(git ls-remote origin "refs/tags/$final_tag^{}" | awk '{ print $1 }')
+    [[ "$remote_final_commit" == "$commit_sha" ]] || {
+        echo "remote final tag does not point to the manifest commit" >&2
+        exit 1
+    }
 fi
-
-python3 "$script_dir/signing.py" verify-tag "$final_tag"
-
-remote_final_commit=$(git ls-remote origin "refs/tags/$final_tag^{}" | awk '{ print $1 }')
-[[ "$remote_final_commit" == "$commit_sha" ]] || {
-    echo "remote final tag does not point to the manifest commit" >&2
-    exit 1
-}
 
 notes_file=$(mktemp)
 awk -v version="$version" '
@@ -119,7 +113,14 @@ release_count=$(jq 'length' "$release_list")
 }
 
 if [[ "$release_count" -eq 0 ]]; then
-    gh release create "$final_tag" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+    [[ "$phase" == prepare ]] || {
+        echo "verified draft GitHub Release is missing; refusing to finalize" >&2
+        exit 1
+    }
+    bash "$script_dir/check-release-blockers.sh"
+    # A draft may name a future tag. Create the signed final tag only after
+    # crates.io serves the tested bytes, immediately before publishing.
+    gh release create "$final_tag" --repo "$GITHUB_REPOSITORY" --target "$commit_sha" --draft \
         --title "$package_name v$version" --notes-file "$notes_file"
     gh api --paginate --slurp -H 'X-GitHub-Api-Version: 2026-03-10' \
         "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -143,6 +144,14 @@ for asset in "$crate_file.asc" SHA256SUMS.asc "$sbom_file.asc" release-manifest.
         gh release download "$final_tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$release_assets"
     fi
 done
+if [[ "$phase" == publish ]]; then
+    for signature in "$crate_file.asc" SHA256SUMS.asc "$sbom_file.asc" release-manifest.json.asc test-evidence.json.asc; do
+        [[ -f "$release_assets/$signature" ]] || {
+            echo "verified draft signature is missing: $signature" >&2
+            exit 1
+        }
+    done
+fi
 python3 "$script_dir/signing.py" sign-files \
     "$release_assets/$crate_file" "$release_assets/SHA256SUMS" \
     "$release_assets/$sbom_file" "$release_assets/release-manifest.json" "$release_assets/test-evidence.json"
@@ -152,6 +161,10 @@ assets=("$crate_file" SHA256SUMS "$sbom_file" release-manifest.json test-evidenc
 expected_names=$(printf '%s\n' "${assets[@]}" | LC_ALL=C sort)
 
 if jq -e '.draft == false' "$release_body" >/dev/null; then
+    [[ "$registry_state" == exact ]] || {
+        echo "published GitHub Release has no matching registry publication" >&2
+        exit 1
+    }
     jq -e '.immutable == true' "$release_body" >/dev/null || {
         echo "published release is not immutable" >&2
         exit 1
@@ -187,6 +200,12 @@ jq -e \
     echo "existing draft release metadata differs from the canonical release" >&2
     exit 1
 }
+if ! git rev-parse -q --verify "refs/tags/$final_tag" >/dev/null; then
+    jq -e --arg commit "$commit_sha" '.target_commitish == $commit' "$release_body" >/dev/null || {
+        echo "draft release target differs from the verified candidate" >&2
+        exit 1
+    }
+fi
 [[ "$actual_notes" == "$expected_notes" ]] || {
     echo "existing draft release notes differ from CHANGELOG.md" >&2
     exit 1
@@ -208,6 +227,10 @@ for asset in "${assets[@]}"; do
     asset_id=$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .id' "$release_body")
     if [[ -n "$asset_id" ]]; then
         asset_state=$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .state' "$release_body")
+        if [[ "$phase" == publish && "$asset_state" != uploaded ]]; then
+            echo "verified draft asset $asset is not uploaded" >&2
+            exit 1
+        fi
         if [[ "$asset_state" == starter ]]; then
             # GitHub can leave a zero-byte `starter` placeholder after a 502.
             # It is not a published asset and must be removed to retry safely.
@@ -231,6 +254,10 @@ for asset in "${assets[@]}"; do
             exit 1
         fi
     else
+        [[ "$phase" == prepare ]] || {
+            echo "verified draft asset is missing: $asset" >&2
+            exit 1
+        }
         gh release upload "$final_tag" --repo "$GITHUB_REPOSITORY" "$source_file"
     fi
 done
@@ -265,6 +292,23 @@ for asset in "${assets[@]}"; do
         exit 1
     }
 done
+
+if [[ "$phase" == prepare ]]; then
+    echo "GitHub draft $final_tag contains the verified canonical assets"
+    exit 0
+fi
+
+if ! git rev-parse -q --verify "refs/tags/$final_tag" >/dev/null; then
+    bash "$script_dir/check-release-blockers.sh"
+    git tag -s "$final_tag" "$commit_sha" -m "Release $package_name $version
+
+Promoted from: $rc_tag
+crate-sha256: $(jq -er '.crate.sha256' "$manifest")
+commit: $commit_sha"
+    python3 "$script_dir/signing.py" verify-tag "$final_tag"
+    git push origin "refs/tags/$final_tag"
+fi
+python3 "$script_dir/signing.py" verify-tag "$final_tag"
 
 remote_final_commit=$(git ls-remote origin "refs/tags/$final_tag^{}" | awk '{ print $1 }')
 [[ "$remote_final_commit" == "$commit_sha" ]] || {

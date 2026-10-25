@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare or recover the pipeline's signed version and changelog commit."""
+"""Prepare a reproducible candidate commit without release credentials."""
 
 from datetime import datetime, timezone
 import os
@@ -68,7 +68,7 @@ def bump_files(root, version, date):
     changelog.write_text(text)
 
 
-def prepare(version):
+def prepare(version, expected_commit=None):
     if not re.fullmatch(VERSION, version):
         raise ValueError("Version must be an exact X.Y.Z release without leading zeroes.")
     source = os.environ["GITHUB_SHA"]
@@ -86,27 +86,46 @@ def prepare(version):
     if owned:
         signing.verify_tag(owned[0])
         commit = signing.run(["git", "rev-parse", owned[0] + "^{commit}"]).strip()
-        signing.verify_commit(commit)
         if signing.run(["git", "show", "-s", "--format=%P", commit]).strip() != source:
             raise ValueError("Recovered release commit is not a child of the dispatch commit.")
+        if expected_commit and commit != expected_commit:
+            raise ValueError("Recovered release commit differs from the verified candidate.")
         signing.run(["git", "checkout", "--detach", commit])
         return
     if (signing.run(["git", "rev-parse", "HEAD"]).strip() != source
-            or signing.run(["git", "rev-parse", "origin/main"]).strip() != source
+            or (not expected_commit
+                and signing.run(["git", "rev-parse", "origin/main"]).strip() != source)
             or signing.run(["git", "status", "--porcelain"]).strip()):
         raise ValueError("Release preparation requires a clean checkout of current main.")
-    bump_files(Path.cwd(), version, datetime.now(timezone.utc).date().isoformat())
+    # The workflow creation time is fixed across jobs and reruns. Signing this
+    # commit later would change its SHA and Cargo's packaged VCS metadata;
+    # signed tags authenticate the unchanged, tested commit after approval.
+    timestamp = datetime.fromisoformat(os.environ["RELEASE_TIMESTAMP"])
+    if timestamp.tzinfo is None:
+        raise ValueError("Release timestamp must include a timezone.")
+    timestamp = timestamp.astimezone(timezone.utc)
+    bump_files(Path.cwd(), version, timestamp.date().isoformat())
     signing.run(["git", "add", "Cargo.toml", "Cargo.lock", "CHANGELOG.md"])
-    signing.run(["git", "commit", "-S", "--allow-empty", "-m",
-                 f"chore: release {version}\n\nworkflow-run: {run_id}\nsource-commit: {source}"])
-    signing.verify_commit("HEAD")
+    commit_env = {**os.environ,
+                  "GIT_AUTHOR_NAME": "github-actions[bot]",
+                  "GIT_AUTHOR_EMAIL": "41898282+github-actions[bot]@users.noreply.github.com",
+                  "GIT_COMMITTER_NAME": "github-actions[bot]",
+                  "GIT_COMMITTER_EMAIL": "41898282+github-actions[bot]@users.noreply.github.com",
+                  "GIT_AUTHOR_DATE": timestamp.isoformat(),
+                  "GIT_COMMITTER_DATE": timestamp.isoformat()}
+    signing.run(["git", "-c", "core.hooksPath=/dev/null", "commit", "--no-gpg-sign",
+                 "--allow-empty", "--cleanup=verbatim", "-m",
+                 f"chore: release {version}\n\nworkflow-run: {run_id}\nsource-commit: {source}\n"],
+                env=commit_env)
+    if expected_commit and signing.run(["git", "rev-parse", "HEAD"]).strip() != expected_commit:
+        raise ValueError("Recreated release commit differs from the verified candidate.")
 
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) != 2:
-            raise ValueError("Usage: prepare_release.py VERSION")
-        prepare(sys.argv[1])
+        if len(sys.argv) not in (2, 3):
+            raise ValueError("Usage: prepare_release.py VERSION [EXPECTED_COMMIT]")
+        prepare(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else None)
     except (ValueError, KeyError) as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)
