@@ -39,15 +39,8 @@ pub(crate) struct SortedAffinityNodes {
 enum QueryPlanState {
     /// Non-seeded fallback state (Round-Robin)
     RoundRobin { used_nodes: HashSet<Arc<Url>> },
-    /// Seeded deterministic state for Key Route Affinity
-    Affinity {
-        seed: i64,
-        rng: DeterministicRng,
-        nodes: Vec<Arc<Url>>,
-        remaining_nodes: Vec<Arc<Url>>,
-    },
-    /// Deterministic order with selected nodes before the rest.
-    PreferredNodes { nodes: Vec<Arc<Url>>, next: usize },
+    /// Captured deterministic order for seeded affinity or voted coordinators.
+    Ordered { nodes: Vec<Arc<Url>>, next: usize },
 }
 
 impl Storable for QueryPlan {
@@ -67,15 +60,16 @@ impl QueryPlan {
 
     /// Creates a seeded deterministic affinity query plan.
     pub fn new_with_hash(live_nodes: Arc<LiveNodes>, seed: u64) -> Self {
-        let nodes = Self::sorted_affinity_nodes(&live_nodes).nodes;
+        let mut remaining = Self::sorted_affinity_nodes(&live_nodes).nodes;
+        let mut nodes = Vec::with_capacity(remaining.len());
+        let mut rng = DeterministicRng::new(seed as i64);
+        while !remaining.is_empty() {
+            let index = rng.index(remaining.len());
+            nodes.push(remaining.swap_remove(index));
+        }
         Self {
             live_nodes,
-            state: Mutex::new(QueryPlanState::Affinity {
-                seed: seed as i64,
-                rng: DeterministicRng::new(seed as i64),
-                remaining_nodes: nodes.clone(),
-                nodes,
-            }),
+            state: Mutex::new(QueryPlanState::Ordered { nodes, next: 0 }),
         }
     }
 
@@ -96,7 +90,7 @@ impl QueryPlan {
         ordered.extend(nodes);
         Self {
             live_nodes,
-            state: Mutex::new(QueryPlanState::PreferredNodes {
+            state: Mutex::new(QueryPlanState::Ordered {
                 nodes: ordered,
                 next: 0,
             }),
@@ -114,7 +108,7 @@ impl QueryPlan {
     /// With round-robin, on every attempt, the first node that hasn't been used yet in this request is returned.
     /// Search begins from the last used node in the live nodes list, so that requests are distributed evenly across the cluster.
     ///
-    /// With affinity, the next node is selected from the remaining nodes using a seeded pick-and-remove algorithm.
+    /// With affinity, the next node comes from the order captured when the plan was created.
     pub fn next_node(&self) -> Option<Arc<Url>> {
         let mut state = self.state.lock().unwrap();
 
@@ -124,28 +118,7 @@ impl QueryPlan {
                 used_nodes.insert(node.clone());
                 Some(node)
             }
-            QueryPlanState::Affinity {
-                rng,
-                remaining_nodes,
-                ..
-            } => {
-                let remaining = remaining_nodes;
-
-                if remaining.is_empty() {
-                    return None;
-                }
-
-                // Pick-and-Remove Algorithm.
-                let idx = rng.index(remaining.len());
-                let selected_node = remaining[idx].clone();
-                let last_idx = remaining.len() - 1;
-
-                remaining[idx] = remaining[last_idx].clone();
-                remaining.pop();
-
-                Some(selected_node)
-            }
-            QueryPlanState::PreferredNodes { nodes, next } => {
+            QueryPlanState::Ordered { nodes, next } => {
                 let node = nodes.get(*next)?.clone();
                 *next += 1;
                 Some(node)
@@ -178,18 +151,7 @@ impl QueryPlan {
 
         match &mut *state {
             QueryPlanState::RoundRobin { used_nodes } => used_nodes.clear(),
-            QueryPlanState::Affinity {
-                seed,
-                rng,
-                nodes,
-                remaining_nodes,
-            } => {
-                // Re-seeding repeats the deterministic affinity order and
-                // puts the preferred coordinator first again.
-                *rng = DeterministicRng::new(*seed);
-                *remaining_nodes = nodes.clone();
-            }
-            QueryPlanState::PreferredNodes { next, .. } => *next = 0,
+            QueryPlanState::Ordered { next, .. } => *next = 0,
         }
     }
 }
