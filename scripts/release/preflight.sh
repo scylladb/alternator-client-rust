@@ -36,7 +36,6 @@ commit_sha=$(git rev-parse HEAD)
     echo "release commit must be a direct child of the dispatch commit" >&2
     exit 1
 }
-python3 "$(dirname "${BASH_SOURCE[0]}")/signing.py" verify-commit "$commit_sha"
 
 git fetch --force --tags origin '+refs/heads/main:refs/remotes/origin/main'
 main_sha=$(git rev-parse refs/remotes/origin/main)

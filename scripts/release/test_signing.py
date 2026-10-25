@@ -186,7 +186,7 @@ class SigningTests(unittest.TestCase):
             with self.assertRaises(signing.SigningError):
                 signing.sign_files([str(artifact)])
 
-    def test_pipeline_preparation_and_recovery_keep_signed_commit(self):
+    def test_pipeline_preparation_recreates_candidate_without_signing_credentials(self):
         with self.repository() as directory:
             Path("Cargo.toml").write_text('[package]\nname = "alternator-client"\nversion = "1.0.0"\n')
             Path("Cargo.lock").write_text('version = 4\n\n[[package]]\nname = "alternator-client"\nversion = "1.0.0"\n')
@@ -202,17 +202,33 @@ class SigningTests(unittest.TestCase):
             origin = directory / "origin.git"
             signing.run(["git", "clone", "--bare", ".", str(origin)])
             signing.run(["git", "remote", "add", "origin", str(origin)])
-            self.configured()
-            os.environ.update(GITHUB_SHA=source, GITHUB_REF="refs/heads/main", GITHUB_RUN_ID="1234")
+            os.environ.update(GITHUB_SHA=source, GITHUB_REF="refs/heads/main", GITHUB_RUN_ID="1234",
+                              GITHUB_RUN_ATTEMPT="1", RELEASE_TIMESTAMP="2026-10-25T12:00:00Z")
             prepare_release.prepare("1.0.1")
             commit = signing.run(["git", "rev-parse", "HEAD"]).strip()
             self.assertNotEqual(commit, source)
             self.assertEqual(signing.run(["git", "show", "-s", "--format=%P", commit]).strip(), source)
-            signing.verify_commit(commit)
+            with self.assertRaises(signing.SigningError):
+                signing.verify_commit(commit)
             self.assertIn('version = "1.0.1"', Path("Cargo.toml").read_text())
             self.assertIn('version = "1.0.1"', Path("Cargo.lock").read_text())
             self.assertIn('## [1.0.1] - ', Path("CHANGELOG.md").read_text())
             self.assertFalse(signing.run(["git", "status", "--porcelain"]).strip())
+            allocation = subprocess.run(
+                ["bash", str(Path(__file__).with_name("allocate-rc.sh")), "--dry-run",
+                 "1.0.1", commit], capture_output=True, text=True, check=True,
+                env={**os.environ, "GITHUB_OUTPUT": str(directory / "allocation-output")},
+            )
+            self.assertIn("v1.0.1-rc.1", allocation.stdout)
+            self.assertFalse(signing.run(["git", "tag", "-l"]).strip())
+            signing.run(["git", "checkout", "--detach", source])
+            prepare_release.prepare("1.0.1", commit)
+            self.assertEqual(signing.run(["git", "rev-parse", "HEAD"]).strip(), commit)
+            signing.run(["git", "checkout", "--detach", source])
+            with self.assertRaisesRegex(ValueError, "differs from the verified candidate"):
+                prepare_release.prepare("1.0.1", "0" * 40)
+            # Approval unlocks the key only after this exact commit is tested.
+            self.configured()
             signing.run(["git", "tag", "-s", "v1.0.1-rc.1", "-m", "RC\n\nworkflow-run: 1234"])
             signing.run(["git", "push", "origin", "refs/tags/v1.0.1-rc.1"])
             signing.run(["git", "checkout", "--detach", source])

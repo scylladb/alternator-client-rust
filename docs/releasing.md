@@ -3,7 +3,7 @@
 The package name is `alternator-client`; the Rust library name remains
 `alternator_driver`. Dispatch `.github/workflows/release.yml` from `main` with
 an exact final version such as `1.1.0`. The pipeline bumps `Cargo.toml`,
-`Cargo.lock`, and `CHANGELOG.md`, creates a signed release commit and signed
+`Cargo.lock`, and `CHANGELOG.md`, creates a reproducible release commit and signed
 annotated tags, verifies the packaged candidate, and publishes an immutable
 GitHub Release containing the exact tested crate.
 
@@ -64,37 +64,53 @@ gh workflow run release.yml --ref main -f version=1.1.0
 
 Dispatch starts verification. It does not approve release credentials.
 
-## Verification and approvals
+## Verification and approval
 
-The pipeline has two approval points, both after verification:
+The pipeline has one approval point, after all candidate gates and test evidence
+succeed. Only the publication job references the protected `release` environment.
+GitHub withholds that job and its environment secrets until a member of
+`scylladb/drivers` approves it. Keep the required-reviewer rule enabled and admin
+bypass disabled; workflow YAML alone does not configure those protections.
 
 1. **Source verification:** the reusable ordinary CI workflow runs static,
    security, packaging, portable, and Scylla tests on the dispatch commit, with
    no deployment environment or release secrets.
-2. **Preparation approval:** after those jobs succeed, the `release` environment
-   waits for one member of `scylladb/drivers`. Approval unlocks the signing key.
-   The pipeline bumps both Cargo versions, promotes Unreleased notes to a dated
-   version section, updates comparison links, and creates a signed release
-   commit as a direct child of the dispatch commit. It creates the immutable
-   signed `vX.Y.Z-rc.N` tag at that commit. It does not push to `main`.
-3. **Exact candidate verification:** ordinary runners package and attest that
-   signed commit before testing. Portable, static, security, compatibility,
-   publication dry-run, and Scylla gates extract and test the same candidate.
-   These jobs have no deployment environment or release credentials.
+2. **Candidate preparation:** an ordinary runner bumps both Cargo versions,
+   promotes Unreleased notes to a dated version section, and updates comparison
+   links. It creates an unsigned release commit as a direct child of the
+   dispatch commit and plans the next `vX.Y.Z-rc.N` identity without creating a
+   tag or pushing to `main`. Fixed author details and workflow creation time
+   make the commit reproducible across jobs and reruns.
+3. **Exact candidate verification:** ordinary runners recreate that exact
+   commit, package and attest it before testing. Portable, static, security,
+   compatibility, publication dry-run, and Scylla gates extract and test the
+   same candidate. These jobs have no deployment environment or release secrets.
 4. **Publication approval:** all candidate gates and test evidence must succeed
-   before GitHub requests a second approval from `scylladb/drivers`. This is a
-   separate deployment to `release`. Failed or skipped gates block publication.
-5. **Release:** the approved job verifies candidate identity and regenerated
-   crate bytes, obtains the registry credential, publishes, and requires both
-   the crates.io index checksum and downloaded archive to match the candidate.
-   It then creates signed `vX.Y.Z` at the same signed RC commit, uploads and
-   verifies release assets in a draft, and publishes the immutable GitHub Release.
+   before GitHub requests approval from `scylladb/drivers`. Failed or skipped
+   gates block the job. Approval unlocks signing credentials and publication.
+5. **Draft verification:** the approved job recreates the tested commit, verifies
+   candidate identity and regenerated crate bytes, and creates its signed RC
+   tag. It signs, uploads, downloads, and verifies every GitHub Release asset in
+   a draft targeting that commit. The draft names the future final tag but does
+   not create it. Draft failures stop the job before registry publication.
+6. **Release:** only after draft verification does the job obtain the registry
+   credential and publish. It requires both the crates.io index checksum and
+   downloaded archive to match the candidate. It rechecks the existing draft
+   assets, creates signed `vX.Y.Z` at the tested commit, and publishes the
+   immutable GitHub Release. Finalization refuses missing or changed assets;
+   it does not upload replacements after registry publication.
 
-All pipeline-created release commits, tags, and detached asset signatures use
-the same repository-specific GPG subkey belonging to `scylladb-publisher`.
-GitHub Releases have no GPG-signature field: the signed tag and signed manifest,
-crate, checksums, SBOM, and evidence authenticate their contents. GitHub adds
-its own release attestation for immutable releases.
+The release commit stays unsigned so signing after approval cannot change the
+commit SHA embedded in the tested crate. Signed RC and final tags authenticate
+that exact commit. Tags and detached asset signatures use the same
+repository-specific GPG subkey belonging to `scylladb-publisher`. GitHub Releases
+have no GPG-signature field: the signed tag and signed manifest, crate,
+checksums, SBOM, and evidence authenticate their contents. GitHub adds its own
+release attestation for immutable releases.
+
+Registry and GitHub publication are separate operations. A failure after
+crates.io publication can still leave the verified GitHub draft unpublished;
+rerun failed jobs to complete it without publishing the crate again.
 
 The source checkout must still be current `main` when a new release commit is
 prepared. The version bump lives on the tagged release commit. Carry that
@@ -111,7 +127,7 @@ The immutable Actions candidate artifact is named
 - `alternator-client-X.Y.Z.cdx.json`;
 - `release-manifest.json`.
 
-The manifest records the signed release commit, crate and SBOM hashes, pinned
+The manifest records the tested release commit, crate and SBOM hashes, pinned
 inputs, lockfile and changelog hashes. Build provenance attests these files;
 its workflow source digest is the dispatch commit. The signed manifest binds
 the generated release commit to the tested package. The SBOM attestation
@@ -151,8 +167,9 @@ restrict the branch. See [crates.io Trusted Publishing](https://crates.io/docs/t
 An open issue labeled exactly `release-blocker` stops release mutations. The
 check verifies that the label exists and fails closed on API, authentication,
 rate-limit, pagination, or malformed-response errors. Pull requests with the
-label do not count. Checks run before creating an RC tag, publishing to
-crates.io, creating the final tag, and publishing the draft GitHub Release.
+label do not count. Checks run before creating an RC tag or GitHub draft,
+publishing to crates.io, creating the final tag, and publishing the draft
+GitHub Release.
 
 For infrastructure failures or interrupted publication, rerun failed jobs in
 the same run:
@@ -161,16 +178,19 @@ the same run:
 gh run rerun RUN_ID --repo scylladb/alternator-client-rust --failed
 ```
 
-Preparation recovers the existing run-owned signed RC commit, verifies its
-signature and parent, and does not repeat the version bump. Regenerated crate
-bytes must match earlier artifacts or the preserved candidate hash in the
-previous attempt's log. Recovery requires the relevant environment approval
-again. Existing exact registry bytes skip publication. Existing tags and draft
-assets are verified and reused; signatures are never overwritten.
+Preparation recreates the same unsigned commit from the fixed workflow creation
+time, or recovers the commit authenticated by an existing run-owned signed RC
+tag and verifies its parent. Regenerated crate bytes must match earlier artifacts
+or the preserved candidate hash in the previous attempt's log. Rerunning the
+publication job requires environment approval again. Existing exact registry
+bytes skip publication and draft preparation. Existing tags and draft assets
+are verified and reused; signatures are never overwritten.
 
 For source failures, merge a normal fix PR and dispatch a new run for the same
-version. It creates a new RC number. Older RCs cannot be newly published after
-a newer RC exists. Never replace tags, assets, or a published crate version.
+version. If the earlier run created an RC tag, the new run uses the next RC
+number; otherwise it can reuse the unallocated number. Older RCs cannot be newly
+published after a newer RC exists. Never replace tags, assets, or a published
+crate version.
 A conflicting registry checksum or release asset stops recovery.
 
 Pinned Rust, nightly, CCM, Scylla, release-tool, runner, and action revisions
