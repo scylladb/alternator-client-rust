@@ -100,6 +100,7 @@ pub struct AlternatorClientBuildError {
 enum AlternatorClientBuildErrorKind {
     SdkConfiguration(String),
     TlsConfiguration(String),
+    DiscoveryConfiguration(String),
     LiveNodes(LiveNodesBuildError),
 }
 
@@ -111,6 +112,12 @@ impl std::fmt::Display for AlternatorClientBuildError {
             }
             AlternatorClientBuildErrorKind::TlsConfiguration(message) => {
                 write!(formatter, "failed to configure SDK TLS: {message}")
+            }
+            AlternatorClientBuildErrorKind::DiscoveryConfiguration(message) => {
+                write!(
+                    formatter,
+                    "failed to configure Alternator discovery: {message}"
+                )
             }
             AlternatorClientBuildErrorKind::LiveNodes(source) => {
                 write!(
@@ -127,6 +134,7 @@ impl std::error::Error for AlternatorClientBuildError {
         match &self.kind {
             AlternatorClientBuildErrorKind::SdkConfiguration(_) => None,
             AlternatorClientBuildErrorKind::TlsConfiguration(_) => None,
+            AlternatorClientBuildErrorKind::DiscoveryConfiguration(_) => None,
             AlternatorClientBuildErrorKind::LiveNodes(source) => Some(source),
         }
     }
@@ -379,23 +387,33 @@ fn sdk_http_client(use_tls: bool) -> aws_sdk_dynamodb::config::SharedHttpClient 
 }
 
 impl AlternatorClient {
-    /// Constructs a client, panicking if its routing configuration is invalid.
+    /// Constructs a client, panicking if its routing or discovery configuration is invalid.
     ///
     /// Use [`Self::try_from_conf`] when configuration comes from a fallible or
     /// externally supplied source.
     ///
     /// # Panics
     ///
-    /// Panics when routing configuration is missing or invalid, or when
-    /// required HTTP or TLS resources cannot be built.
+    /// Panics when routing configuration is missing or invalid, when the discovery
+    /// timeout is zero or unrepresentable, or when required HTTP or TLS resources
+    /// cannot be built.
     pub fn from_conf(config: AlternatorConfig) -> Self {
         Self::try_from_conf(config)
             .unwrap_or_else(|error| panic!("failed to construct AlternatorClient: {error}"))
     }
 
-    /// Tries to construct a client after validating required SDK and routing
+    /// Tries to construct a client after validating required SDK, routing, and discovery
     /// configuration.
     pub fn try_from_conf(config: AlternatorConfig) -> Result<Self, AlternatorClientBuildError> {
+        if let Some(timeout) = config.discovery_timeout()
+            && (timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none())
+        {
+            return Err(AlternatorClientBuildError {
+                kind: AlternatorClientBuildErrorKind::DiscoveryConfiguration(
+                    "discovery_timeout must be positive and fit the runtime clock".to_owned(),
+                ),
+            });
+        }
         let dynamodb_config = config.dynamodb_config.clone();
         let extensions = config.alternator_ext.clone();
         let stalled_stream_protection_explicitly_unset =
@@ -490,17 +508,30 @@ impl AlternatorClient {
                 // cycle: main client -> affinity interceptor -> resolver -> DescribeTable
                 // -> main client. Build a separate discovery client from the same base config
                 // but with round-robin routing only.
-                let pk_discovery_client = try_dynamodb_client_from_conf(
-                    builder
-                        .clone()
-                        .interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()))
-                        .build(),
-                )?;
-                let resolver =
-                    std::sync::Arc::new(keyrouting::resolver::PartitionKeyResolver::new(
+                let mut pk_builder = builder
+                    .clone()
+                    .interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()));
+                if let Some(timeout) = config.discovery_timeout() {
+                    let timeouts = config
+                        .timeout_config()
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            aws_smithy_types::timeout::TimeoutConfig::builder().build()
+                        })
+                        .to_builder()
+                        .operation_timeout(timeout)
+                        .operation_attempt_timeout(timeout)
+                        .build();
+                    pk_builder = pk_builder.timeout_config(timeouts);
+                }
+                let pk_discovery_client = try_dynamodb_client_from_conf(pk_builder.build())?;
+                let resolver = std::sync::Arc::new(
+                    keyrouting::resolver::PartitionKeyResolver::new_with_timeout(
                         pk_discovery_client,
                         cfg.pk_info_per_table.clone(),
-                    ));
+                        config.discovery_timeout(),
+                    ),
+                );
                 partition_keys = Some(resolver.clone());
                 Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
                     AffinityQueryPlanInterceptor::new(
