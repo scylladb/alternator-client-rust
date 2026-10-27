@@ -444,10 +444,12 @@ async fn partition_key_discovery_uses_explicit_short_and_long_deadlines() {
         } else {
             discovery_timeout / 2
         };
-        tokio::time::advance(before_deadline).await;
-        assert_eq!(
-            http.dropped.available_permits(),
-            0,
+        // Observe cancellation while paused time processes earlier timers;
+        // an early deadline must fail before advancing through retry backoff.
+        assert!(
+            tokio::time::timeout(before_deadline, http.dropped.acquire())
+                .await
+                .is_err(),
             "explicit discovery deadline must replace inherited data deadline"
         );
         assert_eq!(http.describes.load(Ordering::SeqCst), 1);
@@ -483,10 +485,10 @@ async fn unset_discovery_timeout_keeps_partition_key_sdk_deadline() {
     assert_eq!(client.config().discovery_timeout(), None);
     put_item(&client, "users").await;
     http.wait_entered().await;
-    tokio::time::advance(Duration::from_secs(6)).await;
-    assert_eq!(
-        http.dropped.available_permits(),
-        0,
+    assert!(
+        tokio::time::timeout(Duration::from_secs(6), http.dropped.acquire())
+            .await
+            .is_err(),
         "legacy PK timeout must not gain topology's default 5s cap"
     );
     tokio::time::advance(Duration::from_secs(2)).await;

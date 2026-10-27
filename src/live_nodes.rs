@@ -1817,7 +1817,7 @@ mod tests {
             builder.set_discovery_timeout(configured);
             let nodes = LiveNodes::new(&builder.build()).unwrap();
             let started = tokio::time::Instant::now();
-            let request = tokio::spawn(async move {
+            let mut request = tokio::spawn(async move {
                 nodes
                     .discovery()
                     .inputs
@@ -1838,9 +1838,12 @@ mod tests {
             } else {
                 effective / 2
             };
-            tokio::time::advance(before_deadline).await;
+            // Waiting on the request lets paused time process earlier timers
+            // before asserting that the discovery deadline has not expired.
             assert!(
-                !request.is_finished(),
+                tokio::time::timeout(before_deadline, &mut request)
+                    .await
+                    .is_err(),
                 "discovery deadline must not be silently capped"
             );
             assert_eq!(http.dropped.available_permits(), 0);
@@ -1917,7 +1920,7 @@ mod tests {
             .build();
         let nodes = LiveNodes::new(&config).unwrap();
         assert_eq!(nodes.discovery().inputs.discovery_timeout, None);
-        let request = tokio::spawn(async move {
+        let mut request = tokio::spawn(async move {
             nodes
                 .discovery()
                 .inputs
@@ -1932,8 +1935,12 @@ mod tests {
             .unwrap()
             .unwrap()
             .forget();
-        tokio::time::advance(Duration::from_millis(500)).await;
-        assert!(!request.is_finished());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut request)
+                .await
+                .is_err(),
+            "discovery must outlast the data-attempt timeout"
+        );
         tokio::time::advance(Duration::from_millis(500)).await;
         let discovered = request
             .await
