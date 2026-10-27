@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Optional per-request `discovery_timeout` for topology and partition-key
+  discovery. Unset timeouts preserve existing defaults; zero and unrepresentable
+  durations are rejected during client construction.
+
 ### Fixed
 
 - Eligible key-affinity requests use every rack in the selected datacenter while

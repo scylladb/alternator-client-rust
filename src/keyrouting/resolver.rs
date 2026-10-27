@@ -48,7 +48,7 @@ impl FailureRecord {
 /// Resolves partition key attribute names for DynamoDB tables.
 ///
 /// Caches results to avoid repeated `DescribeTable` calls. Supports both
-/// pre-configured partition key info (via [`PartitionKeyResolver::new`]) and
+/// pre-configured partition key info (via [`PartitionKeyResolver::new_with_timeout`]) and
 /// asynchronous discovery on demand (via [`trigger_discovery`]).
 ///
 /// # Retry behavior
@@ -79,13 +79,23 @@ impl FailureRecord {
 pub struct PartitionKeyResolver {
     pub(crate) tasks: crate::discovery::DiscoveryTasks,
     client: aws_sdk_dynamodb::Client,
+    discovery_timeout: Option<Duration>,
     cache: PkCache,
     in_progress: Arc<DashSet<String>>,
     failed_tables: Arc<DashMap<String, FailureRecord>>,
 }
 
 impl PartitionKeyResolver {
+    #[cfg(test)]
     pub fn new(client: aws_sdk_dynamodb::Client, pk_info: HashMap<String, String>) -> Self {
+        Self::new_with_timeout(client, pk_info, None)
+    }
+
+    pub(crate) fn new_with_timeout(
+        client: aws_sdk_dynamodb::Client,
+        pk_info: HashMap<String, String>,
+        discovery_timeout: Option<Duration>,
+    ) -> Self {
         let cache: PkCache = Arc::new(DashMap::new());
         for (k, v) in pk_info {
             cache.insert(k, Arc::from(v));
@@ -93,6 +103,7 @@ impl PartitionKeyResolver {
         Self {
             tasks: crate::discovery::DiscoveryTasks::default(),
             client,
+            discovery_timeout,
             cache,
             in_progress: Arc::new(DashSet::new()),
             failed_tables: Arc::new(DashMap::new()),
@@ -163,12 +174,16 @@ impl PartitionKeyResolver {
         let mut delay = INITIAL_RETRY_DELAY_MS;
 
         loop {
-            let response = self
-                .client
-                .describe_table()
-                .table_name(&table_name)
-                .send()
-                .await;
+            let request = self.client.describe_table().table_name(&table_name).send();
+            let response = match self.discovery_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, request).await {
+                    Ok(response) => response,
+                    Err(_) => Err(SdkError::timeout_error(
+                        "partition-key discovery deadline elapsed",
+                    )),
+                },
+                None => request.await,
+            };
             match response {
                 Ok(response) => {
                     if let Some(table) = response.table
